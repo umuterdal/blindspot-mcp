@@ -4,6 +4,8 @@
 
 **v0.1.0** — [Report bugs](https://github.com/umuterdal/blindspot-mcp/issues) | [Contribute](https://github.com/umuterdal/blindspot-mcp/pulls)
 
+[![PyPI version](https://img.shields.io/pypi/v/blindspot-mcp.svg)](https://pypi.org/project/blindspot-mcp/)
+[![PyPI downloads](https://img.shields.io/pypi/dm/blindspot-mcp.svg)](https://pypi.org/project/blindspot-mcp/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
 
