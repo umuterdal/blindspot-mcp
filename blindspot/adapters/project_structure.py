@@ -499,17 +499,73 @@ def get_project_structure(project_path: str) -> ProjectStructure:
             if extra_dir not in scan_dirs:
                 scan_dirs[extra_dir] = extra_dir
 
-    # Build extensions
+    # Monorepo enhancement: detect workspaces and merge their info
+    workspaces = detect_workspaces(project_path)
+    workspace_languages: Set[str] = set()
+    workspace_frameworks: Set[str] = set()
+
+    if workspaces:
+        for ws in workspaces:
+            if ws.get("language"):
+                workspace_languages.add(ws["language"])
+            if ws.get("framework"):
+                workspace_frameworks.add(ws["framework"])
+
+        # Add workspace directories to scan_dirs
+        for ws in workspaces:
+            ws_name = ws["name"]
+            ws_rel = ws["rel_path"]
+            # Add the workspace itself as a scannable directory
+            if ws_name not in scan_dirs:
+                scan_dirs[ws_name] = ws_rel
+
+        # Merge framework defaults from all detected workspace frameworks
+        for ws_fw in workspace_frameworks:
+            if ws_fw in _FRAMEWORK_DEFAULTS:
+                ws_defaults = _FRAMEWORK_DEFAULTS[ws_fw]
+                # Find which workspace has this framework
+                for ws in workspaces:
+                    if ws.get("framework") == ws_fw:
+                        ws_rel = ws["rel_path"]
+                        for key, path in ws_defaults.items():
+                            # Prefix with workspace path
+                            full_path = os.path.join(ws_rel, path)
+                            if os.path.isdir(os.path.join(project_path, full_path)):
+                                prefixed_key = f"{ws['name']}_{key}"
+                                scan_dirs[prefixed_key] = full_path
+                            elif path.startswith("src/"):
+                                stripped = path[4:]
+                                full_stripped = os.path.join(ws_rel, stripped)
+                                if os.path.isdir(os.path.join(project_path, full_stripped)):
+                                    prefixed_key = f"{ws['name']}_{key}"
+                                    scan_dirs[prefixed_key] = full_stripped
+                        break
+
+    # Build extensions — include all workspace languages too
     source_ext = []
-    if language and language in _LANGUAGE_EXTENSIONS:
-        source_ext = list(_LANGUAGE_EXTENSIONS[language])
-    # For TypeScript projects, also include JS
-    if language == "typescript":
-        source_ext.extend(_LANGUAGE_EXTENSIONS.get("javascript", []))
+    all_languages = {language} | workspace_languages if language else workspace_languages
+    for lang in all_languages:
+        if lang and lang in _LANGUAGE_EXTENSIONS:
+            for ext in _LANGUAGE_EXTENSIONS[lang]:
+                if ext not in source_ext:
+                    source_ext.append(ext)
+    # Always include TS if JS is present and vice versa
+    if any(ext in source_ext for ext in [".js", ".jsx"]):
+        for ext in [".ts", ".tsx"]:
+            if ext not in source_ext:
+                source_ext.append(ext)
+    if any(ext in source_ext for ext in [".ts", ".tsx"]):
+        for ext in [".js", ".jsx", ".mjs", ".cjs"]:
+            if ext not in source_ext:
+                source_ext.append(ext)
 
     template_ext = []
-    if framework and framework in _TEMPLATE_EXTENSIONS:
-        template_ext = list(_TEMPLATE_EXTENSIONS[framework])
+    all_frameworks = {framework} | workspace_frameworks if framework else workspace_frameworks
+    for fw in all_frameworks:
+        if fw and fw in _TEMPLATE_EXTENSIONS:
+            for ext in _TEMPLATE_EXTENSIONS[fw]:
+                if ext not in template_ext:
+                    template_ext.append(ext)
 
     all_ext = list(set(source_ext + template_ext))
 
