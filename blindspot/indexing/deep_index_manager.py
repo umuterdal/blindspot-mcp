@@ -19,8 +19,8 @@ class DeepIndexManager:
         self._mgr = SQLiteIndexManager()
 
     # Expose a subset of API to keep callers simple
-    def set_project_path(self, project_path: str) -> bool:
-        return self._mgr.set_project_path(project_path)
+    def set_project_path(self, project_path: str, additional_excludes: Optional[List[str]] = None) -> bool:
+        return self._mgr.set_project_path(project_path, additional_excludes)
 
     def build_index(self, force_rebuild: bool = False) -> bool:
         return self._mgr.build_index(force_rebuild=force_rebuild)

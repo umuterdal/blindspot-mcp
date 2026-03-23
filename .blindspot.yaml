@@ -1,0 +1,11 @@
+# Blindspot MCP Configuration
+language: python
+
+exclude_dirs:
+  - test_env
+  - .venv
+  - __pycache__
+  - .git
+  - dist
+  - build
+  - "*.egg-info"

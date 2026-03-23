@@ -544,10 +544,21 @@ class SymbolResolver:
                     if not summary:
                         continue
                     for cls in summary.get("classes", []):
+                        cls_name = cls.get("name", "")
+                        # Count methods belonging to this specific class
+                        cls_method_count = sum(
+                            1 for m in summary.get("methods", [])
+                            if m.get("name", "").startswith(cls_name + ".")
+                        )
+                        # Also count from functions that have ClassName. prefix
+                        cls_method_count += sum(
+                            1 for f in summary.get("functions", [])
+                            if f.get("name", "").startswith(cls_name + ".")
+                        )
                         cls_info = {
-                            "name": cls.get("name", ""),
+                            "name": cls_name,
                             "file": rel_path,
-                            "methods": len(summary.get("methods", [])),
+                            "methods": cls_method_count,
                             "category": self.structure.categorize_file(rel_path),
                         }
                         if cls.get("signature"):

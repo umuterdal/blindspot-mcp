@@ -92,9 +92,9 @@ FILTER_CONFIG = {
         # Version control
         '.git', '.svn', '.hg', '.bzr',
         
-        # Package managers & dependencies  
+        # Package managers & dependencies
         'node_modules', '__pycache__', '.venv', 'venv',
-        'vendor', 'bower_components',
+        'vendor', 'bower_components', 'test_env',
         
         # Build outputs & framework cache
         'dist', 'build', 'target', 'out', 'bin', 'obj',
