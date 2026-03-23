@@ -9,6 +9,36 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
 
+### Install
+
+```bash
+pip install blindspot-mcp
+```
+
+**Claude Code** — add to `~/.claude/settings.json`:
+```json
+{
+  "mcpServers": {
+    "blindspot": {
+      "command": "blindspot-mcp",
+      "args": ["--project-path", "/path/to/your/project"]
+    }
+  }
+}
+```
+
+**Cursor / VS Code** — add to `.cursor/mcp.json`:
+```json
+{
+  "mcpServers": {
+    "blindspot": {
+      "command": "blindspot-mcp",
+      "args": ["--project-path", "."]
+    }
+  }
+}
+```
+
 ---
 
 ## Why Blindspot Exists
