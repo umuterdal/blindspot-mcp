@@ -1155,29 +1155,48 @@ class NestJSIntelligenceService(BaseService):
                 continue
 
             # Parse constructor dependencies
-            ctor_m = re.search(
-                r"constructor\s*\(\s*([^)]*)\)",
-                content,
-                re.DOTALL,
-            )
+            # Use balanced parenthesis matching since constructor params
+            # contain nested parens like @InjectRepository(User)
+            ctor_m = None
+            ctor_start = content.find("constructor")
+            if ctor_start != -1:
+                paren_start = content.find("(", ctor_start)
+                if paren_start != -1:
+                    depth = 1
+                    pos = paren_start + 1
+                    while pos < len(content) and depth > 0:
+                        if content[pos] == "(":
+                            depth += 1
+                        elif content[pos] == ")":
+                            depth -= 1
+                        pos += 1
+                    if depth == 0:
+                        ctor_m = content[paren_start + 1:pos - 1]
             deps: List[Dict[str, str]] = []
-            if ctor_m:
-                params_raw = ctor_m.group(1)
-                # Parse each parameter
+            if ctor_m is not None:
+                params_raw = ctor_m
+                # Parse each parameter - supports @Inject, @InjectRepository,
+                # @InjectDataSource, @InjectConnection, and other NestJS decorators
                 for param in re.finditer(
-                    r"(?:@Inject\s*\(\s*([^)]+)\s*\)\s*)?(?:private|protected|public|readonly)\s+"
-                    r"(?:readonly\s+)?(\w+)\s*:\s*([\w<>]+)",
+                    r"(?:@(Inject(?:Repository|DataSource|Connection|Queue|Model)?)\s*\(\s*"
+                    r"(?:forwardRef\s*\(\s*\(\)\s*=>\s*)?([^)]*?)\)?\s*\)\s*)?"
+                    r"(?:private|protected|public|readonly)\s+"
+                    r"(?:readonly\s+)?(\w+)\s*:\s*([\w<>,\s]+?)(?:\s*[,)])",
                     params_raw,
                 ):
-                    inject_token = param.group(1)
-                    param_name = param.group(2)
-                    param_type = param.group(3)
+                    decorator_name = param.group(1)
+                    inject_token = param.group(2)
+                    param_name = param.group(3)
+                    param_type = param.group(4).strip()
                     dep: Dict[str, str] = {
                         "name": param_name,
                         "type": param_type,
                     }
                     if inject_token:
-                        dep["inject_token"] = inject_token.strip("'\"")
+                        token_clean = inject_token.strip("'\" \t\n")
+                        dep["inject_token"] = token_clean
+                    if decorator_name:
+                        dep["decorator"] = f"@{decorator_name}"
                     deps.append(dep)
 
             providers[class_name] = {

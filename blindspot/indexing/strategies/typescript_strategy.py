@@ -185,6 +185,11 @@ class TypeScriptParsingStrategy(ParsingStrategy):
                 if current_function is not None:
                     continue
 
+                # Skip destructuring patterns (array_pattern, object_pattern)
+                # e.g. const [foo, setFoo] = useState(...) or const { a, b } = ...
+                if name_node.type in ['array_pattern', 'object_pattern']:
+                    continue
+
                 value_type = value_node.type
                 if value_type not in [
                     'arrow_function',
@@ -244,6 +249,12 @@ class TypeScriptParsingStrategy(ParsingStrategy):
         elif node.type in ['export_statement', 'export_default_declaration']:
             export_text = context.content[node.start_byte:node.end_byte]
             context.exports.append(export_text)
+            # Must traverse children so exported functions/classes are properly registered
+            # e.g. export default function Page() { ... } contains a function_declaration child
+            for child in node.children:
+                self._traverse_node_single_pass(child, context, current_function=current_function,
+                                               current_class=current_class)
+            return
 
         # Continue traversing children for other node types
         for child in node.children:

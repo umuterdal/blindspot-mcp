@@ -475,7 +475,12 @@ class AdvancedAnalysisService(BaseService):
         is_blade = file_path.endswith(".blade.php")
         is_controller = "Controller" in file_path and file_path.endswith(".php")
 
-        # Find which models are involved
+        # Detect TypeORM/NestJS files and use specialized analysis
+        is_ts = file_path.endswith((".ts", ".tsx", ".js", ".jsx"))
+        if is_ts:
+            return self._check_typeorm_eager_loading(file_path, content)
+
+        # Find which models are involved (Laravel)
         if is_controller:
             imported_models = self._find_imported_models(content)
         else:
@@ -676,6 +681,122 @@ class AdvancedAnalysisService(BaseService):
                               + len([i for i in blade_issues if i.get("severity") == "info"]),
                 "eager_loaded_count": len(eager_loaded),
                 "models_checked": len(imported_models),
+            },
+        }
+
+    def _check_typeorm_eager_loading(self, file_path: str, content: str) -> Dict[str, Any]:
+        """
+        Check TypeORM/NestJS files for N+1 query patterns.
+
+        Detects:
+        - Repository .find() calls without relations option
+        - Loops that access entity relationships without preloading
+        - QueryBuilder without leftJoinAndSelect for accessed relations
+        """
+        issues: List[Dict[str, Any]] = []
+        lines = content.split("\n")
+
+        # Find imported entities
+        imported_entities: Set[str] = set()
+        for line in lines:
+            m = re.search(r'import\s*\{([^}]+)\}\s*from\s*[\'"].*entit', line)
+            if m:
+                for name in m.group(1).split(","):
+                    name = name.strip()
+                    if name and not name.startswith("type "):
+                        imported_entities.add(name)
+
+        # Find @InjectRepository usages to map variable -> entity
+        repo_map: Dict[str, str] = {}  # variable name -> entity name
+        for i, line in enumerate(lines):
+            m = re.search(r'@InjectRepository\s*\(\s*(\w+)\s*\)', line)
+            if m:
+                entity = m.group(1)
+                # Next line usually has: private readonly fooRepository: Repository<Foo>
+                for j in range(i, min(i + 3, len(lines))):
+                    vm = re.search(r'(?:private|protected|public)\s+(?:readonly\s+)?(\w+)\s*:', lines[j])
+                    if vm:
+                        repo_map[vm.group(1)] = entity
+                        break
+
+        # Find .find() / .findOne() calls without relations
+        for i, line in enumerate(lines, 1):
+            stripped = line.strip()
+
+            # Pattern: repository.find({ where: ... }) without relations
+            for repo_var in repo_map:
+                if f'{repo_var}.find(' in stripped or f'{repo_var}.findOne(' in stripped:
+                    # Check if relations are specified in the next few lines
+                    context_block = "\n".join(lines[max(0, i - 1):min(len(lines), i + 10)])
+                    has_relations = 'relations:' in context_block or 'relations :' in context_block
+                    if not has_relations:
+                        entity = repo_map[repo_var]
+                        issues.append({
+                            "line": i,
+                            "severity": "info",
+                            "code": "typeorm-no-relations",
+                            "entity": entity,
+                            "message": f"{repo_var}.find() without 'relations' option — related entities won't be loaded",
+                            "snippet": stripped[:120],
+                            "fix": f"Add relations: ['relationName'] to the find options if you need related data",
+                        })
+
+            # Pattern: accessing .property on entity inside a loop (for/map/forEach)
+            # This is a heuristic — look for entity property access after a find
+            if re.search(r'\.(map|forEach|filter|reduce|some|every)\s*\(', stripped):
+                # Check callback body for relationship-like property access
+                block = "\n".join(lines[max(0, i - 1):min(len(lines), i + 15)])
+                # Look for patterns like item.relationship.property
+                deep_access = re.findall(r'(\w+)\.(\w+)\.(\w+)', block)
+                for _, rel, _ in deep_access:
+                    if rel in ('length', 'map', 'filter', 'forEach', 'find', 'some',
+                               'every', 'reduce', 'includes', 'indexOf', 'push',
+                               'prototype', 'constructor', 'toString', 'data',
+                               'status', 'message', 'error', 'type', 'id', 'name'):
+                        continue
+                    # Could be a relationship access — flag as potential
+                    issues.append({
+                        "line": i,
+                        "severity": "info",
+                        "code": "typeorm-deep-access-in-loop",
+                        "message": f"Deep property access '.{rel}.' inside array iteration — verify relation is eager-loaded",
+                        "snippet": stripped[:120],
+                    })
+                    break  # One warning per loop
+
+        # Find QueryBuilder without joins for known relations
+        qb_regions: List[Tuple[int, int]] = []
+        for i, line in enumerate(lines, 1):
+            if '.createQueryBuilder(' in line:
+                qb_regions.append((i, min(i + 30, len(lines))))
+
+        for start, end in qb_regions:
+            block = "\n".join(lines[start - 1:end])
+            has_join = 'leftJoinAndSelect' in block or 'innerJoinAndSelect' in block or 'leftJoin' in block
+            has_get_many = '.getMany()' in block or '.getOne()' in block
+            if has_get_many and not has_join:
+                issues.append({
+                    "line": start,
+                    "severity": "info",
+                    "code": "typeorm-qb-no-join",
+                    "message": "QueryBuilder without join — related entities won't be loaded",
+                    "snippet": lines[start - 1].strip()[:120],
+                    "fix": "Add .leftJoinAndSelect() if you need related entities",
+                })
+
+        return {
+            "status": "success",
+            "file": file_path,
+            "file_type": "typeorm-service",
+            "eager_loaded": [],
+            "models_analyzed": sorted(imported_entities),
+            "issues": issues,
+            "blade_issues": [],
+            "summary": {
+                "n_plus_one_risks": len([i for i in issues if i["severity"] == "warning"]),
+                "info_items": len([i for i in issues if i["severity"] == "info"]),
+                "eager_loaded_count": 0,
+                "models_checked": len(imported_entities),
             },
         }
 

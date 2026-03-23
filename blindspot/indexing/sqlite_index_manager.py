@@ -329,10 +329,18 @@ def _categorize_symbols(symbol_rows) -> Dict[str, List[Dict[str, Any]]]:
     methods: List[Dict[str, Any]] = []
 
     for row in symbol_rows:
+        short_name = row["short_name"] or ""
+
+        # Skip symbols with invalid names (broken parsing artifacts)
+        # Valid identifiers: start with letter/$/_, contain only word chars/$
+        # Also allow Class.method format for methods
+        if short_name and not re.match(r'^[a-zA-Z_$][\w$]*(?:\.[a-zA-Z_$][\w$]*)*$', short_name):
+            continue
+
         symbol_type = row["type"]
         called_by = _safe_json_loads(row["called_by"])
         info = {
-            "name": row["short_name"],
+            "name": short_name,
             "called_by": called_by,
             "line": row["line"],
             "end_line": row["end_line"],

@@ -2141,7 +2141,7 @@ class LaravelValidationService(BaseService):
                         "snippet": stripped[:100],
                     })
 
-            # JavaScript/TypeScript debug
+            # JavaScript/TypeScript anti-patterns
             if file_type == "javascript":
                 if re.search(r'\bconsole\.log\s*\(', stripped):
                     issues.append({
@@ -2153,6 +2153,59 @@ class LaravelValidationService(BaseService):
                     issues.append({
                         "line": i, "severity": "error", "code": "debugger",
                         "message": "debugger statement found — remove before commit",
+                        "snippet": stripped[:100],
+                    })
+                # any type usage
+                if re.search(r':\s*any\b', stripped) and '// eslint-disable' not in stripped:
+                    issues.append({
+                        "line": i, "severity": "warning", "code": "any-type",
+                        "message": "Explicit 'any' type — use a specific type instead",
+                        "snippet": stripped[:100],
+                    })
+                # @ts-ignore without explanation
+                if re.search(r'@ts-ignore(?!\s+\S)', stripped):
+                    issues.append({
+                        "line": i, "severity": "warning", "code": "ts-ignore",
+                        "message": "@ts-ignore without explanation — use @ts-expect-error with a reason",
+                        "snippet": stripped[:100],
+                    })
+                # Non-null assertion operator (!) overuse
+                if re.search(r'\w+!\.\w+', stripped) or re.search(r'\w+!;', stripped):
+                    issues.append({
+                        "line": i, "severity": "info", "code": "non-null-assertion",
+                        "message": "Non-null assertion (!) — consider proper null handling",
+                        "snippet": stripped[:100],
+                    })
+                # Empty catch blocks
+                if re.search(r'catch\s*\([^)]*\)\s*\{\s*\}', stripped):
+                    issues.append({
+                        "line": i, "severity": "warning", "code": "empty-catch",
+                        "message": "Empty catch block — errors are silently swallowed",
+                        "snippet": stripped[:100],
+                    })
+                # Nested ternary (exclude optional chaining ?. from count)
+                clean_for_ternary = re.sub(r'\?\.|(\?\?)', '', stripped)
+                real_questions = clean_for_ternary.count('?')
+                real_colons = clean_for_ternary.count(':')
+                if real_questions >= 2 and real_colons >= 2:
+                    if re.search(r'\?[^:?]+\?', clean_for_ternary):
+                        issues.append({
+                            "line": i, "severity": "warning", "code": "nested-ternary",
+                            "message": "Nested ternary operator — extract to if/else or variable for readability",
+                            "snippet": stripped[:100],
+                        })
+                # TODO/FIXME/HACK comments
+                if re.search(r'//\s*(TODO|FIXME|HACK|XXX)\b', stripped):
+                    issues.append({
+                        "line": i, "severity": "info", "code": "todo-comment",
+                        "message": "TODO/FIXME comment found — track in issue tracker",
+                        "snippet": stripped[:100],
+                    })
+                # Magic numbers (numeric literals not -1, 0, 1, 2 in logic)
+                if re.search(r'===?\s*\d{2,}|!==?\s*\d{2,}|[<>]=?\s*\d{2,}', stripped):
+                    issues.append({
+                        "line": i, "severity": "info", "code": "magic-number",
+                        "message": "Magic number in comparison — extract to a named constant",
                         "snippet": stripped[:100],
                     })
 
