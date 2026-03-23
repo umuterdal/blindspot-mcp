@@ -1,0 +1,47 @@
+# Blindspot MCP configuration for Next.js projects
+language: typescript
+framework: nextjs
+
+anti_patterns:
+  enabled: true
+  custom_rules:
+    - name: "no-any-type"
+      pattern: ":\\s*any\\b"
+      message: "Avoid using 'any' type — use a specific type or 'unknown'"
+      severity: warning
+
+    - name: "no-console-log"
+      pattern: "console\\.log\\("
+      message: "Remove console.log() before committing — use a proper logger"
+      severity: warning
+
+    - name: "no-inline-styles"
+      pattern: "style=\\{\\{"
+      message: "Use CSS modules or Tailwind classes instead of inline styles"
+      severity: warning
+
+    - name: "no-useeffect-fetch"
+      pattern: "useEffect\\([^)]*fetch\\("
+      message: "Use server components or SWR/React Query for data fetching"
+      severity: warning
+
+syntax_check:
+  enabled: true
+  on_failure: warn
+
+scan_dirs:
+  - src
+  - app
+  - pages
+  - components
+  - lib
+  - utils
+  - hooks
+  - types
+
+exclude_dirs:
+  - node_modules
+  - .next
+  - out
+  - public
+  - coverage

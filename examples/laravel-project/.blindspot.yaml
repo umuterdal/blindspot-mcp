@@ -1,0 +1,45 @@
+# Blindspot MCP configuration for Laravel projects
+language: php
+framework: laravel
+
+anti_patterns:
+  enabled: true
+  custom_rules:
+    - name: "no-raw-sql"
+      pattern: "DB::raw\\("
+      message: "Use Eloquent query builder instead of raw SQL"
+      severity: warning
+
+    - name: "no-env-in-code"
+      pattern: "env\\(['\"]"
+      message: "Use config() instead of env() outside of config files"
+      severity: error
+
+    - name: "no-query-in-blade"
+      pattern: "\\{\\{.*::(where|find|all|get)\\("
+      message: "Do not run Eloquent queries directly in Blade templates"
+      severity: error
+
+    - name: "no-dd-in-production"
+      pattern: "\\bdd\\("
+      message: "Remove dd() calls before committing"
+      severity: warning
+
+syntax_check:
+  enabled: true
+  on_failure: rollback
+
+scan_dirs:
+  - app
+  - config
+  - routes
+  - database
+  - resources/views
+  - tests
+
+exclude_dirs:
+  - vendor
+  - node_modules
+  - storage
+  - public
+  - bootstrap/cache

@@ -1,0 +1,68 @@
+# Blindspot MCP Configuration
+# Copy this file to .blindspot.yaml in your project root
+
+# Primary language of your project
+language: php  # php, javascript, typescript, python, go, rust
+
+# Framework (enables framework-specific tools)
+framework: laravel  # laravel, nextjs, django, rails, express, none
+
+# Custom anti-pattern rules
+# Each rule is checked against files matching the specified file_types
+anti_patterns:
+  - pattern: "console\\.log\\("
+    severity: error
+    message: "Remove console.log before commit"
+    file_types: [js, ts, jsx, tsx]
+
+  - pattern: "dd\\("
+    severity: error
+    message: "Remove dd() debug function before commit"
+    file_types: [php]
+
+  - pattern: "dump\\("
+    severity: error
+    message: "Remove dump() debug function before commit"
+    file_types: [php]
+
+  - pattern: "debugger"
+    severity: error
+    message: "Remove debugger statement before commit"
+    file_types: [js, ts, jsx, tsx]
+
+  - pattern: "TODO|FIXME|HACK|XXX"
+    severity: warning
+    message: "Unresolved TODO/FIXME comment"
+    file_types: []  # empty = all files
+
+  - pattern: "import pdb|breakpoint\\(\\)"
+    severity: error
+    message: "Remove Python debugger before commit"
+    file_types: [py]
+
+# Custom syntax checkers (overrides defaults)
+# Available placeholders: {file}
+syntax_check:
+  php: "php -l {file}"
+  typescript: "npx tsc --noEmit --pretty false {file}"
+  python: "python -m py_compile {file}"
+  # javascript: "node --check {file}"
+  # go: "go vet {file}"
+  # rust: "cargo check --message-format=short 2>&1"
+
+# Directories to scan for specific categories
+# Used by framework plugins and code intelligence
+scan_dirs:
+  models: "app/Models"
+  controllers: "app/Http/Controllers"
+  views: "resources/views"
+  services: "app/Services"
+  migrations: "database/migrations"
+  routes: "routes"
+  middleware: "app/Http/Middleware"
+  tests: "tests"
+
+# Additional directories to exclude from indexing
+exclude_dirs:
+  - storage
+  - bootstrap/cache
