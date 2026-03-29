@@ -154,21 +154,25 @@ class SQLiteIndexStore:
                 f"Unexpected schema version {stored} (expected {SCHEMA_VERSION})"
             )
 
+    # Whitelisted PRAGMA names and allowed value patterns for safety
+    _ALLOWED_PRAGMAS = {"journal_mode", "synchronous", "cache_size", "temp_store"}
+
     def _apply_pragmas(self, conn: sqlite3.Connection, for_build: bool) -> None:
         pragmas: Dict[str, Any] = {
-            "journal_mode": "WAL" if for_build else "WAL",
+            "journal_mode": "WAL",
             "synchronous": "NORMAL" if for_build else "FULL",
-            "cache_size": -262144,  # negative => size in KB, ~256MB
+            "cache_size": -262144,
         }
+        if for_build:
+            pragmas["temp_store"] = "MEMORY"
+
         for pragma, value in pragmas.items():
+            if pragma not in self._ALLOWED_PRAGMAS:
+                continue
             try:
+                # Use parameterized-safe approach: pragma names are whitelisted,
+                # values are from hardcoded dict (not user input)
                 conn.execute(f"PRAGMA {pragma}={value}")
             except sqlite3.DatabaseError:
-                # PRAGMA not supported or rejected; continue best-effort.
                 continue
-        if for_build:
-            try:
-                conn.execute("PRAGMA temp_store=MEMORY")
-            except sqlite3.DatabaseError:
-                pass
 
