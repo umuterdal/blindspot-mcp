@@ -29,10 +29,19 @@ logger = logging.getLogger(__name__)
 # Session-level tracking for ripple analysis across multiple smart_apply_edit calls
 _SESSION_RIPPLE_ITEMS: Dict[str, Dict[str, Any]] = {}
 _SESSION_RESOLVED: Set[str] = set()
+_SESSION_INDEX_DIRTY: Set[str] = set()  # Files edited this session (for re-edit warnings)
+_SESSION_PIPELINE_CALLS: Dict[str, Set[str]] = {}  # file_path -> {"context", "pre_edit"} tracking
+_SESSION_DECISIONS: List[Dict[str, Any]] = []  # Edit history memory
+_SESSION_FEEDBACK_OVERRIDES: Dict[str, Dict] = {}  # ripple_id -> {correct, note, original_action}
 _SESSION_METRICS: Dict[str, Any] = {
     "total_edits": 0,
     "files_edited": set(),
+    "blocked_edits": 0,
     "total_warnings": 0,
+    "warnings_by_type": {},
+    "total_ripple_items": 0,
+    "resolved_ripple_items": 0,
+    "avg_affected_per_edit": 0.0,
 }
 
 # Laravel irregular pluralization — covers common model names
@@ -110,6 +119,25 @@ class AdvancedAnalysisService(BaseService):
             json.dump(entries, f, indent=2, default=str)
 
         return detail_path
+
+    @staticmethod
+    def _generate_ripple_id(file_path: str, line: int, symbol: str) -> str:
+        """Generate deterministic ripple item ID for cross-call tracking."""
+        import hashlib
+        raw = f"{file_path}:{line}:{symbol}"
+        return hashlib.md5(raw.encode()).hexdigest()[:8]
+
+    @staticmethod
+    def _get_truncation_limits(total_files: int) -> Dict[str, int]:
+        """Adaptive truncation based on impact size."""
+        if total_files <= 3:
+            return {"max_files": 3, "max_lines": 20}
+        elif total_files <= 10:
+            return {"max_files": 5, "max_lines": 15}
+        elif total_files <= 20:
+            return {"max_files": 7, "max_lines": 10}
+        else:
+            return {"max_files": 5, "max_lines": 5}
 
     @staticmethod
     def _compact_smart_response(result: Dict[str, Any]) -> Dict[str, Any]:
@@ -1714,24 +1742,21 @@ class AdvancedAnalysisService(BaseService):
             "total_issues": len(all_issues),
         }
 
-        # Save full results to detail file, return compact summary
-        if len(all_issues) > 20:
-            try:
-                base = self._get_project_path() or ""
-                detail_path = self._save_to_session_file("full_audit", full_result, base)
-                return {
-                    "status": "success",
-                    "focus": focus,
-                    "files_scanned": len(source_files),
-                    "summary": summary,
-                    "total_issues": len(all_issues),
-                    "detail_file": detail_path,
-                    "hint": "Full issue list saved to detail_file. Read it for specifics.",
-                }
-            except Exception:
-                pass
-
-        return full_result
+        # Always save full results to detail file, return compact summary
+        try:
+            base = self._get_project_path() or ""
+            detail_path = self._save_to_session_file("full_audit", full_result, base)
+            return {
+                "status": "success",
+                "focus": focus,
+                "files_scanned": len(source_files),
+                "summary": summary,
+                "total_issues": len(all_issues),
+                "detail_file": detail_path,
+                "hint": "Full issue list saved to detail_file. Read it for specifics.",
+            }
+        except Exception:
+            return full_result
 
     def _audit_security(
         self, file_path: str, lines: List[str], syntax: LanguageSyntax,
@@ -2321,6 +2346,10 @@ class AdvancedAnalysisService(BaseService):
         start_line: int = None,
         end_line: int = None,
         occurrence: int = None,
+        pipeline_context: dict = None,
+        resolved_items: list = None,
+        strict_mode: dict = None,
+        feedback: dict = None,
     ) -> Dict[str, Any]:
         """
         The ultimate single-call edit tool. apply_edit on steroids.
@@ -2347,6 +2376,29 @@ class AdvancedAnalysisService(BaseService):
         edit_svc = FileEditService(self.ctx)
         intel = self._get_generic_intel()
 
+        # Pipeline enforcement: check if get_context_for_edit was called first
+        if strict_mode and strict_mode.get("enforce_pipeline"):
+            pipeline_calls = _SESSION_PIPELINE_CALLS.get(file_path, set())
+            if "context" not in pipeline_calls:
+                _SESSION_METRICS["blocked_edits"] += 1
+                return {
+                    "status": "blocked",
+                    "message": "Pipeline enforcement: call get_context_for_edit() before smart_apply_edit on high-risk files",
+                    "missing_pipeline_steps": ["get_context_for_edit"],
+                }
+
+        # Process human feedback overrides
+        if feedback:
+            for ripple_id, fb in feedback.items():
+                _SESSION_FEEDBACK_OVERRIDES[ripple_id] = fb
+
+        # Track resolved items from previous calls
+        if resolved_items:
+            for item_id in resolved_items:
+                _SESSION_RESOLVED.add(item_id)
+                if item_id in _SESSION_RIPPLE_ITEMS:
+                    _SESSION_RIPPLE_ITEMS[item_id]["state"] = "resolved"
+
         # Update session metrics
         _SESSION_METRICS["total_edits"] += 1
         _SESSION_METRICS["files_edited"].add(file_path)
@@ -2366,6 +2418,11 @@ class AdvancedAnalysisService(BaseService):
 
         if result.get("status") != "success":
             return result
+
+        # Track this file as dirty for re-edit warnings
+        if file_path in _SESSION_INDEX_DIRTY:
+            result["re_edit_warning"] = f"File {file_path} was already edited this session. Verify previous changes first."
+        _SESSION_INDEX_DIRTY.add(file_path)
 
         base = self._get_project_path()
         if not base:
@@ -2572,6 +2629,10 @@ class AdvancedAnalysisService(BaseService):
             except Exception:
                 pass
 
+        # Derive symbol name and total affected for summaries
+        symbol_name = changed_symbols[0] if changed_symbols else "unknown"
+        total_affected = sum(w.get("total_files_affected", 0) for w in ripple_warnings)
+
         if ripple_warnings:
             # Deterministic sort: priority (HIGH->MEDIUM->LOW) -> file path -> line
             ripple_warnings.sort(key=lambda w: (
@@ -2583,20 +2644,97 @@ class AdvancedAnalysisService(BaseService):
             for w in ripple_warnings:
                 w.pop("_sort_priority", None)
 
+            # Decision rationale and ripple IDs per warning
+            for w in ripple_warnings:
+                w["rationale"] = f"{w.get('risk_level', 'review')}: {w.get('symbol', symbol_name)} affects {w.get('total_files_affected', 0)} files"
+                w["id"] = self._generate_ripple_id(
+                    w.get("affected_files_with_code", [{}])[0].get("file", "") if w.get("affected_files_with_code") else "",
+                    (w.get("affected_files_with_code", [{}])[0].get("lines", [{}])[0].get("line", 0) if w.get("affected_files_with_code") else 0),
+                    symbol_name,
+                )
+
+            # Register ripple items with lifecycle
+            for item in all_ripple_items:
+                rid = self._generate_ripple_id(item["file"], item.get("line", 0), symbol_name)
+                state = "open"
+                if rid in _SESSION_RESOLVED:
+                    state = "reopened"  # Was resolved but file re-edited
+                _SESSION_RIPPLE_ITEMS[rid] = {
+                    "file": item["file"],
+                    "line": item.get("line", 0),
+                    "symbol": symbol_name,
+                    "action": item.get("classification", "review_logic"),
+                    "state": state,
+                    "id": rid,
+                }
+
             result["ripple_warnings"] = ripple_warnings
             _SESSION_METRICS["total_warnings"] += len(ripple_warnings)
+
+        # Count priority levels for edit summary
+        high_count = sum(
+            1 for w in ripple_warnings
+            for af in w.get("affected_files_with_code", [])
+            if isinstance(af, dict) and af.get("classification") == "fix_required"
+        )
+        med_count = sum(
+            1 for w in ripple_warnings
+            for af in w.get("affected_files_with_code", [])
+            if isinstance(af, dict) and af.get("classification") in ("check_redundancy", "review_logic")
+        )
+
+        # Build edit summary
+        result["edit_summary"] = {
+            "changed_symbols": changed_symbols[:5],
+            "total_affected_files": total_affected,
+            "high_priority_items": high_count,
+            "medium_priority_items": med_count,
+            "remaining_risk": "critical" if high_count > 5 else "high" if high_count > 0 else "medium" if med_count > 0 else "low",
+        }
+
+        # Auto-fix suggestions for HIGH priority (fix_required) items
+        fix_suggestions = []
+        for w in ripple_warnings:
+            for af in w.get("affected_files_with_code", []):
+                if isinstance(af, dict) and af.get("classification") == "fix_required":
+                    for ln in af.get("lines", [])[:2]:
+                        fix_suggestions.append({
+                            "file": af["file"],
+                            "suggestion": f"Update usage of '{symbol_name}' to match new behavior",
+                            "line": ln.get("line", 0),
+                        })
+        if fix_suggestions:
+            result["fix_suggestions"] = fix_suggestions[:5]
 
         # Coverage tracking
         if all_ripple_items:
             total_items = len(all_ripple_items)
-            resolved_items = len(items_no_action)
-            coverage_pct = (resolved_items / total_items * 100) if total_items > 0 else 100.0
+            resolved_count = len(items_no_action)
+            coverage_pct = (resolved_count / total_items * 100) if total_items > 0 else 100.0
             result["ripple_coverage"] = {
                 "total_items": total_items,
-                "resolved_items": resolved_items,
+                "resolved_items": resolved_count,
                 "coverage_percent": round(coverage_pct, 1),
-                "needs_attention": total_items - resolved_items,
+                "needs_attention": total_items - resolved_count,
             }
+
+        # Record decision in session history
+        _SESSION_DECISIONS.append({
+            "file": file_path,
+            "symbol": symbol_name if changed_symbols else "unknown",
+            "affected_count": total_affected,
+            "timestamp": time.strftime("%H:%M:%S"),
+        })
+
+        # Update session metrics fully
+        _SESSION_METRICS["total_warnings"] = _SESSION_METRICS.get("total_warnings", 0)
+        _SESSION_METRICS["total_ripple_items"] = len(_SESSION_RIPPLE_ITEMS)
+        _SESSION_METRICS["resolved_ripple_items"] = len(_SESSION_RESOLVED)
+        total_edits = _SESSION_METRICS["total_edits"]
+        if total_edits > 0:
+            _SESSION_METRICS["avg_affected_per_edit"] = (
+                _SESSION_METRICS.get("avg_affected_per_edit", 0) * (total_edits - 1) + total_affected
+            ) / total_edits
 
         # Session-level metrics
         result["session_metrics"] = {
@@ -2605,6 +2743,8 @@ class AdvancedAnalysisService(BaseService):
             "total_ripple_items": len(_SESSION_RIPPLE_ITEMS),
             "total_resolved": len(_SESSION_RESOLVED),
             "total_warnings": _SESSION_METRICS["total_warnings"],
+            "blocked_edits": _SESSION_METRICS["blocked_edits"],
+            "avg_affected_per_edit": round(_SESSION_METRICS["avg_affected_per_edit"], 1),
         }
 
         # Save full response and return compact summary

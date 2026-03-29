@@ -1025,6 +1025,12 @@ def get_context_for_edit(file_path: str, ctx: Context, symbol: str = None) -> di
         file_path: Relative path to the file about to be edited
         symbol: Optional method/property to focus on (triggers ripple analysis)
     """
+    # Track pipeline call for strict_mode enforcement in smart_apply_edit
+    from .services.advanced_analysis_service import _SESSION_PIPELINE_CALLS
+    if file_path not in _SESSION_PIPELINE_CALLS:
+        _SESSION_PIPELINE_CALLS[file_path] = set()
+    _SESSION_PIPELINE_CALLS[file_path].add("context")
+
     return GenericIntelligenceService(ctx).get_context_for_edit(file_path, symbol)
 
 
@@ -1042,6 +1048,10 @@ def smart_apply_edit(
     start_line: int = None,
     end_line: int = None,
     occurrence: int = None,
+    pipeline_context: dict = None,
+    resolved_items: list = None,
+    strict_mode: dict = None,
+    feedback: dict = None,
 ) -> dict[str, Any]:
     """
     apply_edit with automatic ripple effect analysis — the safe edit tool.
@@ -1057,7 +1067,12 @@ def smart_apply_edit(
     Use this instead of apply_edit for model/controller/service edits.
     For simple template/config edits, regular apply_edit is fine.
 
-    Args: Same as apply_edit — all 5 modes (search-replace, batch, symbol, line-range, occurrence).
+    Args:
+        Same as apply_edit — all 5 modes (search-replace, batch, symbol, line-range, occurrence).
+        pipeline_context: Optional context from get_context_for_edit for pipeline tracking.
+        resolved_items: List of ripple item IDs previously resolved by the agent.
+        strict_mode: Dict with enforcement options (e.g., {"enforce_pipeline": True}).
+        feedback: Dict mapping ripple_id -> {correct, note, original_action} for human overrides.
     """
     return AdvancedAnalysisService(ctx).smart_apply_edit(
         file_path=file_path,
@@ -1069,6 +1084,10 @@ def smart_apply_edit(
         start_line=start_line,
         end_line=end_line,
         occurrence=occurrence,
+        pipeline_context=pipeline_context,
+        resolved_items=resolved_items,
+        strict_mode=strict_mode,
+        feedback=feedback,
     )
 
 
