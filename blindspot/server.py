@@ -822,6 +822,69 @@ def diff_preview(edits: list, ctx: Context) -> dict[str, Any]:
     return AdvancedAnalysisService(ctx).diff_preview(edits)
 
 
+# ----- AUDIT & CHECKLIST TOOLS -----
+
+
+@mcp.tool()
+@handle_mcp_tool_errors(return_type="dict")
+@with_concurrency_limit
+def full_audit(ctx: Context, focus: str = "all") -> dict[str, Any]:
+    """
+    Run comprehensive, language-agnostic project audit.
+
+    Scans all source files for issues across four categories:
+    - security: hardcoded secrets, SQL injection, mass assignment, XSS
+    - performance: queries in loops, unbounded queries, N+1 patterns
+    - quality: debug statements, TODO/FIXME, empty catch blocks, unused imports
+    - dead_code: functions/methods with no external references
+
+    Uses the LanguageSyntax adapter for language-specific patterns and the
+    deep index for dead code cross-referencing.
+
+    Args:
+        focus: Category to scan — "all", "security", "performance", "quality", or "dead_code"
+    """
+    return AdvancedAnalysisService(ctx).full_audit(focus)
+
+
+@mcp.tool()
+@handle_mcp_tool_errors(return_type="dict")
+@with_concurrency_limit
+def post_edit_checklist(file_path: str, ctx: Context) -> dict[str, Any]:
+    """
+    Get a language-aware checklist of steps to take after editing a file.
+
+    Based on file extension and project type, returns required and
+    recommended next steps:
+    - PHP: syntax check, route cache clear, test run
+    - JS/TS: type check, test run (Jest/Vitest)
+    - Python: compile check, pytest
+    - Go: go vet, go test
+    - Rust: cargo check, cargo test
+    - Config files: restart server, clear cache
+    - Migration files: run migration
+    - Docker files: rebuild container
+    - Test files: run the specific test
+
+    Args:
+        file_path: Relative path to the file that was just edited
+    """
+    return AdvancedAnalysisService(ctx).post_edit_checklist(file_path)
+
+
+@mcp.tool()
+@handle_mcp_tool_errors(return_type="dict")
+def get_rebuild_status(ctx: Context) -> dict[str, Any]:
+    """
+    Get the current status of the deep index.
+
+    Returns whether the index is built, file count, symbol count,
+    and available languages. Useful to check if build_deep_index
+    needs to be called before using symbol-dependent tools.
+    """
+    return IndexManagementService(ctx).get_rebuild_status()
+
+
 # ----- PROACTIVE CONTEXT TOOLS -----
 
 

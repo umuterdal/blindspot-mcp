@@ -10,9 +10,11 @@ Provides advanced analysis capabilities that go beyond basic code intelligence:
 - Multi-file diff preview (dry-run)
 """
 
+import json
 import logging
 import os
 import re
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -20,8 +22,18 @@ from .base_service import BaseService
 from .generic_intelligence_service import GenericIntelligenceService
 from .laravel_intelligence_service import LaravelIntelligenceService
 from .laravel_validation_service import LaravelValidationService
+from ..adapters.language_syntax import get_syntax_for_file, get_language_syntax, get_all_languages, LanguageSyntax
 
 logger = logging.getLogger(__name__)
+
+# Session-level tracking for ripple analysis across multiple smart_apply_edit calls
+_SESSION_RIPPLE_ITEMS: Dict[str, Dict[str, Any]] = {}
+_SESSION_RESOLVED: Set[str] = set()
+_SESSION_METRICS: Dict[str, Any] = {
+    "total_edits": 0,
+    "files_edited": set(),
+    "total_warnings": 0,
+}
 
 # Laravel irregular pluralization — covers common model names
 _IRREGULAR_PLURALS = {
@@ -1471,6 +1483,689 @@ class AdvancedAnalysisService(BaseService):
 
         return context
 
+    # ── full_audit ───────────────────────────────────────────────────
+
+    def full_audit(self, focus: str = "all") -> Dict[str, Any]:
+        """
+        Run a comprehensive, language-agnostic project audit.
+
+        Scans for security, performance, quality, and dead code issues
+        across all source files using the LanguageSyntax adapter for
+        language-specific pattern matching.
+
+        Args:
+            focus: Category to scan — "all", "security", "performance",
+                   "quality", or "dead_code".
+
+        Returns:
+            Dict with issues grouped by category, each with severity,
+            file, line, message, and fix suggestion.
+        """
+        base = self._get_project_path()
+        if not base:
+            return {"status": "error", "message": "Project path not set"}
+
+        valid_categories = {"all", "security", "performance", "quality", "dead_code"}
+        if focus not in valid_categories:
+            return {"status": "error", "message": f"Invalid focus '{focus}'. Use: {sorted(valid_categories)}"}
+
+        categories_to_run = (
+            ["security", "performance", "quality", "dead_code"]
+            if focus == "all"
+            else [focus]
+        )
+
+        # Collect all source files
+        from ..config import EXTENSION_LANGUAGE_MAP
+        source_files: List[Tuple[str, str, str]] = []  # (rel_path, full_path, language)
+        for root, _dirs, files in os.walk(base):
+            # Skip common non-source directories
+            rel_root = os.path.relpath(root, base)
+            if any(skip in rel_root.split(os.sep) for skip in [
+                "node_modules", "vendor", ".git", "__pycache__", ".mypy_cache",
+                "dist", "build", ".next", "target", "coverage", "test_env",
+                ".blindspot",
+            ]):
+                continue
+            for fname in files:
+                ext = os.path.splitext(fname)[1]
+                lang = EXTENSION_LANGUAGE_MAP.get(ext)
+                if lang:
+                    full = os.path.join(root, fname)
+                    rel = os.path.relpath(full, base)
+                    source_files.append((rel, full, lang))
+
+        results: Dict[str, List[Dict[str, Any]]] = {
+            "security": [],
+            "performance": [],
+            "quality": [],
+            "dead_code": [],
+        }
+
+        # Cap files to avoid extremely long scans
+        source_files = source_files[:500]
+
+        for rel_path, full_path, language in source_files:
+            try:
+                with open(full_path, "r", encoding="utf-8", errors="replace") as f:
+                    content = f.read()
+            except Exception:
+                continue
+
+            syntax = get_language_syntax(language)
+            lines = content.split("\n")
+
+            if "security" in categories_to_run:
+                self._audit_security(rel_path, lines, syntax, language, results["security"])
+            if "performance" in categories_to_run:
+                self._audit_performance(rel_path, lines, syntax, language, results["performance"])
+            if "quality" in categories_to_run:
+                self._audit_quality(rel_path, lines, syntax, language, results["quality"])
+
+        # Dead code detection uses the deep index
+        if "dead_code" in categories_to_run:
+            self._audit_dead_code(base, source_files, results["dead_code"])
+
+        # Build summary
+        all_issues = []
+        for cat in categories_to_run:
+            all_issues.extend(results[cat])
+
+        summary = {}
+        for cat in categories_to_run:
+            issues = results[cat]
+            summary[cat] = {
+                "total": len(issues),
+                "critical": sum(1 for i in issues if i.get("severity") == "critical"),
+                "error": sum(1 for i in issues if i.get("severity") == "error"),
+                "warning": sum(1 for i in issues if i.get("severity") == "warning"),
+                "info": sum(1 for i in issues if i.get("severity") == "info"),
+            }
+
+        return {
+            "status": "success",
+            "focus": focus,
+            "files_scanned": len(source_files),
+            "issues": {cat: results[cat] for cat in categories_to_run},
+            "summary": summary,
+            "total_issues": len(all_issues),
+        }
+
+    def _audit_security(
+        self, file_path: str, lines: List[str], syntax: LanguageSyntax,
+        language: str, issues: List[Dict[str, Any]]
+    ) -> None:
+        """Scan for security issues in a file."""
+        for i, line in enumerate(lines, 1):
+            stripped = line.strip()
+            if syntax.is_comment(stripped):
+                continue
+
+            # Hardcoded secrets: API keys, passwords, tokens
+            secret_patterns = [
+                (r'(?:api[_-]?key|apikey|secret[_-]?key|password|passwd|token|auth[_-]?token)\s*[=:]\s*["\'][^"\']{8,}["\']',
+                 "Hardcoded secret detected"),
+                (r'(?:AWS_SECRET|STRIPE_SECRET|DATABASE_PASSWORD|PRIVATE_KEY)\s*[=:]\s*["\'][^"\']+["\']',
+                 "Hardcoded credential constant"),
+            ]
+            for pattern, msg in secret_patterns:
+                if re.search(pattern, stripped, re.IGNORECASE):
+                    # Skip env() calls or os.environ or process.env
+                    if any(safe in stripped for safe in ["env(", "os.environ", "process.env", "getenv", "os.Getenv"]):
+                        continue
+                    issues.append({
+                        "severity": "critical",
+                        "file": file_path,
+                        "line": i,
+                        "code": "hardcoded-secret",
+                        "message": msg,
+                        "fix": "Use environment variables instead of hardcoded values",
+                    })
+
+            # Raw SQL without bindings
+            raw_sql_patterns = {
+                "php": [r'DB::raw\s*\(\s*["\'].*\$', r'->whereRaw\s*\(\s*["\'].*\$'],
+                "python": [r'\.execute\s*\(\s*f["\']', r'\.execute\s*\(\s*["\'].*%\s*\(', r'cursor\.execute\s*\(\s*["\'].*\+'],
+                "javascript": [r'\.query\s*\(\s*`[^`]*\$\{', r'\.query\s*\(\s*["\'].*\+'],
+                "typescript": [r'\.query\s*\(\s*`[^`]*\$\{', r'\.query\s*\(\s*["\'].*\+'],
+                "go": [r'\.Exec\s*\(\s*fmt\.Sprintf', r'\.Query\s*\(\s*fmt\.Sprintf'],
+                "ruby": [r'\.execute\s*\(\s*".*#\{', r'\.where\s*\(\s*".*#\{'],
+            }
+            for pattern in raw_sql_patterns.get(language, []):
+                if re.search(pattern, stripped):
+                    issues.append({
+                        "severity": "error",
+                        "file": file_path,
+                        "line": i,
+                        "code": "raw-sql-injection",
+                        "message": "Raw SQL with variable interpolation — SQL injection risk",
+                        "fix": "Use parameterized queries or query builder bindings",
+                    })
+
+            # Mass assignment risks (language-specific)
+            if language == "php":
+                if re.search(r'->(?:create|update|fill)\s*\(\s*\$request->all\(\)', stripped):
+                    issues.append({
+                        "severity": "error",
+                        "file": file_path,
+                        "line": i,
+                        "code": "mass-assignment",
+                        "message": "Mass assignment with $request->all() — use validated() or only()",
+                        "fix": "Use $request->validated() or $request->only([...]) instead",
+                    })
+            elif language == "python":
+                if re.search(r'\.objects\.create\s*\(\s*\*\*request\.(data|POST)', stripped):
+                    issues.append({
+                        "severity": "error",
+                        "file": file_path,
+                        "line": i,
+                        "code": "mass-assignment",
+                        "message": "Mass assignment with **request.data — use serializer validation",
+                        "fix": "Use a serializer with explicit fields instead of passing raw request data",
+                    })
+            elif language in ("javascript", "typescript"):
+                if re.search(r'\.create\s*\(\s*req\.body\s*\)', stripped):
+                    issues.append({
+                        "severity": "error",
+                        "file": file_path,
+                        "line": i,
+                        "code": "mass-assignment",
+                        "message": "Mass assignment with req.body — validate and pick fields",
+                        "fix": "Use a DTO or pick specific fields from req.body",
+                    })
+
+            # Unescaped output patterns
+            if language == "php":
+                if re.search(r'\{!!\s*\$', stripped) or re.search(r'echo\s+\$(?!this)', stripped):
+                    issues.append({
+                        "severity": "warning",
+                        "file": file_path,
+                        "line": i,
+                        "code": "unescaped-output",
+                        "message": "Unescaped output — potential XSS risk",
+                        "fix": "Use {{ $var }} (escaped) instead of {!! $var !!} or echo",
+                    })
+            elif language in ("javascript", "typescript"):
+                if re.search(r'dangerouslySetInnerHTML', stripped) or re.search(r'\.innerHTML\s*=', stripped):
+                    issues.append({
+                        "severity": "warning",
+                        "file": file_path,
+                        "line": i,
+                        "code": "unescaped-output",
+                        "message": "Direct HTML injection — potential XSS risk",
+                        "fix": "Sanitize HTML input or use safe rendering methods",
+                    })
+
+    def _audit_performance(
+        self, file_path: str, lines: List[str], syntax: LanguageSyntax,
+        language: str, issues: List[Dict[str, Any]]
+    ) -> None:
+        """Scan for performance issues in a file."""
+        in_loop = False
+        loop_depth = 0
+        brace_depth = 0
+
+        for i, line in enumerate(lines, 1):
+            stripped = line.strip()
+            if syntax.is_comment(stripped):
+                continue
+
+            # Track loop context (brace-based languages)
+            if language in ("php", "javascript", "typescript", "go", "rust", "java"):
+                brace_depth += stripped.count("{") - stripped.count("}")
+                if re.match(r'(for|foreach|while)\s*\(', stripped):
+                    loop_depth += 1
+                if loop_depth > 0 and brace_depth <= 0:
+                    loop_depth = max(0, loop_depth - 1)
+            elif language == "python":
+                if re.match(r'(for|while)\s+', stripped):
+                    in_loop = True
+                elif in_loop and stripped and not stripped.startswith((' ', '\t')) and not stripped.startswith('#'):
+                    in_loop = False
+
+            is_in_loop = loop_depth > 0 or in_loop
+
+            # Unbounded queries (queries without limits in loops)
+            query_in_loop_patterns = {
+                "php": [r'::where\(', r'::find\(', r'DB::table\('],
+                "python": [r'\.objects\.(filter|get|all)\(', r'\.execute\(', r'session\.query\('],
+                "javascript": [r'\.find\(', r'\.findOne\(', r'await\s+.*\.query\('],
+                "typescript": [r'\.find\(', r'\.findOne\(', r'\.getRepository\('],
+                "go": [r'\.Find\(', r'\.First\(', r'\.Where\('],
+                "ruby": [r'\.where\(', r'\.find\(', r'\.find_by\('],
+            }
+            if is_in_loop:
+                for pattern in query_in_loop_patterns.get(language, []):
+                    if re.search(pattern, stripped):
+                        issues.append({
+                            "severity": "error",
+                            "file": file_path,
+                            "line": i,
+                            "code": "query-in-loop",
+                            "message": "Database query inside loop — batch or eager-load instead",
+                            "fix": "Move query outside loop, use batch query, or eager loading",
+                        })
+                        break
+
+            # Missing pagination on list-like queries
+            pagination_check = {
+                "php": (r'->get\(\s*\)', r'paginate\('),
+                "python": (r'\.all\(\s*\)', r'\.paginate\(|Paginator|PageNumberPagination|\[:.*\]'),
+                "javascript": (r'\.find\(\s*\{\s*\}\s*\)', r'\.limit\(|\.skip\(|\.paginate\('),
+                "typescript": (r'\.find\(\s*\{\s*\}\s*\)', r'\.take\(|\.skip\(|\.limit\('),
+            }
+            if language in pagination_check:
+                fetch_pat, page_pat = pagination_check[language]
+                if re.search(fetch_pat, stripped):
+                    # Check surrounding lines for pagination
+                    context_block = "\n".join(lines[max(0, i - 5):min(len(lines), i + 5)])
+                    if not re.search(page_pat, context_block):
+                        issues.append({
+                            "severity": "warning",
+                            "file": file_path,
+                            "line": i,
+                            "code": "unbounded-query",
+                            "message": "Query fetches all records without pagination or limit",
+                            "fix": "Add pagination or limit to prevent loading unbounded data",
+                        })
+
+            # Large file reads without streaming
+            file_read_patterns = {
+                "php": r'file_get_contents\(',
+                "python": r'\.read\(\s*\)|\.readlines\(\s*\)',
+                "javascript": r'readFileSync\(|readFile\(',
+                "go": r'ioutil\.ReadAll\(|os\.ReadFile\(',
+                "rust": r'fs::read_to_string\(',
+            }
+            pat = file_read_patterns.get(language)
+            if pat and re.search(pat, stripped):
+                issues.append({
+                    "severity": "info",
+                    "file": file_path,
+                    "line": i,
+                    "code": "large-file-read",
+                    "message": "File read loads entire content into memory — consider streaming for large files",
+                    "fix": "Use streaming/buffered reads for potentially large files",
+                })
+
+    def _audit_quality(
+        self, file_path: str, lines: List[str], syntax: LanguageSyntax,
+        language: str, issues: List[Dict[str, Any]]
+    ) -> None:
+        """Scan for code quality issues in a file."""
+        for i, line in enumerate(lines, 1):
+            stripped = line.strip()
+
+            # Debug statements (using language-specific debug functions from syntax adapter)
+            for debug_fn in syntax.debug_functions:
+                if debug_fn in stripped and not syntax.is_comment(stripped):
+                    issues.append({
+                        "severity": "warning",
+                        "file": file_path,
+                        "line": i,
+                        "code": "debug-statement",
+                        "message": f"Debug statement '{debug_fn}' left in code",
+                        "fix": f"Remove {debug_fn} before committing",
+                    })
+                    break  # One per line
+
+            # TODO/FIXME/HACK comments
+            if re.search(r'\b(TODO|FIXME|HACK|XXX)\b', stripped):
+                tag = re.search(r'\b(TODO|FIXME|HACK|XXX)\b', stripped).group(1)
+                severity = "warning" if tag in ("FIXME", "HACK") else "info"
+                issues.append({
+                    "severity": severity,
+                    "file": file_path,
+                    "line": i,
+                    "code": f"{tag.lower()}-comment",
+                    "message": f"{tag} comment found: {stripped[:100]}",
+                    "fix": f"Address the {tag} item or create a tracking issue",
+                })
+
+            # Empty catch blocks (language-specific)
+            if language in ("php", "javascript", "typescript", "java"):
+                if re.search(r'catch\s*\([^)]*\)\s*\{\s*\}', stripped):
+                    issues.append({
+                        "severity": "warning",
+                        "file": file_path,
+                        "line": i,
+                        "code": "empty-catch",
+                        "message": "Empty catch block — errors are silently swallowed",
+                        "fix": "Log the error or handle it appropriately",
+                    })
+            elif language == "python":
+                if re.match(r'except.*:\s*$', stripped):
+                    # Check if next non-empty line is just 'pass'
+                    for j in range(i, min(i + 3, len(lines))):
+                        next_stripped = lines[j].strip()
+                        if next_stripped and next_stripped != "":
+                            if next_stripped == "pass":
+                                issues.append({
+                                    "severity": "warning",
+                                    "file": file_path,
+                                    "line": i,
+                                    "code": "empty-catch",
+                                    "message": "Bare except with pass — errors are silently swallowed",
+                                    "fix": "Log the error or handle it; avoid bare except clauses",
+                                })
+                            break
+            elif language == "go":
+                if re.search(r'if\s+err\s*!=\s*nil\s*\{\s*\}', stripped):
+                    issues.append({
+                        "severity": "warning",
+                        "file": file_path,
+                        "line": i,
+                        "code": "empty-catch",
+                        "message": "Empty error handling block — errors are silently ignored",
+                        "fix": "Return or log the error",
+                    })
+
+            # Unused imports (basic heuristic: import on one line, symbol not used elsewhere)
+            # Only for single-symbol imports to reduce false positives
+            if language == "python" and re.match(r'(?:from\s+\S+\s+)?import\s+(\w+)\s*$', stripped):
+                imported_name = re.match(r'(?:from\s+\S+\s+)?import\s+(\w+)\s*$', stripped).group(1)
+                full_content = "\n".join(lines)
+                # Count occurrences of the import name (excluding the import line itself)
+                usage_count = full_content.count(imported_name) - 1
+                if usage_count <= 0:
+                    issues.append({
+                        "severity": "info",
+                        "file": file_path,
+                        "line": i,
+                        "code": "unused-import",
+                        "message": f"Import '{imported_name}' appears unused",
+                        "fix": f"Remove unused import: {imported_name}",
+                    })
+
+    def _audit_dead_code(
+        self, base: str, source_files: List[Tuple[str, str, str]],
+        issues: List[Dict[str, Any]]
+    ) -> None:
+        """Detect functions/methods that are never referenced elsewhere.
+
+        Uses the deep index for symbol lookup and find_references for
+        cross-referencing.
+        """
+        try:
+            from ..indexing import get_index_manager
+            index_mgr = get_index_manager()
+            if not index_mgr or not index_mgr.get_index_stats().get("status") == "loaded":
+                issues.append({
+                    "severity": "info",
+                    "file": "",
+                    "line": 0,
+                    "code": "dead-code-skip",
+                    "message": "Deep index not built — skipping dead code detection. Run build_deep_index first.",
+                    "fix": "Run build_deep_index to enable dead code detection",
+                })
+                return
+        except Exception:
+            return
+
+        intel = self._get_generic_intel()
+
+        # Sample up to 100 files for dead code analysis to keep it fast
+        sampled = source_files[:100]
+        checked = 0
+
+        for rel_path, full_path, language in sampled:
+            summary = index_mgr.get_file_summary(rel_path)
+            if not summary:
+                continue
+
+            # Check functions and methods
+            for pool_key in ("functions", "methods"):
+                for sym_info in summary.get(pool_key, []):
+                    name = sym_info.get("name", "")
+                    if not name:
+                        continue
+                    # Skip common entry points and lifecycle methods
+                    base_name = name.split(".")[-1] if "." in name else name
+                    if base_name.startswith("_") or base_name in (
+                        "main", "__init__", "__str__", "__repr__", "setUp", "tearDown",
+                        "test", "handle", "register", "boot", "run", "index", "create",
+                        "store", "show", "edit", "update", "destroy",
+                    ) or base_name.startswith("test_"):
+                        continue
+
+                    checked += 1
+                    if checked > 200:
+                        return  # Cap for performance
+
+                    try:
+                        refs = intel.find_references(base_name, scope="all")
+                        ref_list = refs.get("references", [])
+                        # Filter out self-references (same file)
+                        external_refs = [
+                            r for r in ref_list
+                            if r.get("file", "") != rel_path
+                        ]
+                        if len(external_refs) == 0:
+                            issues.append({
+                                "severity": "info",
+                                "file": rel_path,
+                                "line": sym_info.get("line", 0),
+                                "code": "dead-code",
+                                "message": f"'{base_name}' has no external references — potentially dead code",
+                                "fix": f"Verify '{base_name}' is needed; remove if unused",
+                            })
+                    except Exception:
+                        continue
+
+    # ── post_edit_checklist ──────────────────────────────────────────
+
+    def post_edit_checklist(self, file_path: str) -> Dict[str, Any]:
+        """
+        Generate a language-aware checklist of steps to take after editing a file.
+
+        Based on file extension and project type, returns required and
+        recommended next steps (syntax checks, tests, cache clears, etc.).
+
+        Args:
+            file_path: Relative path to the edited file.
+
+        Returns:
+            Dict with checklist items, each with command, priority, and reason.
+        """
+        base = self._get_project_path()
+        if not base:
+            return {"status": "error", "message": "Project path not set"}
+
+        ext = os.path.splitext(file_path)[1].lower()
+        basename = os.path.basename(file_path).lower()
+        checklist: List[Dict[str, Any]] = []
+
+        # ── Language-specific syntax/type checks ──
+        if ext == ".php":
+            full_path = os.path.join(base, file_path)
+            checklist.append({
+                "command": f"php -l {file_path}",
+                "priority": "required",
+                "reason": "PHP syntax check to catch parse errors",
+            })
+            if "test" in file_path.lower():
+                checklist.append({
+                    "command": f"php artisan test --filter={os.path.splitext(basename)[0]}",
+                    "priority": "required",
+                    "reason": "Run the edited test file",
+                })
+        elif ext in (".ts", ".tsx"):
+            checklist.append({
+                "command": "npx tsc --noEmit",
+                "priority": "required",
+                "reason": "TypeScript type check to catch type errors",
+            })
+            if "test" in file_path.lower() or "spec" in file_path.lower():
+                checklist.append({
+                    "command": f"npx jest --testPathPattern={file_path}",
+                    "priority": "required",
+                    "reason": "Run the edited test/spec file",
+                })
+                checklist.append({
+                    "command": f"npx vitest run {file_path}",
+                    "priority": "optional",
+                    "reason": "Alternative: run with Vitest if project uses it",
+                })
+        elif ext in (".js", ".jsx", ".mjs", ".cjs"):
+            if "test" in file_path.lower() or "spec" in file_path.lower():
+                checklist.append({
+                    "command": f"npx jest --testPathPattern={file_path}",
+                    "priority": "required",
+                    "reason": "Run the edited test/spec file",
+                })
+            checklist.append({
+                "command": f"node --check {file_path}",
+                "priority": "recommended",
+                "reason": "JavaScript syntax check",
+            })
+        elif ext == ".py":
+            checklist.append({
+                "command": f"python -m py_compile {file_path}",
+                "priority": "required",
+                "reason": "Python syntax/compile check",
+            })
+            if "test" in file_path.lower():
+                checklist.append({
+                    "command": f"pytest {file_path} -v",
+                    "priority": "required",
+                    "reason": "Run the edited test file",
+                })
+        elif ext == ".go":
+            checklist.append({
+                "command": "go vet ./...",
+                "priority": "required",
+                "reason": "Go static analysis check",
+            })
+            checklist.append({
+                "command": "go test ./...",
+                "priority": "recommended",
+                "reason": "Run Go tests to verify changes",
+            })
+        elif ext == ".rs":
+            checklist.append({
+                "command": "cargo check",
+                "priority": "required",
+                "reason": "Rust compilation check",
+            })
+            checklist.append({
+                "command": "cargo test",
+                "priority": "recommended",
+                "reason": "Run Rust tests to verify changes",
+            })
+        elif ext == ".rb":
+            checklist.append({
+                "command": f"ruby -c {file_path}",
+                "priority": "required",
+                "reason": "Ruby syntax check",
+            })
+            if "test" in file_path.lower() or "spec" in file_path.lower():
+                checklist.append({
+                    "command": f"bundle exec rspec {file_path}",
+                    "priority": "required",
+                    "reason": "Run the edited spec/test file",
+                })
+        elif ext == ".java":
+            checklist.append({
+                "command": "mvn compile -q",
+                "priority": "required",
+                "reason": "Java compilation check",
+            })
+            if "test" in file_path.lower():
+                checklist.append({
+                    "command": f"mvn test -pl . -Dtest={os.path.splitext(basename)[0]}",
+                    "priority": "required",
+                    "reason": "Run the edited test class",
+                })
+
+        # ── Config files ──
+        if ext in (".yaml", ".yml", ".json", ".toml", ".ini", ".env"):
+            checklist.append({
+                "command": "Restart application server / reload config",
+                "priority": "required",
+                "reason": "Configuration changes require service restart to take effect",
+            })
+            if ext in (".env",) or basename.startswith(".env"):
+                checklist.append({
+                    "command": "Verify sensitive values are not committed to version control",
+                    "priority": "required",
+                    "reason": "Environment files may contain secrets",
+                })
+
+        # ── Migration files ──
+        if "migration" in file_path.lower():
+            if ext == ".php":
+                checklist.append({
+                    "command": "php artisan migrate",
+                    "priority": "required",
+                    "reason": "Run migration to apply database changes",
+                })
+            elif ext == ".py":
+                checklist.append({
+                    "command": "python manage.py migrate",
+                    "priority": "required",
+                    "reason": "Run Django migration to apply database changes",
+                })
+            elif ext == ".rb":
+                checklist.append({
+                    "command": "bundle exec rails db:migrate",
+                    "priority": "required",
+                    "reason": "Run Rails migration to apply database changes",
+                })
+            elif ext == ".go":
+                checklist.append({
+                    "command": "Run your migration tool (e.g., goose up, migrate up)",
+                    "priority": "required",
+                    "reason": "Apply database migration",
+                })
+
+        # ── Route files ──
+        is_route_file = any(k in file_path.lower() for k in ["route", "urls.py", "router"])
+        if is_route_file:
+            if ext == ".php":
+                checklist.append({
+                    "command": "php artisan route:clear && php artisan route:cache",
+                    "priority": "required",
+                    "reason": "Clear and rebuild route cache after route changes",
+                })
+            checklist.append({
+                "command": "Verify all route handlers/controllers exist",
+                "priority": "recommended",
+                "reason": "New routes need corresponding handlers",
+            })
+
+        # ── Docker files ──
+        if basename in ("dockerfile", "docker-compose.yml", "docker-compose.yaml") or basename.startswith("dockerfile"):
+            checklist.append({
+                "command": "docker-compose build" if "compose" in basename else "docker build .",
+                "priority": "required",
+                "reason": "Rebuild container image to apply Docker changes",
+            })
+            checklist.append({
+                "command": "docker-compose up -d" if "compose" in basename else "Restart container",
+                "priority": "recommended",
+                "reason": "Restart containers with new image",
+            })
+
+        # ── Test files (generic — if not already caught above) ──
+        if not any(c.get("reason", "").startswith("Run the edited test") for c in checklist):
+            if "test" in file_path.lower() or "spec" in file_path.lower():
+                checklist.append({
+                    "command": f"Run test: {file_path}",
+                    "priority": "required",
+                    "reason": "Test file was edited — verify it still passes",
+                })
+
+        return {
+            "status": "success",
+            "file": file_path,
+            "extension": ext,
+            "checklist": checklist,
+            "total_items": len(checklist),
+            "required_count": sum(1 for c in checklist if c["priority"] == "required"),
+            "recommended_count": sum(1 for c in checklist if c["priority"] == "recommended"),
+            "optional_count": sum(1 for c in checklist if c["priority"] == "optional"),
+        }
+
     # ── smart_apply_edit ─────────────────────────────────────────────
 
     def smart_apply_edit(
@@ -1489,12 +2184,15 @@ class AdvancedAnalysisService(BaseService):
         The ultimate single-call edit tool. apply_edit on steroids.
 
         Does everything in ONE call:
-        1. Applies the edit with PHP syntax check + auto-rollback
-        2. Runs anti-pattern check (CLAUDE.md violations)
+        1. Applies the edit with syntax check + auto-rollback
+        2. Runs anti-pattern check (project rule violations)
         3. Detects which symbols were changed
-        4. Runs ripple effect on changed symbols
+        4. Runs ripple effect on changed symbols with classification
         5. Shows affected files' RELEVANT CODE SNIPPETS so you can fix them too
         6. Shows cache keys that need invalidation review
+        7. Tracks session-level ripple coverage
+        8. Suggests relevant test commands
+        9. Detects scope direction changes (narrowing/widening)
 
         The key innovation: when ripple effect finds affected files, it doesn't
         just list file names — it shows the EXACT lines in those files that
@@ -1506,6 +2204,10 @@ class AdvancedAnalysisService(BaseService):
 
         edit_svc = FileEditService(self.ctx)
         intel = self._get_generic_intel()
+
+        # Update session metrics
+        _SESSION_METRICS["total_edits"] += 1
+        _SESSION_METRICS["files_edited"].add(file_path)
 
         # Apply the edit via standard apply_edit
         result = edit_svc.apply_edit(
@@ -1527,12 +2229,39 @@ class AdvancedAnalysisService(BaseService):
         if not base:
             return result
 
-        # Only do deep analysis for high-risk files
-        is_high_risk = any(
-            p in file_path
-            for p in ["app/Models/", "app/Services/", "app/Http/Controllers/",
-                       "app/Http/Middleware/", "app/Http/Requests/"]
-        )
+        # Scope direction analysis when old/new code is available
+        scope_direction = self._detect_scope_direction(search, replace, edits)
+        if scope_direction:
+            result["scope_direction"] = scope_direction
+
+        # Generate test suggestions based on file type
+        test_suggestions = self._generate_test_suggestions(file_path)
+        if test_suggestions:
+            result["test_suggestions"] = test_suggestions
+
+        # Determine if file is high-risk for deep analysis
+        # Language-agnostic: check if it's a model, service, controller, or core logic
+        from ..config import EXTENSION_LANGUAGE_MAP
+        ext = os.path.splitext(file_path)[1]
+        lang = EXTENSION_LANGUAGE_MAP.get(ext)
+
+        high_risk_patterns = [
+            # PHP/Laravel
+            "app/Models/", "app/Services/", "app/Http/Controllers/",
+            "app/Http/Middleware/", "app/Http/Requests/",
+            # Python/Django
+            "models.py", "models/", "views.py", "views/", "services/", "middleware/",
+            # JS/TS/NestJS/Next.js
+            "src/models/", "src/services/", "src/controllers/", "src/entities/",
+            "src/modules/", "lib/", "core/",
+            # Go
+            "internal/", "pkg/", "cmd/",
+            # Rust
+            "src/lib.rs", "src/models/", "src/services/",
+            # Generic
+            "domain/", "repository/", "handler/",
+        ]
+        is_high_risk = any(p in file_path for p in high_risk_patterns)
 
         if not is_high_risk:
             return result
@@ -1544,6 +2273,8 @@ class AdvancedAnalysisService(BaseService):
             return result
 
         ripple_warnings: List[Dict[str, Any]] = []
+        all_ripple_items: List[Dict[str, Any]] = []
+        items_no_action: List[Dict[str, Any]] = []
 
         for sym in changed_symbols[:3]:
             try:
@@ -1571,7 +2302,7 @@ class AdvancedAnalysisService(BaseService):
                 if sym_info.get("is_scope") and sym_info.get("scope_name"):
                     search_term = sym_info["scope_name"]
 
-                # Collect affected files with code snippets
+                # Collect affected files with code snippets and classify each
                 affected_with_code: List[Dict[str, Any]] = []
                 seen_aff: Set[str] = set()
 
@@ -1580,6 +2311,26 @@ class AdvancedAnalysisService(BaseService):
                     if not imp_file or imp_file == file_path or imp_file in seen_aff:
                         continue
                     seen_aff.add(imp_file)
+
+                    # Classify this ripple item
+                    classification = self._classify_ripple_item(
+                        impact, search_term, sym, file_path, base
+                    )
+
+                    # Track in session
+                    ripple_key = f"{sym}:{imp_file}:{impact.get('line', 0)}"
+                    ripple_item = {
+                        "file": imp_file,
+                        "symbol": sym,
+                        "line": impact.get("line", 0),
+                        "classification": classification,
+                    }
+                    all_ripple_items.append(ripple_item)
+                    _SESSION_RIPPLE_ITEMS[ripple_key] = ripple_item
+
+                    if classification == "no_action":
+                        items_no_action.append(ripple_item)
+                        _SESSION_RESOLVED.add(ripple_key)
 
                     # Use text from ripple if available
                     imp_text = impact.get("text", "")
@@ -1592,13 +2343,15 @@ class AdvancedAnalysisService(BaseService):
                                 existing["lines"].append({
                                     "line": imp_line,
                                     "code": imp_text.strip()[:150],
+                                    "classification": classification,
                                 })
                                 existing["usages"] += 1
                         else:
                             affected_with_code.append({
                                 "file": imp_file,
                                 "usages": 1,
-                                "lines": [{"line": imp_line, "code": imp_text.strip()[:150]}],
+                                "classification": classification,
+                                "lines": [{"line": imp_line, "code": imp_text.strip()[:150], "classification": classification}],
                             })
                     else:
                         # Fallback: read file
@@ -1614,11 +2367,13 @@ class AdvancedAnalysisService(BaseService):
                                 relevant_lines.append({
                                     "line": line_num,
                                     "code": line.strip()[:150],
+                                    "classification": classification,
                                 })
                         if relevant_lines:
                             affected_with_code.append({
                                 "file": imp_file,
                                 "usages": len(relevant_lines),
+                                "classification": classification,
                                 "lines": relevant_lines[:5],
                             })
 
@@ -1644,9 +2399,14 @@ class AdvancedAnalysisService(BaseService):
                                         "lines": vi_lines_with_sym[:3],
                                     })
 
+                # Build priority for deterministic sorting
+                priority_map = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+                priority_val = priority_map.get(risk, 3)
+
                 warning_entry: Dict[str, Any] = {
                     "symbol": sym,
                     "risk_level": risk,
+                    "_sort_priority": priority_val,
                     "total_files_affected": total,
                 }
 
@@ -1671,9 +2431,205 @@ class AdvancedAnalysisService(BaseService):
                 pass
 
         if ripple_warnings:
+            # Deterministic sort: priority (HIGH->MEDIUM->LOW) -> file path -> line
+            ripple_warnings.sort(key=lambda w: (
+                w.get("_sort_priority", 3),
+                (w.get("affected_files_with_code", [{}])[0].get("file", "") if w.get("affected_files_with_code") else ""),
+                (w.get("affected_files_with_code", [{}])[0].get("lines", [{}])[0].get("line", 0) if w.get("affected_files_with_code") else 0),
+            ))
+            # Remove sort key from output
+            for w in ripple_warnings:
+                w.pop("_sort_priority", None)
+
             result["ripple_warnings"] = ripple_warnings
+            _SESSION_METRICS["total_warnings"] += len(ripple_warnings)
+
+        # Coverage tracking
+        if all_ripple_items:
+            total_items = len(all_ripple_items)
+            resolved_items = len(items_no_action)
+            coverage_pct = (resolved_items / total_items * 100) if total_items > 0 else 100.0
+            result["ripple_coverage"] = {
+                "total_items": total_items,
+                "resolved_items": resolved_items,
+                "coverage_percent": round(coverage_pct, 1),
+                "needs_attention": total_items - resolved_items,
+            }
+
+        # Session-level metrics
+        result["session_metrics"] = {
+            "total_edits": _SESSION_METRICS["total_edits"],
+            "files_edited": len(_SESSION_METRICS["files_edited"]),
+            "total_ripple_items": len(_SESSION_RIPPLE_ITEMS),
+            "total_resolved": len(_SESSION_RESOLVED),
+            "total_warnings": _SESSION_METRICS["total_warnings"],
+        }
 
         return result
+
+    @staticmethod
+    def _classify_ripple_item(
+        impact: Dict[str, Any], search_term: str, symbol: str,
+        edited_file: str, base: str,
+    ) -> str:
+        """Classify a ripple impact item into an action category.
+
+        Returns one of:
+        - "no_action": auto-inherits change, safe to skip
+        - "check_redundancy": inline check may duplicate scope, review
+        - "fix_required": direct usage will break, must fix
+        - "review_logic": complex logic needs human review
+        """
+        imp_file = impact.get("file", "")
+        imp_text = impact.get("text", "")
+        usage_type = impact.get("type", "")
+
+        if not imp_text:
+            # No text available to classify — conservative default
+            return "review_logic"
+
+        stripped = imp_text.strip()
+
+        # Import/use statements auto-inherit — no action needed
+        if any(kw in stripped for kw in ["import ", "use ", "require(", "require_relative"]):
+            return "no_action"
+
+        # Type hints / annotations auto-inherit
+        if any(kw in stripped for kw in [": " + search_term, "-> " + search_term,
+                                          "@param", "@return", "@var"]):
+            return "no_action"
+
+        # Class extension inherits automatically
+        if any(kw in stripped for kw in ["extends ", "implements ", "< "]):
+            return "no_action"
+
+        # Direct method call or property access — likely needs fixing
+        if re.search(rf'(?:->|\.){re.escape(search_term)}\s*\(', stripped):
+            return "fix_required"
+
+        # Static call — likely needs fixing
+        if re.search(rf'::{re.escape(search_term)}\s*\(', stripped):
+            return "fix_required"
+
+        # Inline condition that duplicates a scope — check redundancy
+        if re.search(rf'(?:where|filter|if).*{re.escape(search_term)}', stripped, re.IGNORECASE):
+            return "check_redundancy"
+
+        # Complex logic (conditionals, ternary, switch) — needs human review
+        if any(kw in stripped for kw in ["if ", "switch ", "case ", "? ", "match "]):
+            return "review_logic"
+
+        # Default: review needed
+        return "review_logic"
+
+    @staticmethod
+    def _detect_scope_direction(
+        search: str = None, replace: str = None, edits: list = None,
+    ) -> Optional[str]:
+        """Detect if the edit narrows or widens a scope/condition.
+
+        Returns: "narrowing", "widening", "modified", or None if not detectable.
+        """
+        pairs = []
+        if search and replace:
+            pairs.append((search, replace))
+        if edits:
+            for e in edits:
+                s = e.get("search", "")
+                r = e.get("replace", "")
+                if s and r:
+                    pairs.append((s, r))
+
+        if not pairs:
+            return None
+
+        narrowing_signals = 0
+        widening_signals = 0
+
+        for old_text, new_text in pairs:
+            # Count restrictive operators / conditions
+            restrictive = ["&&", "and ", "!==", "!=", "> ", "< ", ">=", "<=", "not ", "!"]
+            permissive = ["||", "or ", "===", "==", "true", "all", "any"]
+
+            old_restrict = sum(1 for r in restrictive if r in old_text)
+            new_restrict = sum(1 for r in restrictive if r in new_text)
+            old_permissive = sum(1 for p in permissive if p in old_text)
+            new_permissive = sum(1 for p in permissive if p in new_text)
+
+            if new_restrict > old_restrict or new_permissive < old_permissive:
+                narrowing_signals += 1
+            if new_permissive > old_permissive or new_restrict < old_restrict:
+                widening_signals += 1
+
+        if narrowing_signals > 0 and widening_signals == 0:
+            return "narrowing"
+        elif widening_signals > 0 and narrowing_signals == 0:
+            return "widening"
+        elif narrowing_signals > 0 and widening_signals > 0:
+            return "modified"
+        return None
+
+    @staticmethod
+    def _generate_test_suggestions(file_path: str) -> List[Dict[str, str]]:
+        """Generate language-appropriate test commands based on file type."""
+        ext = os.path.splitext(file_path)[1].lower()
+        suggestions: List[Dict[str, str]] = []
+
+        # Derive a test filter from the file name
+        basename = os.path.splitext(os.path.basename(file_path))[0]
+        dirname = os.path.dirname(file_path)
+
+        if ext == ".php":
+            suggestions.append({
+                "command": f"php artisan test --filter={basename}",
+                "reason": "Run related PHP tests",
+            })
+        elif ext in (".js", ".jsx", ".mjs"):
+            suggestions.append({
+                "command": f"npx jest --testPathPattern={basename}",
+                "reason": "Run related Jest tests",
+            })
+            suggestions.append({
+                "command": f"npx vitest run {file_path}",
+                "reason": "Run with Vitest (if applicable)",
+            })
+        elif ext in (".ts", ".tsx"):
+            suggestions.append({
+                "command": f"npx jest --testPathPattern={basename}",
+                "reason": "Run related Jest tests",
+            })
+            suggestions.append({
+                "command": f"npx vitest run {file_path}",
+                "reason": "Run with Vitest (if applicable)",
+            })
+        elif ext == ".py":
+            suggestions.append({
+                "command": f"pytest -k {basename} -v",
+                "reason": "Run related Python tests",
+            })
+        elif ext == ".go":
+            pkg_dir = dirname if dirname else "."
+            suggestions.append({
+                "command": f"go test ./{pkg_dir}/...",
+                "reason": "Run Go tests in package",
+            })
+        elif ext == ".rs":
+            suggestions.append({
+                "command": f"cargo test {basename}",
+                "reason": "Run related Rust tests",
+            })
+        elif ext == ".rb":
+            suggestions.append({
+                "command": f"bundle exec rspec --pattern '*{basename}*'",
+                "reason": "Run related Ruby specs",
+            })
+        elif ext == ".java":
+            suggestions.append({
+                "command": f"mvn test -Dtest={basename}",
+                "reason": "Run related Java tests",
+            })
+
+        return suggestions
 
     @staticmethod
     def _detect_changed_symbols(

@@ -18,9 +18,12 @@ Response strategy:
 """
 
 import difflib
+import glob as glob_module
+import json
 import logging
 import os
 import subprocess
+import time
 from typing import Any, Dict, List, Optional
 
 from .base_service import BaseService
@@ -30,6 +33,9 @@ logger = logging.getLogger(__name__)
 
 # Diff lines threshold — above this, return summary instead of full diff
 DIFF_TRUNCATE_THRESHOLD = 30
+
+# Maximum detail files to keep in .blindspot/output/
+MAX_DETAIL_FILES = 20
 
 
 class FileEditService(BaseService):
@@ -79,12 +85,59 @@ class FileEditService(BaseService):
             n=n,
         ))
 
+    def _save_detail_file(self, data: Dict[str, Any], tool_name: str) -> str:
+        """Save full response data to a detail file for large outputs.
+
+        Creates .blindspot/output/ directory in the project root and saves
+        the full response as a JSON file with timestamp. Keeps only the
+        last MAX_DETAIL_FILES files.
+
+        Args:
+            data: Full response dictionary to save.
+            tool_name: Name of the tool that generated this output.
+
+        Returns:
+            Path to the saved detail file (relative to project root).
+        """
+        try:
+            base = self.base_path
+            if not base:
+                return ""
+
+            output_dir = os.path.join(base, ".blindspot", "output")
+            os.makedirs(output_dir, exist_ok=True)
+
+            # Generate timestamped filename
+            ts = time.strftime("%Y%m%d_%H%M%S")
+            filename = f"{tool_name}_{ts}.json"
+            full_path = os.path.join(output_dir, filename)
+
+            with open(full_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, default=str)
+
+            # Cleanup: keep only the last MAX_DETAIL_FILES
+            existing = sorted(
+                glob_module.glob(os.path.join(output_dir, "*.json")),
+                key=os.path.getmtime,
+            )
+            if len(existing) > MAX_DETAIL_FILES:
+                for old_file in existing[: len(existing) - MAX_DETAIL_FILES]:
+                    try:
+                        os.remove(old_file)
+                    except OSError:
+                        pass
+
+            return os.path.relpath(full_path, base)
+        except Exception as e:
+            logger.debug("Failed to save detail file: %s", e)
+            return ""
+
     def _build_response(
         self, old_content: str, new_content: str, file_path: str
     ) -> Dict[str, Any]:
         """
         Build a smart response based on diff size.
-        Small diff → full diff. Large diff → summary only.
+        Small diff → full diff. Large diff → summary only + detail file.
         """
         old_lines = old_content.splitlines()
         new_lines = new_content.splitlines()
@@ -120,6 +173,19 @@ class FileEditService(BaseService):
                 "hunks": hunks[:5],  # Max 5 hunk headers
             }
             response["hint"] = "Large diff truncated. Use get_edit_region to verify specific sections."
+
+            # Save full diff to detail file
+            detail_data = {
+                "file_path": file_path,
+                "diff": diff_text,
+                "lines_before": len(old_lines),
+                "lines_after": len(new_lines),
+                "lines_added": added,
+                "lines_removed": removed,
+            }
+            detail_path = self._save_detail_file(detail_data, "apply_edit")
+            if detail_path:
+                response["detail_file"] = detail_path
 
         return response
 
