@@ -26,13 +26,45 @@ from ..adapters.language_syntax import get_syntax_for_file, get_language_syntax,
 
 logger = logging.getLogger(__name__)
 
-# Session-level tracking for ripple analysis across multiple smart_apply_edit calls
+# Project-scoped session tracking — keyed by project path to prevent cross-project state leaks
+_SESSION_STORE: Dict[str, Dict[str, Any]] = {}
+_SESSION_MAX_AGE: int = 3600  # 1 hour TTL
+_SESSION_MAX_ITEMS: int = 1000  # Max ripple items before cleanup
+
+
+def _get_session(project_path: str = "") -> Dict[str, Any]:
+    """Get or create session state scoped to a project path."""
+    key = project_path or "_default"
+    if key not in _SESSION_STORE:
+        _SESSION_STORE[key] = {
+            "ripple_items": {},
+            "resolved": set(),
+            "index_dirty": set(),
+            "pipeline_calls": {},
+            "decisions": [],
+            "feedback_overrides": {},
+            "metrics": {
+                "total_edits": 0,
+                "files_edited": set(),
+                "blocked_edits": 0,
+                "total_warnings": 0,
+                "warnings_by_type": {},
+                "total_ripple_items": 0,
+                "resolved_ripple_items": 0,
+                "avg_affected_per_edit": 0.0,
+            },
+            "start_time": time.time(),
+        }
+    return _SESSION_STORE[key]
+
+
+# Backward-compatible aliases for existing code
 _SESSION_RIPPLE_ITEMS: Dict[str, Dict[str, Any]] = {}
 _SESSION_RESOLVED: Set[str] = set()
-_SESSION_INDEX_DIRTY: Set[str] = set()  # Files edited this session (for re-edit warnings)
-_SESSION_PIPELINE_CALLS: Dict[str, Set[str]] = {}  # file_path -> {"context", "pre_edit"} tracking
-_SESSION_DECISIONS: List[Dict[str, Any]] = []  # Edit history memory
-_SESSION_FEEDBACK_OVERRIDES: Dict[str, Dict] = {}  # ripple_id -> {correct, note, original_action}
+_SESSION_INDEX_DIRTY: Set[str] = set()
+_SESSION_PIPELINE_CALLS: Dict[str, Set[str]] = {}
+_SESSION_DECISIONS: List[Dict[str, Any]] = []
+_SESSION_FEEDBACK_OVERRIDES: Dict[str, Dict] = {}
 _SESSION_METRICS: Dict[str, Any] = {
     "total_edits": 0,
     "files_edited": set(),
@@ -44,29 +76,35 @@ _SESSION_METRICS: Dict[str, Any] = {
     "avg_affected_per_edit": 0.0,
 }
 _SESSION_START_TIME: float = time.time()
-_SESSION_MAX_AGE: int = 3600  # 1 hour TTL
-_SESSION_MAX_ITEMS: int = 1000  # Max ripple items before cleanup
 
 
-def _check_session_cleanup():
+def _check_session_cleanup(project_path: str = ""):
     """Clean up session state if too old or too large."""
     global _SESSION_START_TIME
+    session = _get_session(project_path)
     now = time.time()
-    if now - _SESSION_START_TIME > _SESSION_MAX_AGE or len(_SESSION_RIPPLE_ITEMS) > _SESSION_MAX_ITEMS:
+    if now - session.get("start_time", 0) > _SESSION_MAX_AGE or len(session["ripple_items"]) > _SESSION_MAX_ITEMS:
+        # Clear project-scoped session
+        session["ripple_items"].clear()
+        session["resolved"].clear()
+        session["index_dirty"].clear()
+        session["pipeline_calls"].clear()
+        session["decisions"].clear()
+        session["feedback_overrides"].clear()
+        session["metrics"] = {
+            "total_edits": 0, "files_edited": set(), "blocked_edits": 0,
+            "total_warnings": 0, "warnings_by_type": {},
+            "total_ripple_items": 0, "resolved_ripple_items": 0,
+            "avg_affected_per_edit": 0.0,
+        }
+        session["start_time"] = now
+        # Also clear backward-compatible globals
         _SESSION_RIPPLE_ITEMS.clear()
         _SESSION_RESOLVED.clear()
         _SESSION_INDEX_DIRTY.clear()
         _SESSION_PIPELINE_CALLS.clear()
         _SESSION_DECISIONS.clear()
         _SESSION_FEEDBACK_OVERRIDES.clear()
-        _SESSION_METRICS["total_edits"] = 0
-        _SESSION_METRICS["files_edited"] = set()
-        _SESSION_METRICS["blocked_edits"] = 0
-        _SESSION_METRICS["total_warnings"] = 0
-        _SESSION_METRICS["warnings_by_type"] = {}
-        _SESSION_METRICS["total_ripple_items"] = 0
-        _SESSION_METRICS["resolved_ripple_items"] = 0
-        _SESSION_METRICS["avg_affected_per_edit"] = 0.0
         _SESSION_START_TIME = now
 
 # Laravel irregular pluralization — covers common model names

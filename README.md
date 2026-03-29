@@ -600,7 +600,7 @@ Options:
 **Key design decisions:**
 
 - **Local only** — Your code never leaves your machine. Everything runs in-process.
-- **Framework-aware loading** — Only the detected framework's plugin loads. A Next.js project gets ~45 tools, not 240.
+- **Framework-aware loading** — Only the detected framework's plugin loads. A Next.js project gets ~45 tools, not 241.
 - **Deep index + file scanning** — Tree-sitter for structured symbol data, regex for cross-file references. Best of both worlds.
 - **Compact responses** — Every tool is designed to return the minimum data needed. Large diffs get summarized. Symbol bodies can be fetched in compact mode (~90% fewer tokens).
 
@@ -767,7 +767,7 @@ Supported monorepo tools: npm workspaces, yarn workspaces, pnpm workspaces, Turb
 Total Python files:     112
 Total lines of code:    73,000+
 Framework plugins:      16
-Total MCP tools:        240 (34 core + ~13 per plugin)
+Total MCP tools:        241 (34 core + ~13 per plugin)
 Supported languages:    12 (PHP, TypeScript, JavaScript, Python, Java,
                             Kotlin, Go, Rust, Ruby, C#, Dart, Elixir)
 Tree-sitter parsers:    12

@@ -50,20 +50,26 @@ class FileEditService(BaseService):
     # ─── Path & IO ───────────────────────────────────────────────
 
     def _resolve_path(self, file_path: str) -> str:
-        """Resolve a relative file path to an absolute path with security checks."""
-        if self.base_path:
-            full_path = os.path.normpath(os.path.join(self.base_path, file_path))
-            # Prevent path traversal outside project
-            if not full_path.startswith(os.path.normpath(self.base_path) + os.sep) and full_path != os.path.normpath(self.base_path):
+        """Resolve a relative file path to an absolute path with symlink-safe security."""
+        base = self.base_path
+        if not base:
+            from ..indexing import get_index_manager
+            mgr = get_index_manager()
+            base = mgr.project_path if mgr else None
+        if not base:
+            raise ValueError("Project path not set. Call set_project_path first.")
+
+        full_path = os.path.normpath(os.path.join(base, file_path))
+        # Resolve symlinks for real path comparison
+        real_path = os.path.realpath(full_path)
+        real_base = os.path.realpath(base)
+        try:
+            common = os.path.commonpath([real_path, real_base])
+            if common != real_base:
                 raise ValueError(f"Path traversal blocked: {file_path}")
-            return full_path
-        index_manager = get_index_manager()
-        if index_manager.project_path:
-            full_path = os.path.normpath(os.path.join(index_manager.project_path, file_path))
-            if not full_path.startswith(os.path.normpath(index_manager.project_path) + os.sep):
-                raise ValueError(f"Path traversal blocked: {file_path}")
-            return full_path
-        raise ValueError("Project path not set. Call set_project_path first.")
+        except ValueError:
+            raise ValueError(f"Path traversal blocked: {file_path}")
+        return full_path
 
     def _read_file(self, full_path: str) -> str:
         """Read file content with encoding fallback."""

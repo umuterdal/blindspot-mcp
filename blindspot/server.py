@@ -140,7 +140,7 @@ def _setup_signal_handlers():
     if hasattr(signal, 'SIGTERM'):
         signal.signal(signal.SIGTERM, sigterm_handler)
 
-_setup_signal_handlers()
+# Signal handlers deferred to main() — not on import, to avoid host process side effects
 
 
 def with_concurrency_limit(func):
@@ -164,27 +164,22 @@ def with_concurrency_limit(func):
     return wrapper
 
 
-# Setup logging without writing to files
+# Setup logging — scoped to blindspot namespace only, no root logger override
 def setup_indexing_performance_logging():
-    """Setup logging (stderr only); remove any file-based logging."""
-
-    root_logger = logging.getLogger()
-    root_logger.handlers.clear()
-
-    formatter = logging.Formatter(
-        "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-    )
-
-    # stderr for errors only
-    stderr_handler = logging.StreamHandler(sys.stderr)
-    stderr_handler.setFormatter(formatter)
-    stderr_handler.setLevel(logging.ERROR)
-
-    root_logger.addHandler(stderr_handler)
-    root_logger.setLevel(logging.DEBUG)
+    """Setup blindspot-scoped logging (stderr only). Does NOT touch root logger."""
+    blindspot_logger = logging.getLogger("blindspot")
+    if not blindspot_logger.handlers:
+        formatter = logging.Formatter(
+            "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+        )
+        stderr_handler = logging.StreamHandler(sys.stderr)
+        stderr_handler.setFormatter(formatter)
+        stderr_handler.setLevel(logging.ERROR)
+        blindspot_logger.addHandler(stderr_handler)
+        blindspot_logger.setLevel(logging.DEBUG)
 
 
-# Initialize logging (no file handlers)
+# Initialize logging (scoped, no host process side effects)
 setup_indexing_performance_logging()
 logger = logging.getLogger(__name__)
 
@@ -1211,6 +1206,9 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None):
     """Main function to run the MCP server."""
+    # Setup signal handlers only when running as main process (not on import)
+    _setup_signal_handlers()
+
     args = _parse_args(argv)
 
     # Load and register framework plugins
