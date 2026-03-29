@@ -793,7 +793,7 @@ def apply_edit(
     Returns:
         Dictionary with status and either compact diff or summary (for large changes).
     """
-    return FileEditService(ctx).apply_edit(
+    result = FileEditService(ctx).apply_edit(
         file_path=file_path,
         search=search,
         replace=replace,
@@ -804,6 +804,29 @@ def apply_edit(
         end_line=end_line,
         occurrence=occurrence,
     )
+
+    # Auto-ripple guard: if editing a file with classes/symbols in the deep index,
+    # add a warning nudging toward smart_apply_edit for safer editing
+    if isinstance(result, dict) and result.get("status") == "success":
+        try:
+            from .indexing import get_index_manager
+            mgr = get_index_manager()
+            summary = mgr.get_file_summary(file_path) if mgr else None
+            if summary:
+                symbol_count = (
+                    len(summary.get("classes", [])) +
+                    len(summary.get("functions", [])) +
+                    len(summary.get("methods", []))
+                )
+                if symbol_count > 3:
+                    result["ripple_hint"] = (
+                        f"This file has {symbol_count} symbols. Consider using smart_apply_edit "
+                        f"instead of apply_edit for automatic ripple effect analysis."
+                    )
+        except Exception:
+            pass
+
+    return result
 
 
 @mcp.tool()
@@ -1117,6 +1140,7 @@ def smart_apply_edit(
     occurrence: int = None,
     pipeline_context: dict = None,
     resolved_items: list = None,
+    test_results: list = None,
     strict_mode: dict = None,
     feedback: dict = None,
 ) -> dict[str, Any]:
@@ -1138,6 +1162,7 @@ def smart_apply_edit(
         Same as apply_edit — all 5 modes (search-replace, batch, symbol, line-range, occurrence).
         pipeline_context: Optional context from get_context_for_edit for pipeline tracking.
         resolved_items: List of ripple item IDs previously resolved by the agent.
+        test_results: List of test results to auto-resolve ripple items (e.g., [{"test": "...", "passed": True, "ripple_ids": [...]}]).
         strict_mode: Dict with enforcement options (e.g., {"enforce_pipeline": True}).
         feedback: Dict mapping ripple_id -> {correct, note, original_action} for human overrides.
     """
@@ -1153,6 +1178,7 @@ def smart_apply_edit(
         occurrence=occurrence,
         pipeline_context=pipeline_context,
         resolved_items=resolved_items,
+        test_results=test_results,
         strict_mode=strict_mode,
         feedback=feedback,
     )

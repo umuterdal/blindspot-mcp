@@ -2547,6 +2547,7 @@ class AdvancedAnalysisService(BaseService):
         occurrence: int = None,
         pipeline_context: dict = None,
         resolved_items: list = None,
+        test_results: list = None,
         strict_mode: dict = None,
         feedback: dict = None,
     ) -> Dict[str, Any]:
@@ -2613,6 +2614,15 @@ class AdvancedAnalysisService(BaseService):
                 _SESSION_RESOLVED.add(item_id)
                 if item_id in _SESSION_RIPPLE_ITEMS:
                     _SESSION_RIPPLE_ITEMS[item_id]["state"] = "resolved"
+
+        # Process test results — auto-resolve ripple items where tests pass
+        if test_results:
+            for tr in test_results:
+                if isinstance(tr, dict) and tr.get("passed"):
+                    for rid in tr.get("ripple_ids", []):
+                        _SESSION_RESOLVED.add(rid)
+                        if rid in _SESSION_RIPPLE_ITEMS:
+                            _SESSION_RIPPLE_ITEMS[rid]["state"] = "resolved"
 
         # Update session metrics
         _SESSION_METRICS["total_edits"] += 1
