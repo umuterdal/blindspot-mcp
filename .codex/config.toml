@@ -1,3 +1,0 @@
-[mcp_servers.blindspot]
-command = "/Users/umuterdal/Desktop/blindspot-mcp/.venv/bin/blindspot-mcp"
-args = ["--project-path", "/Users/umuterdal/Desktop/blindspot-mcp"]

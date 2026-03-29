@@ -38,3 +38,9 @@ test_env/
 
 # Local MCP config (user-specific)
 .mcp.json
+
+# Blindspot output files (session data)
+.blindspot/output/
+
+# Codex CLI config (project-specific, user-specific)
+.codex/
