@@ -2490,3 +2490,480 @@ class LaravelIntelligenceService(BaseService):
         if brace_depth == 0:
             return content[match.start():pos]
         return None
+
+    # ------------------------------------------------------------------ #
+    #  verify_schema / detect_transaction_risks / get_domain_rules /      #
+    #  generate_test_skeleton / match_view_guards                         #
+    # ------------------------------------------------------------------ #
+
+    def verify_schema(self, table_or_model: str, columns: list) -> Dict[str, Any]:
+        """
+        Verify that columns exist in migration-defined schema for a table or model.
+
+        Returns missing columns so the caller knows what is absent before editing.
+        """
+        base = self._get_project_path()
+        if not base:
+            return {"status": "error", "message": "Project path not set"}
+
+        migrations_dir = os.path.join(base, "database", "migrations")
+        if not os.path.isdir(migrations_dir):
+            return {"status": "ok", "table": table_or_model, "found": [], "missing": list(columns),
+                    "message": "Migrations directory not found – cannot verify"}
+
+        # Normalise: if a Model name is given, snake-case + pluralise naively
+        table_name = table_or_model
+        if table_name[0:1].isupper():
+            # CamelCase → snake_case rough conversion
+            snake = re.sub(r'(?<!^)(?=[A-Z])', '_', table_name).lower()
+            table_name = snake + "s" if not snake.endswith("s") else snake
+
+        found_columns: Set[str] = set()
+        migration_files = sorted(
+            [f for f in os.listdir(migrations_dir) if f.endswith(".php")]
+        )
+
+        col_pattern = re.compile(
+            r"\$\w+->(string|integer|bigInteger|text|boolean|date|dateTime|timestamp|"
+            r"float|decimal|json|uuid|char|binary|enum|unsignedBigInteger|unsignedInteger|"
+            r"increments|bigIncrements|id|timestamps|softDeletes|morphs|nullableMorphs|"
+            r"foreignId|foreignUuid|tinyInteger|smallInteger|mediumInteger|mediumText|"
+            r"longText|double)\s*\(\s*['\"](\w+)['\"]",
+            re.IGNORECASE,
+        )
+        shorthand_pattern = re.compile(
+            r"\$\w+->(timestamps|softDeletes|rememberToken|id)\s*\(",
+        )
+
+        for fname in migration_files:
+            fpath = os.path.join(migrations_dir, fname)
+            try:
+                with open(fpath, "r", encoding="utf-8", errors="replace") as f:
+                    content = f.read()
+            except Exception:
+                continue
+
+            # Only look at blocks that reference our table
+            if table_name not in content:
+                continue
+
+            for m in col_pattern.finditer(content):
+                found_columns.add(m.group(2))
+
+            for m in shorthand_pattern.finditer(content):
+                method = m.group(1)
+                if method == "timestamps":
+                    found_columns.update(["created_at", "updated_at"])
+                elif method == "softDeletes":
+                    found_columns.add("deleted_at")
+                elif method == "rememberToken":
+                    found_columns.add("remember_token")
+                elif method == "id":
+                    found_columns.add("id")
+
+        found = [c for c in columns if c in found_columns]
+        missing = [c for c in columns if c not in found_columns]
+
+        return {
+            "status": "ok",
+            "table": table_name,
+            "found": found,
+            "missing": missing,
+            "all_schema_columns": sorted(found_columns),
+        }
+
+    def detect_transaction_risks(self, file_path: str) -> Dict[str, Any]:
+        """
+        Detect transaction / atomicity risks in a Laravel PHP file.
+
+        Looks for multiple DB writes without DB::transaction(), and cache
+        operations inside transactions.
+        """
+        base = self._get_project_path()
+        if not base:
+            return {"status": "error", "message": "Project path not set"}
+
+        full_path = os.path.join(base, file_path)
+        if not os.path.isfile(full_path):
+            return {"status": "error", "message": f"File not found: {file_path}"}
+
+        try:
+            with open(full_path, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read()
+        except Exception as exc:
+            return {"status": "error", "message": str(exc)}
+
+        risks: List[Dict[str, Any]] = []
+        lines = content.split("\n")
+
+        # Detect DB write patterns
+        write_pattern = re.compile(
+            r"(->save\s*\(|->create\s*\(|->update\s*\(|->delete\s*\(|->insert\s*\(|"
+            r"DB::insert|DB::update|DB::delete|->forceDelete\s*\()"
+        )
+        transaction_pattern = re.compile(r"DB::transaction\s*\(|DB::beginTransaction\s*\(")
+        cache_pattern = re.compile(r"Cache::(put|forget|flush|remember|rememberForever|set|add)\s*\(")
+
+        # Find methods and check for multiple writes without transaction
+        method_pattern = re.compile(
+            r"(?:public|protected|private)\s+function\s+(\w+)\s*\([^)]*\)\s*\{",
+        )
+        for m_match in method_pattern.finditer(content):
+            method_name = m_match.group(1)
+            start = m_match.end()
+            brace_depth = 1
+            pos = start
+            while pos < len(content) and brace_depth > 0:
+                if content[pos] == "{":
+                    brace_depth += 1
+                elif content[pos] == "}":
+                    brace_depth -= 1
+                pos += 1
+            method_body = content[start:pos]
+
+            write_calls = write_pattern.findall(method_body)
+            has_transaction = bool(transaction_pattern.search(method_body))
+
+            if len(write_calls) >= 2 and not has_transaction:
+                line_num = content[:m_match.start()].count("\n") + 1
+                risks.append({
+                    "type": "missing_transaction",
+                    "method": method_name,
+                    "line": line_num,
+                    "write_count": len(write_calls),
+                    "message": f"Method '{method_name}' has {len(write_calls)} DB writes without DB::transaction()",
+                    "severity": "high",
+                })
+
+            # Cache inside transaction
+            if has_transaction:
+                cache_calls = cache_pattern.findall(method_body)
+                if cache_calls:
+                    line_num = content[:m_match.start()].count("\n") + 1
+                    risks.append({
+                        "type": "cache_in_transaction",
+                        "method": method_name,
+                        "line": line_num,
+                        "message": f"Cache operations inside DB::transaction() in '{method_name}' – "
+                                   "cache may be set before transaction commits",
+                        "severity": "medium",
+                    })
+
+        return {
+            "status": "ok",
+            "file": file_path,
+            "risks": risks,
+            "risk_count": len(risks),
+        }
+
+    def get_domain_rules(self, file_path: str) -> Dict[str, Any]:
+        """
+        Return domain-aware anti-pattern rules based on the file location / type.
+        """
+        base = self._get_project_path()
+        if not base:
+            return {"status": "error", "message": "Project path not set"}
+
+        rules: List[Dict[str, str]] = []
+        norm = file_path.replace("\\", "/").lower()
+
+        full_path = os.path.join(base, file_path)
+        content = ""
+        if os.path.isfile(full_path):
+            try:
+                with open(full_path, "r", encoding="utf-8", errors="replace") as f:
+                    content = f.read()
+            except Exception:
+                pass
+
+        # Controllers handling public pages → SEO
+        if "controllers" in norm:
+            rules.append({
+                "rule": "require_seo_meta",
+                "message": "Public-facing controller actions should set SEO meta (title, description)",
+                "severity": "info",
+            })
+            if not re.search(r"abort_unless|abort_if|authorize|middleware|->can\(", content):
+                rules.append({
+                    "rule": "require_authorization",
+                    "message": "Controller has no authorization checks (abort_unless, authorize, middleware)",
+                    "severity": "warning",
+                })
+
+        # Webhook controllers → require transaction
+        if "webhook" in norm:
+            rules.append({
+                "rule": "require_transaction",
+                "message": "Webhook handlers should wrap DB writes in DB::transaction()",
+                "severity": "high",
+            })
+            rules.append({
+                "rule": "require_idempotency",
+                "message": "Webhook handlers should be idempotent – check for duplicate event processing",
+                "severity": "high",
+            })
+
+        # Models → require $fillable
+        if "models" in norm and norm.endswith(".php"):
+            if content and not re.search(r"\$fillable\s*=", content):
+                rules.append({
+                    "rule": "require_fillable",
+                    "message": "Eloquent model should declare $fillable to prevent mass-assignment vulnerabilities",
+                    "severity": "high",
+                })
+            if content and not re.search(r"\$casts\s*=", content):
+                rules.append({
+                    "rule": "recommend_casts",
+                    "message": "Consider declaring $casts for type-safe attribute access",
+                    "severity": "info",
+                })
+
+        # Services → stateless
+        if "services" in norm:
+            if content and re.search(r"\$this->\w+\s*=\s*", content):
+                rules.append({
+                    "rule": "stateless_service",
+                    "message": "Service classes should be stateless – avoid storing mutable state in properties",
+                    "severity": "warning",
+                })
+
+        # Middleware
+        if "middleware" in norm:
+            rules.append({
+                "rule": "middleware_performance",
+                "message": "Middleware runs on every matching request – avoid heavy DB/IO operations",
+                "severity": "info",
+            })
+
+        return {
+            "status": "ok",
+            "file": file_path,
+            "rules": rules,
+            "rule_count": len(rules),
+        }
+
+    def generate_test_skeleton(self, file_path: str, symbol: str) -> Dict[str, Any]:
+        """
+        Generate a PHPUnit test skeleton for a given function/method in a Laravel project.
+        """
+        base = self._get_project_path()
+        if not base:
+            return {"status": "error", "message": "Project path not set"}
+
+        full_path = os.path.join(base, file_path)
+        if not os.path.isfile(full_path):
+            return {"status": "error", "message": f"File not found: {file_path}"}
+
+        try:
+            with open(full_path, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read()
+        except Exception as exc:
+            return {"status": "error", "message": str(exc)}
+
+        norm = file_path.replace("\\", "/").lower()
+
+        # Extract class name
+        class_match = re.search(r"class\s+(\w+)", content)
+        class_name = class_match.group(1) if class_match else "Unknown"
+
+        # Extract method signature
+        method_match = re.search(
+            rf"(?:public|protected|private)\s+function\s+{re.escape(symbol)}\s*\(([^)]*)\)",
+            content,
+        )
+        params = method_match.group(1).strip() if method_match else ""
+
+        # Determine test type
+        if "controllers" in norm:
+            test_type = "feature"
+            test_class = f"{class_name}Test"
+            test_body = self._generate_controller_test(class_name, symbol, content)
+        elif "models" in norm:
+            test_type = "unit"
+            test_class = f"{class_name}Test"
+            test_body = self._generate_model_test(class_name, symbol)
+        elif "services" in norm or "actions" in norm:
+            test_type = "unit"
+            test_class = f"{class_name}Test"
+            test_body = self._generate_service_test(class_name, symbol, params)
+        else:
+            test_type = "unit"
+            test_class = f"{class_name}Test"
+            test_body = self._generate_generic_test(class_name, symbol, params)
+
+        skeleton = (
+            f"<?php\n\nnamespace Tests\\{test_type.capitalize()};\n\n"
+            f"use Tests\\TestCase;\n"
+            f"use Illuminate\\Foundation\\Testing\\RefreshDatabase;\n\n"
+            f"class {test_class} extends TestCase\n{{\n"
+            f"    use RefreshDatabase;\n\n"
+            f"{test_body}"
+            f"}}\n"
+        )
+
+        return {
+            "status": "ok",
+            "file": file_path,
+            "symbol": symbol,
+            "test_type": test_type,
+            "test_class": test_class,
+            "skeleton": skeleton,
+        }
+
+    def _generate_controller_test(self, class_name: str, method: str, content: str) -> str:
+        """Generate test body for a controller method."""
+        # Try to find the route
+        route_match = re.search(
+            rf"Route::(get|post|put|patch|delete)\s*\(\s*['\"]([^'\"]+)['\"].*{re.escape(class_name)}",
+            content,
+        )
+        http_method = route_match.group(1) if route_match else "get"
+        route_path = route_match.group(2) if route_match else f"/{method}"
+
+        return (
+            f"    public function test_{method}_returns_success(): void\n"
+            f"    {{\n"
+            f"        $response = $this->{http_method}('{route_path}');\n\n"
+            f"        $response->assertStatus(200);\n"
+            f"    }}\n\n"
+            f"    public function test_{method}_requires_authentication(): void\n"
+            f"    {{\n"
+            f"        $response = $this->{http_method}('{route_path}');\n\n"
+            f"        $response->assertRedirect('/login');\n"
+            f"    }}\n"
+        )
+
+    def _generate_model_test(self, class_name: str, method: str) -> str:
+        """Generate test body for a model method."""
+        return (
+            f"    public function test_{method}(): void\n"
+            f"    {{\n"
+            f"        $model = {class_name}::factory()->create();\n\n"
+            f"        $result = $model->{method}();\n\n"
+            f"        $this->assertNotNull($result);\n"
+            f"    }}\n"
+        )
+
+    def _generate_service_test(self, class_name: str, method: str, params: str) -> str:
+        """Generate test body for a service method."""
+        return (
+            f"    private ${class_name[0].lower() + class_name[1:]};\n\n"
+            f"    protected function setUp(): void\n"
+            f"    {{\n"
+            f"        parent::setUp();\n"
+            f"        $this->{class_name[0].lower() + class_name[1:]} = app({class_name}::class);\n"
+            f"    }}\n\n"
+            f"    public function test_{method}(): void\n"
+            f"    {{\n"
+            f"        // Arrange\n"
+            f"        // TODO: set up test data\n\n"
+            f"        // Act\n"
+            f"        $result = $this->{class_name[0].lower() + class_name[1:]}->{method}();\n\n"
+            f"        // Assert\n"
+            f"        $this->assertNotNull($result);\n"
+            f"    }}\n"
+        )
+
+    def _generate_generic_test(self, class_name: str, method: str, params: str) -> str:
+        """Generate test body for a generic method."""
+        return (
+            f"    public function test_{method}(): void\n"
+            f"    {{\n"
+            f"        $instance = new {class_name}();\n\n"
+            f"        $result = $instance->{method}();\n\n"
+            f"        $this->assertNotNull($result);\n"
+            f"    }}\n"
+        )
+
+    def match_view_guards(self, file_path: str, symbol: str) -> Dict[str, Any]:
+        """
+        Cross-reference controller abort_unless/if conditions with matching
+        @if/@unless conditions in Blade templates.
+        """
+        base = self._get_project_path()
+        if not base:
+            return {"status": "error", "message": "Project path not set"}
+
+        full_path = os.path.join(base, file_path)
+        if not os.path.isfile(full_path):
+            return {"status": "error", "message": f"File not found: {file_path}"}
+
+        try:
+            with open(full_path, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read()
+        except Exception as exc:
+            return {"status": "error", "message": str(exc)}
+
+        # Extract guard conditions from the controller/method
+        guards: List[Dict[str, Any]] = []
+        guard_patterns = [
+            (r"abort_unless\s*\(\s*(.+?)\s*,", "abort_unless"),
+            (r"abort_if\s*\(\s*(.+?)\s*,", "abort_if"),
+            (r"\$this->authorize\s*\(\s*['\"](\w+)['\"]", "authorize"),
+            (r"->can\s*\(\s*['\"](\w+)['\"]", "can"),
+            (r"Gate::allows\s*\(\s*['\"](\w+)['\"]", "gate_allows"),
+            (r"Gate::denies\s*\(\s*['\"](\w+)['\"]", "gate_denies"),
+        ]
+
+        for pattern, guard_type in guard_patterns:
+            for m in re.finditer(pattern, content):
+                line_num = content[:m.start()].count("\n") + 1
+                guards.append({
+                    "type": guard_type,
+                    "condition": m.group(1),
+                    "line": line_num,
+                })
+
+        # Search Blade templates for matching conditions
+        views_dir = os.path.join(base, "resources", "views")
+        blade_matches: List[Dict[str, Any]] = []
+
+        if os.path.isdir(views_dir):
+            blade_patterns = [
+                (r"@if\s*\(\s*(.+?)\s*\)", "blade_if"),
+                (r"@unless\s*\(\s*(.+?)\s*\)", "blade_unless"),
+                (r"@can\s*\(\s*['\"](\w+)['\"]", "blade_can"),
+                (r"@cannot\s*\(\s*['\"](\w+)['\"]", "blade_cannot"),
+            ]
+
+            for root, _dirs, files in os.walk(views_dir):
+                for fname in files:
+                    if not fname.endswith(".blade.php"):
+                        continue
+                    blade_path = os.path.join(root, fname)
+                    try:
+                        with open(blade_path, "r", encoding="utf-8", errors="replace") as f:
+                            blade_content = f.read()
+                    except Exception:
+                        continue
+
+                    rel_blade = os.path.relpath(blade_path, base)
+                    for bp, btype in blade_patterns:
+                        for bm in re.finditer(bp, blade_content):
+                            blade_cond = bm.group(1)
+                            blade_line = blade_content[:bm.start()].count("\n") + 1
+                            # Check if any guard condition is referenced in the Blade condition
+                            for guard in guards:
+                                cond_text = guard["condition"]
+                                if (cond_text in blade_cond or
+                                        blade_cond in cond_text or
+                                        (guard["type"] in ("authorize", "can", "gate_allows") and
+                                         btype in ("blade_can",) and
+                                         guard["condition"] == blade_cond)):
+                                    blade_matches.append({
+                                        "blade_file": rel_blade,
+                                        "blade_line": blade_line,
+                                        "blade_type": btype,
+                                        "blade_condition": blade_cond,
+                                        "backend_guard": guard,
+                                    })
+
+        return {
+            "status": "ok",
+            "file": file_path,
+            "symbol": symbol,
+            "backend_guards": guards,
+            "blade_matches": blade_matches,
+            "matched_count": len(blade_matches),
+            "unmatched_guards": len(guards) - len({m["backend_guard"]["line"] for m in blade_matches}),
+        }

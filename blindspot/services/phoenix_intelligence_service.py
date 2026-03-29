@@ -1743,3 +1743,614 @@ class PhoenixIntelligenceService(BaseService):
         result["files_affected"] = len(result["references"])
 
         return {"status": "ok", **result}
+
+    # ── verify_schema ─────────────────────────────────────────────────
+    def verify_schema(self, entity_or_model: str, fields: list) -> Dict[str, Any]:
+        """Check Ecto schema field definitions and migration create table fields."""
+        base = self._project_path()
+        if not base:
+            return {"status": "error", "message": "No project path configured"}
+
+        result: Dict[str, Any] = {
+            "schema": entity_or_model,
+            "requested_fields": fields,
+            "schema_fields": [],
+            "migration_fields": [],
+            "missing_fields": [],
+            "warnings": [],
+        }
+
+        found_fields: Set[str] = set()
+
+        for root, _, files in os.walk(base):
+            if "_build" in root or "deps" in root or ".git" in root:
+                continue
+            for fname in files:
+                if not fname.endswith((".ex", ".exs")):
+                    continue
+                fpath = os.path.join(root, fname)
+                try:
+                    with open(fpath, "r", encoding="utf-8", errors="replace") as f:
+                        content = f.read()
+                except Exception:
+                    continue
+
+                if entity_or_model not in content:
+                    continue
+
+                rel = os.path.relpath(fpath, base)
+
+                # Ecto schema field definitions: field :name, :type
+                schema_block_re = re.compile(
+                    r'schema\s+"[^"]*"\s+do\s*\n(.*?)end',
+                    re.DOTALL,
+                )
+                for sb in schema_block_re.finditer(content):
+                    body = sb.group(1)
+                    field_re = re.compile(r'field\s+:(\w+)\s*,\s*:?(\w+)')
+                    for fm in field_re.finditer(body):
+                        field_name, field_type = fm.group(1), fm.group(2)
+                        result["schema_fields"].append({
+                            "file": rel, "field": field_name, "type": field_type,
+                        })
+                        found_fields.add(field_name)
+
+                    # belongs_to / has_many / has_one associations
+                    assoc_re = re.compile(r'(?:belongs_to|has_many|has_one)\s+:(\w+)')
+                    for am in assoc_re.finditer(body):
+                        assoc_name = am.group(1)
+                        result["schema_fields"].append({
+                            "file": rel, "field": assoc_name, "type": "association",
+                        })
+                        found_fields.add(assoc_name)
+
+                # Migration create table fields
+                create_re = re.compile(
+                    r'create\s+table\s*\(\s*:(\w+).*?do\s*\n(.*?)end',
+                    re.DOTALL,
+                )
+                for cm in create_re.finditer(content):
+                    table_name = cm.group(1)
+                    body = cm.group(2)
+                    add_re = re.compile(r'add\s+:(\w+)\s*,\s*:?(\w+)')
+                    for am in add_re.finditer(body):
+                        col_name, col_type = am.group(1), am.group(2)
+                        result["migration_fields"].append({
+                            "file": rel, "table": table_name,
+                            "column": col_name, "type": col_type,
+                        })
+                        found_fields.add(col_name)
+
+                # alter table / add column in migrations
+                alter_re = re.compile(
+                    r'alter\s+table\s*\(\s*:(\w+).*?do\s*\n(.*?)end',
+                    re.DOTALL,
+                )
+                for am in alter_re.finditer(content):
+                    table_name = am.group(1)
+                    body = am.group(2)
+                    add_re = re.compile(r'add\s+:(\w+)\s*,\s*:?(\w+)')
+                    for fm in add_re.finditer(body):
+                        col_name, col_type = fm.group(1), fm.group(2)
+                        result["migration_fields"].append({
+                            "file": rel, "table": table_name,
+                            "column": col_name, "type": col_type,
+                        })
+                        found_fields.add(col_name)
+
+        for field in fields:
+            if field not in found_fields:
+                result["missing_fields"].append(field)
+
+        if result["missing_fields"]:
+            result["warnings"].append(
+                f"Fields not found in schema or migrations: {', '.join(result['missing_fields'])}"
+            )
+
+        return {"status": "ok", **result}
+
+    # ── detect_transaction_risks ──────────────────────────────────────
+    def detect_transaction_risks(self, file_path: str) -> Dict[str, Any]:
+        """Detect missing Ecto.Multi or Repo.transaction around multiple Repo operations."""
+        base = self._project_path()
+        if not base:
+            return {"status": "error", "message": "No project path configured"}
+
+        full_path = os.path.join(base, file_path)
+        if not os.path.isfile(full_path):
+            return {"status": "error", "message": f"File not found: {file_path}"}
+
+        try:
+            with open(full_path, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read()
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+
+        result: Dict[str, Any] = {
+            "file": file_path,
+            "risks": [],
+            "warnings": [],
+            "repo_op_count": 0,
+            "has_transaction": False,
+            "has_multi": False,
+        }
+
+        lines = content.split("\n")
+
+        # Count Repo operations
+        repo_op_re = re.compile(r'Repo\.(?:insert|update|delete|insert_all|update_all|delete_all)\s*[!(]')
+        repo_locs = [(i + 1, ln.strip()) for i, ln in enumerate(lines) if repo_op_re.search(ln)]
+        result["repo_op_count"] = len(repo_locs)
+
+        # Check for transaction wrappers
+        result["has_transaction"] = bool(re.search(r'Repo\.transaction', content))
+        result["has_multi"] = bool(re.search(r'Ecto\.Multi', content))
+
+        # Multiple Repo writes without transaction
+        if len(repo_locs) > 1 and not result["has_transaction"] and not result["has_multi"]:
+            result["risks"].append({
+                "type": "multiple_repo_ops_no_transaction",
+                "severity": "error",
+                "message": f"Found {len(repo_locs)} Repo write operations without Ecto.Multi or Repo.transaction",
+                "locations": [{"line": loc[0], "code": loc[1]} for loc in repo_locs[:5]],
+            })
+
+        # Cache operations inside transaction
+        cache_re = re.compile(r'(?:Cachex|ConCache|ETS|:ets)\.\w+')
+        if result["has_transaction"] or result["has_multi"]:
+            for i, line in enumerate(lines):
+                if cache_re.search(line):
+                    result["risks"].append({
+                        "type": "cache_inside_transaction",
+                        "severity": "warning",
+                        "message": "Cache operation inside transaction -- cache may become inconsistent on rollback",
+                        "line": i + 1,
+                        "code": line.strip(),
+                    })
+
+        # Repo operations in Enum.each (not atomic)
+        enum_repo_re = re.compile(r'Enum\.(?:each|map)\s*\(.*?Repo\.(?:insert|update|delete)', re.DOTALL)
+        if enum_repo_re.search(content):
+            if not result["has_multi"] and not result["has_transaction"]:
+                result["risks"].append({
+                    "type": "repo_in_enum_no_transaction",
+                    "severity": "error",
+                    "message": "Repo operations inside Enum.each/map without transaction -- partial failures possible",
+                })
+
+        # Missing bang (!) version -- silent failures
+        quiet_repo_re = re.compile(r'Repo\.(?:insert|update|delete)\s*\(')
+        bang_repo_re = re.compile(r'Repo\.(?:insert|update|delete)!\s*\(')
+        quiet_count = len(quiet_repo_re.findall(content))
+        bang_count = len(bang_repo_re.findall(content))
+        if quiet_count > 0 and bang_count == 0:
+            has_case = bool(re.search(r'case\s+Repo\.', content))
+            has_with = bool(re.search(r'with\s+\{:ok', content))
+            if not has_case and not has_with:
+                result["risks"].append({
+                    "type": "unhandled_repo_errors",
+                    "severity": "warning",
+                    "message": f"Found {quiet_count} Repo calls without bang (!) and no case/with error handling",
+                })
+
+        if not result["risks"]:
+            result["warnings"].append("No transaction risks detected")
+
+        return {"status": "ok", **result}
+
+    # ── get_domain_rules ──────────────────────────────────────────────
+    def get_domain_rules(self, file_path: str) -> Dict[str, Any]:
+        """Check Phoenix domain rules: plugs, Ecto.Multi, PubSub, changeset validation."""
+        base = self._project_path()
+        if not base:
+            return {"status": "error", "message": "No project path configured"}
+
+        full_path = os.path.join(base, file_path)
+        if not os.path.isfile(full_path):
+            return {"status": "error", "message": f"File not found: {file_path}"}
+
+        try:
+            with open(full_path, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read()
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+
+        result: Dict[str, Any] = {
+            "file": file_path,
+            "violations": [],
+            "suggestions": [],
+            "file_type": "unknown",
+        }
+
+        rel_lower = file_path.lower().replace("\\", "/")
+
+        is_controller = "controller" in rel_lower
+        is_context = ("context" in rel_lower or "lib/app/" in rel_lower) and not is_controller
+        is_liveview = "live" in rel_lower and ("live_view" in content or "LiveView" in content)
+        is_schema = bool(re.search(r'use\s+Ecto\.Schema', content)) or bool(re.search(r'schema\s+"', content))
+
+        if is_controller:
+            result["file_type"] = "controller"
+            # Controllers should have plug checks
+            has_auth_plug = bool(re.search(r'plug\s+:(?:require_auth|authenticate|ensure)', content))
+            has_module_plug = bool(re.search(r'plug\s+\w+Auth|\bplug\s+\w+\.Auth', content))
+            if not has_auth_plug and not has_module_plug:
+                result["violations"].append({
+                    "rule": "controller_requires_plug_checks",
+                    "severity": "warning",
+                    "message": "Controller lacks authentication plug -- add a plug for auth checks",
+                })
+
+            # Controllers should not have direct Repo calls
+            if re.search(r'Repo\.(?:insert|update|delete|get|all)', content):
+                result["violations"].append({
+                    "rule": "no_repo_in_controller",
+                    "severity": "warning",
+                    "message": "Direct Repo call in controller -- use context module instead",
+                })
+
+        if is_context:
+            result["file_type"] = "context"
+            # Contexts with multiple writes should use Ecto.Multi
+            repo_writes = re.findall(r'Repo\.(?:insert|update|delete)', content)
+            has_multi = bool(re.search(r'Ecto\.Multi', content))
+            if len(repo_writes) > 2 and not has_multi:
+                result["violations"].append({
+                    "rule": "context_requires_ecto_multi",
+                    "severity": "warning",
+                    "message": f"Context has {len(repo_writes)} Repo write operations -- use Ecto.Multi for atomicity",
+                })
+
+        if is_liveview:
+            result["file_type"] = "liveview"
+            # LiveViews with PubSub subscribe should have handle_info
+            has_subscribe = bool(re.search(r'PubSub\.subscribe|Phoenix\.PubSub\.subscribe', content))
+            has_handle_info = bool(re.search(r'def\s+handle_info\s*\(', content))
+            if has_subscribe and not has_handle_info:
+                result["violations"].append({
+                    "rule": "liveview_requires_handle_info",
+                    "severity": "error",
+                    "message": "LiveView subscribes to PubSub but has no handle_info callback -- messages will be unhandled",
+                })
+
+            # LiveViews should handle disconnections
+            has_handle_disconnect = bool(re.search(r'def\s+(?:terminate|handle_info.*:DOWN)', content, re.DOTALL))
+            if has_subscribe and not has_handle_disconnect:
+                result["suggestions"].append(
+                    "Consider adding terminate/handle_info for :DOWN to handle disconnections gracefully"
+                )
+
+        if is_schema:
+            result["file_type"] = "schema"
+            # Schemas should have changeset validation
+            has_changeset = bool(re.search(r'def\s+changeset\s*\(', content))
+            if not has_changeset:
+                result["violations"].append({
+                    "rule": "schema_requires_changeset",
+                    "severity": "warning",
+                    "message": "Schema lacks changeset function -- add changeset/2 for validation",
+                })
+            else:
+                # Changeset should have validate_required
+                has_validate = bool(re.search(r'validate_required', content))
+                if not has_validate:
+                    result["suggestions"].append(
+                        "Changeset exists but does not call validate_required -- consider adding required field validation"
+                    )
+
+        return {"status": "ok", **result}
+
+    # ── generate_test_skeleton ────────────────────────────────────────
+    def generate_test_skeleton(self, file_path: str, symbol: str) -> Dict[str, Any]:
+        """Generate ExUnit test skeleton with setup, describe blocks, and Repo sandbox."""
+        base = self._project_path()
+        if not base:
+            return {"status": "error", "message": "No project path configured"}
+
+        full_path = os.path.join(base, file_path)
+        if not os.path.isfile(full_path):
+            return {"status": "error", "message": f"File not found: {file_path}"}
+
+        try:
+            with open(full_path, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read()
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+
+        result: Dict[str, Any] = {
+            "file": file_path,
+            "symbol": symbol,
+            "test_code": "",
+            "test_type": "unit",
+            "dependencies": [],
+        }
+
+        # Detect module name
+        mod_re = re.search(r'defmodule\s+([\w.]+)', content)
+        module_name = mod_re.group(1) if mod_re else "MyApp.Module"
+
+        # Extract function signatures
+        fn_re = re.compile(r'def\s+(\w+)\s*\(([^)]*)\)')
+        functions = [(m.group(1), m.group(2)) for m in fn_re.finditer(content)]
+
+        is_controller = "Controller" in module_name or "controller" in file_path.lower()
+        is_liveview = "LiveView" in content or "live_view" in content
+        is_context = not is_controller and not is_liveview and bool(re.search(r'Repo\.', content))
+        is_schema = bool(re.search(r'use\s+Ecto\.Schema', content))
+
+        uses_repo = bool(re.search(r'Repo\.', content))
+
+        setup_block = ""
+        if uses_repo:
+            result["dependencies"].append("Ecto.Adapters.SQL.Sandbox")
+            setup_block = """
+  setup do
+    :ok = Ecto.Adapters.SQL.Sandbox.checkout(MyApp.Repo)
+    :ok
+  end
+"""
+
+        if is_controller:
+            result["test_type"] = "controller"
+            test_fns = ""
+            for fn_name, params in functions:
+                if fn_name.startswith("_"):
+                    continue
+                test_fns += f"""
+  describe "{fn_name}/2" do
+    test "returns success response", %{{conn: conn}} do
+      conn = get(conn, ~p"/{symbol.lower()}")
+      assert html_response(conn, 200) =~ ""
+    end
+
+    test "handles invalid params", %{{conn: conn}} do
+      conn = get(conn, ~p"/{symbol.lower()}", %{{"invalid" => "param"}})
+      assert html_response(conn, 200)
+    end
+  end
+"""
+            result["test_code"] = f"""defmodule {module_name}Test do
+  use MyAppWeb.ConnCase, async: true
+{setup_block}
+{test_fns}end
+"""
+        elif is_liveview:
+            result["test_type"] = "liveview"
+            result["dependencies"].append("Phoenix.LiveViewTest")
+            test_fns = ""
+            # Find handle_event callbacks
+            events = re.findall(r'def\s+handle_event\s*\(\s*"(\w+)"', content)
+            for evt in events:
+                test_fns += f"""
+  describe "handle_event {evt}" do
+    test "processes event correctly", %{{conn: conn}} do
+      {{:ok, view, _html}} = live(conn, ~p"/{symbol.lower()}")
+      assert view
+        |> element("button", "Submit")
+        |> render_click() =~ ""
+    end
+  end
+"""
+            result["test_code"] = f"""defmodule {module_name}Test do
+  use MyAppWeb.ConnCase, async: true
+  import Phoenix.LiveViewTest
+{setup_block}
+  describe "mount" do
+    test "renders page", %{{conn: conn}} do
+      {{:ok, view, html}} = live(conn, ~p"/{symbol.lower()}")
+      assert html =~ ""
+      assert has_element?(view, "h1")
+    end
+  end
+{test_fns}end
+"""
+        elif is_context:
+            result["test_type"] = "context"
+            test_fns = ""
+            for fn_name, params in functions:
+                if fn_name.startswith("_"):
+                    continue
+                param_count = len([p for p in params.split(",") if p.strip()]) if params.strip() else 0
+                test_fns += f"""
+  describe "{fn_name}/{param_count}" do
+    test "returns expected result" do
+      # Setup test data
+      result = {module_name}.{fn_name}(/* args */)
+      assert result
+    end
+
+    test "handles invalid input" do
+      assert {{:error, _changeset}} = {module_name}.{fn_name}(/* invalid args */)
+    end
+  end
+"""
+            result["test_code"] = f"""defmodule {module_name}Test do
+  use MyApp.DataCase, async: true
+
+  alias {module_name}
+{setup_block}
+{test_fns}end
+"""
+        elif is_schema:
+            result["test_type"] = "schema"
+            result["test_code"] = f"""defmodule {module_name}Test do
+  use MyApp.DataCase, async: true
+
+  alias {module_name}
+{setup_block}
+  describe "changeset/2" do
+    test "valid attrs produce valid changeset" do
+      valid_attrs = %{{}}  # TODO: add valid attributes
+      changeset = {symbol}.changeset(%{symbol}{{}}, valid_attrs)
+      assert changeset.valid?
+    end
+
+    test "invalid attrs produce invalid changeset" do
+      invalid_attrs = %{{}}
+      changeset = {symbol}.changeset(%{symbol}{{}}, invalid_attrs)
+      refute changeset.valid?
+    end
+
+    test "validates required fields" do
+      changeset = {symbol}.changeset(%{symbol}{{}}, %{{}})
+      assert %{{}} = errors_on(changeset)
+    end
+  end
+end
+"""
+        else:
+            result["test_type"] = "unit"
+            test_fns = ""
+            for fn_name, params in functions:
+                if fn_name.startswith("_"):
+                    continue
+                test_fns += f"""
+  describe "{fn_name}" do
+    test "returns expected result" do
+      result = {module_name}.{fn_name}()
+      assert result
+    end
+  end
+"""
+            result["test_code"] = f"""defmodule {module_name}Test do
+  use ExUnit.Case, async: true
+
+  alias {module_name}
+{setup_block}
+{test_fns}end
+"""
+
+        return {"status": "ok", **result}
+
+    # ── match_view_guards ─────────────────────────────────────────────
+    def match_view_guards(self, file_path: str, symbol: str) -> Dict[str, Any]:
+        """Match Plug auth checks with HEEx/LiveView socket.assigns conditions."""
+        base = self._project_path()
+        if not base:
+            return {"status": "error", "message": "No project path configured"}
+
+        full_path = os.path.join(base, file_path)
+        if not os.path.isfile(full_path):
+            return {"status": "error", "message": f"File not found: {file_path}"}
+
+        try:
+            with open(full_path, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read()
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+
+        result: Dict[str, Any] = {
+            "file": file_path,
+            "symbol": symbol,
+            "backend_guards": [],
+            "template_conditions": [],
+            "live_session_guards": [],
+            "mismatches": [],
+            "warnings": [],
+        }
+
+        # Detect plug-based auth guards
+        plug_patterns = [
+            (r'plug\s+:(?:require_auth|authenticate|ensure_authenticated|fetch_current_user)', "auth_plug"),
+            (r'plug\s+(\w+)\.(?:Auth|Require|Ensure)\w*', "module_auth_plug"),
+            (r'plug\s+:put_(?:user|session|auth)', "session_plug"),
+        ]
+        for pattern, plug_type in plug_patterns:
+            for m in re.finditer(pattern, content):
+                line_no = content[:m.start()].count("\n") + 1
+                result["backend_guards"].append({
+                    "type": plug_type, "line": line_no,
+                    "code": m.group(0).strip(),
+                })
+
+        # Detect live_session auth
+        live_session_re = re.compile(
+            r'live_session\s+:(\w+)\s*,\s*on_mount:\s*\[([^\]]+)\]',
+        )
+        for m in live_session_re.finditer(content):
+            session_name = m.group(1)
+            hooks = m.group(2).strip()
+            result["live_session_guards"].append({
+                "session": session_name, "on_mount": hooks,
+            })
+
+        # Extract role/permission checks from plugs
+        backend_roles: Set[str] = set()
+        role_re = re.compile(r'(?:role|permission|admin|moderator|user_type)\s*(?:==|in)\s*[:\"](\w+)')
+        for m in role_re.finditer(content):
+            role = m.group(1)
+            backend_roles.add(role)
+            result["backend_guards"].append({
+                "type": "role_check", "role": role,
+            })
+
+        # Scan HEEx templates and LiveView renders for matching conditions
+        template_roles: Set[str] = set()
+        scan_dirs = [base]
+        for scan_dir in scan_dirs:
+            for root, _, files in os.walk(scan_dir):
+                if "_build" in root or "deps" in root or ".git" in root:
+                    continue
+                for fname in files:
+                    if not fname.endswith((".heex", ".html.heex", ".ex")):
+                        continue
+                    tpath = os.path.join(root, fname)
+                    try:
+                        with open(tpath, "r", encoding="utf-8", errors="replace") as f:
+                            tcontent = f.read()
+                    except Exception:
+                        continue
+
+                    rel_t = os.path.relpath(tpath, base)
+
+                    # HEEx: <%= if @current_user do %> or {#if @current_user}
+                    heex_auth_re = re.compile(
+                        r'(?:<%=?\s*if\s+@(?:current_user|authenticated|logged_in)|\{#if\s+@(?:current_user|authenticated))',
+                    )
+                    for tm in heex_auth_re.finditer(tcontent):
+                        result["template_conditions"].append({
+                            "file": rel_t, "type": "heex_auth_check",
+                            "code": tm.group(0),
+                        })
+
+                    # socket.assigns checks in LiveView
+                    assigns_re = re.compile(
+                        r'socket\.assigns\.(?:current_user|role|admin|authenticated)',
+                    )
+                    for tm in assigns_re.finditer(tcontent):
+                        result["template_conditions"].append({
+                            "file": rel_t, "type": "assigns_auth_check",
+                            "code": tm.group(0),
+                        })
+
+                    # Role checks in templates
+                    tmpl_role_re = re.compile(
+                        r'@(?:current_user|user)\.role\s*==\s*:(\w+)'
+                    )
+                    for tm in tmpl_role_re.finditer(tcontent):
+                        role = tm.group(1)
+                        template_roles.add(role)
+                        result["template_conditions"].append({
+                            "file": rel_t, "type": "template_role_check", "role": role,
+                        })
+
+        # Find mismatches
+        for role in backend_roles:
+            if role not in template_roles:
+                result["mismatches"].append({
+                    "type": "backend_role_no_template_guard",
+                    "role": role,
+                    "message": f"Backend checks role '{role}' but no matching template condition found",
+                })
+        for role in template_roles:
+            if role not in backend_roles:
+                result["mismatches"].append({
+                    "type": "template_guard_no_backend_role",
+                    "role": role,
+                    "message": f"Template checks role '{role}' but no matching backend plug guard found",
+                })
+
+        if not result["backend_guards"] and not result["live_session_guards"]:
+            result["warnings"].append("No auth plugs or live_session guards detected in this file")
+
+        return {"status": "ok", **result}

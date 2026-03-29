@@ -1964,3 +1964,543 @@ class RailsIntelligenceService(BaseService):
             "checks": checks,
             "total_references": sum(r.get("total", 0) for r in checks["references"]),
         }
+
+    # -----------------------------------------------------------------
+    # verify_schema
+    # -----------------------------------------------------------------
+    def verify_schema(self, entity_or_model: str, fields: list) -> Dict[str, Any]:
+        """Verify fields exist in ActiveRecord model via db/migrate/ create_table/add_column."""
+        base = self.base_path
+        result: Dict[str, Any] = {
+            "status": "success",
+            "model": entity_or_model,
+            "requested_fields": fields,
+            "found_fields": [],
+            "missing_fields": [],
+            "migration_sources": [],
+            "schema_fields": [],
+            "warnings": [],
+        }
+
+        # 1. Check db/schema.rb for authoritative field list
+        schema_file = os.path.join(base, "db", "schema.rb")
+        schema_fields: set = set()
+        if os.path.isfile(schema_file):
+            try:
+                with open(schema_file, 'r', encoding='utf-8', errors='replace') as f:
+                    schema_content = f.read()
+                # Convert model name to table name (simple pluralization + underscore)
+                table_name = re.sub(r'([A-Z])', r'_\1', entity_or_model).lstrip('_').lower() + 's'
+                # Also try simple lowercase + s
+                table_variants = [table_name, entity_or_model.lower() + 's', entity_or_model.lower()]
+                for tname in table_variants:
+                    table_re = re.compile(
+                        rf'create_table\s+["\']?{re.escape(tname)}["\']?\s*.*?do\s*\|t\|(.*?)end',
+                        re.DOTALL
+                    )
+                    tm = table_re.search(schema_content)
+                    if tm:
+                        table_body = tm.group(1)
+                        col_names = re.findall(r't\.(?:string|integer|text|boolean|datetime|float|decimal|date|binary|json|jsonb|uuid|references)\s+["\':]+(\w+)', table_body)
+                        schema_fields.update(col_names)
+                        result["schema_fields"] = list(schema_fields)
+                        break
+            except Exception:
+                pass
+
+        # 2. Scan db/migrate/ for create_table and add_column
+        migrate_dir = os.path.join(base, "db", "migrate")
+        migration_fields: set = set()
+        if os.path.isdir(migrate_dir):
+            for fn in sorted(os.listdir(migrate_dir)):
+                if not fn.endswith('.rb'):
+                    continue
+                fpath = os.path.join(migrate_dir, fn)
+                try:
+                    with open(fpath, 'r', encoding='utf-8', errors='replace') as f:
+                        mcontent = f.read()
+                except Exception:
+                    continue
+                # create_table fields
+                col_names = re.findall(r't\.(?:string|integer|text|boolean|datetime|float|decimal|date|binary|json|jsonb|uuid|references)\s+["\':]+(\w+)', mcontent)
+                # add_column :table, :column
+                add_cols = re.findall(r'add_column\s+["\':]+\w+["\']?\s*,\s*["\':]+(\w+)', mcontent)
+                for fld in fields:
+                    if fld in col_names or fld in add_cols:
+                        migration_fields.add(fld)
+                        result["migration_sources"].append({"field": fld, "file": fn})
+
+        # 3. Also check model file for attr_accessor or attribute declarations
+        model_dirs = [
+            os.path.join(base, "app", "models"),
+        ]
+        model_fields: set = set()
+        for mdir in model_dirs:
+            if not os.path.isdir(mdir):
+                continue
+            for fn in os.listdir(mdir):
+                if not fn.endswith('.rb'):
+                    continue
+                fpath = os.path.join(mdir, fn)
+                try:
+                    with open(fpath, 'r', encoding='utf-8', errors='replace') as f:
+                        content = f.read()
+                except Exception:
+                    continue
+                if re.search(rf'class\s+{re.escape(entity_or_model)}\b', content):
+                    # attr_accessor, attribute
+                    attrs = re.findall(r'(?:attr_accessor|attr_reader|attr_writer|attribute)\s+([^\n]+)', content)
+                    for attr_line in attrs:
+                        names = re.findall(r':(\w+)', attr_line)
+                        model_fields.update(names)
+
+        all_known_fields = schema_fields | migration_fields | model_fields
+        if not all_known_fields and not schema_fields:
+            result["warnings"].append(f"No schema information found for model '{entity_or_model}'")
+            result["missing_fields"] = list(fields)
+        else:
+            for fld in fields:
+                if fld in all_known_fields:
+                    result["found_fields"].append(fld)
+                else:
+                    result["missing_fields"].append(fld)
+
+        return result
+
+    # -----------------------------------------------------------------
+    # detect_transaction_risks
+    # -----------------------------------------------------------------
+    def detect_transaction_risks(self, file_path: str) -> Dict[str, Any]:
+        """Detect missing ActiveRecord::Base.transaction around multiple writes."""
+        base = self.base_path
+        full_path = os.path.join(base, file_path) if not os.path.isabs(file_path) else file_path
+        result: Dict[str, Any] = {
+            "status": "success",
+            "file": file_path,
+            "risks": [],
+            "suggestions": [],
+        }
+        if not os.path.isfile(full_path):
+            result["status"] = "error"
+            result["error"] = f"File not found: {file_path}"
+            return result
+
+        try:
+            with open(full_path, 'r', encoding='utf-8', errors='replace') as f:
+                content = f.read()
+        except Exception as e:
+            result["status"] = "error"
+            result["error"] = str(e)
+            return result
+
+        write_ops_re = re.compile(r'\.(?:save!?|create!?|update!?|destroy!?|delete|update_all|delete_all|insert_all|upsert_all)\b')
+        transaction_re = re.compile(r'(?:ActiveRecord::Base\.transaction|\.transaction\s+do|with_lock)')
+        cache_re = re.compile(r'(?:Rails\.cache\.|cache_store\.|\.fetch\s*\(|\.write\s*\(|\.delete\s*\(|Redis\.|REDIS\.)')
+
+        # Split into methods
+        method_re = re.compile(r'^\s*def\s+(\w+[?!]?)', re.MULTILINE)
+        methods = list(method_re.finditer(content))
+
+        for i, m in enumerate(methods):
+            method_name = m.group(1)
+            start = m.start()
+            end = methods[i + 1].start() if i + 1 < len(methods) else len(content)
+            block = content[start:end]
+
+            writes = write_ops_re.findall(block)
+            has_transaction = bool(transaction_re.search(block))
+            has_cache = bool(cache_re.search(block))
+
+            if len(writes) >= 2 and not has_transaction:
+                result["risks"].append({
+                    "method": method_name,
+                    "type": "missing_transaction",
+                    "write_count": len(writes),
+                    "message": f"Method '{method_name}' has {len(writes)} write operations without ActiveRecord::Base.transaction",
+                    "severity": "high",
+                })
+
+            if has_transaction and has_cache:
+                result["risks"].append({
+                    "method": method_name,
+                    "type": "cache_in_transaction",
+                    "message": f"Method '{method_name}' has cache operations inside transaction -- risk of inconsistency on rollback",
+                    "severity": "medium",
+                })
+
+        if not result["risks"]:
+            result["suggestions"].append("No transaction risks detected")
+
+        return result
+
+    # -----------------------------------------------------------------
+    # get_domain_rules
+    # -----------------------------------------------------------------
+    def get_domain_rules(self, file_path: str) -> Dict[str, Any]:
+        """Return Rails domain-layer rules for the given file."""
+        base = self.base_path
+        full_path = os.path.join(base, file_path) if not os.path.isabs(file_path) else file_path
+        result: Dict[str, Any] = {
+            "status": "success",
+            "file": file_path,
+            "file_type": "unknown",
+            "violations": [],
+            "rules_checked": [],
+        }
+        if not os.path.isfile(full_path):
+            result["status"] = "error"
+            result["error"] = f"File not found: {file_path}"
+            return result
+
+        try:
+            with open(full_path, 'r', encoding='utf-8', errors='replace') as f:
+                content = f.read()
+        except Exception as e:
+            result["status"] = "error"
+            result["error"] = str(e)
+            return result
+
+        lower_path = file_path.lower()
+        if '/controllers/' in lower_path:
+            ftype = "controller"
+        elif '/models/' in lower_path:
+            ftype = "model"
+        elif '/jobs/' in lower_path:
+            ftype = "job"
+        elif '/mailers/' in lower_path:
+            ftype = "mailer"
+        else:
+            ftype = "other"
+        result["file_type"] = ftype
+
+        if ftype == "controller":
+            result["rules_checked"].append("Controllers must use strong_parameters (permit)")
+            # Check for actions that use params without permit
+            actions = re.findall(r'def\s+(create|update|new|edit)\b', content)
+            has_permit = bool(re.search(r'\.permit\s*\(', content))
+            has_strong_params = bool(re.search(r'params\.require\s*\(', content))
+            if actions and not has_permit and not has_strong_params:
+                result["violations"].append({
+                    "rule": "missing_strong_parameters",
+                    "message": f"Controller has {', '.join(actions)} action(s) but no params.require/permit",
+                    "severity": "high",
+                })
+            # Check for direct params usage without strong params
+            direct_params = re.findall(r'params\[:(\w+)\]', content)
+            if direct_params and not has_permit:
+                result["violations"].append({
+                    "rule": "raw_params_access",
+                    "message": f"Direct params access without strong_parameters: {', '.join(direct_params[:5])}",
+                    "severity": "medium",
+                })
+
+        elif ftype == "model":
+            result["rules_checked"].append("Models must include validations")
+            has_validations = bool(re.search(r'validates?\s+:', content))
+            has_associations = bool(re.search(r'(?:has_many|has_one|belongs_to|has_and_belongs_to_many)\s+:', content))
+            if not has_validations:
+                result["violations"].append({
+                    "rule": "missing_validations",
+                    "message": "Model has no validations (validates/validate)",
+                    "severity": "medium",
+                })
+            if has_associations and not has_validations:
+                result["violations"].append({
+                    "rule": "associations_without_validation",
+                    "message": "Model has associations but no validations -- consider adding presence/uniqueness checks",
+                    "severity": "medium",
+                })
+
+        elif ftype == "job":
+            result["rules_checked"].append("Jobs must include error handling")
+            has_perform = bool(re.search(r'def\s+perform\b', content))
+            has_rescue = bool(re.search(r'(?:rescue\b|retry_on\b|discard_on\b|rescue_from\b)', content))
+            if has_perform and not has_rescue:
+                result["violations"].append({
+                    "rule": "missing_job_error_handling",
+                    "message": "Job has perform method but no error handling (rescue/retry_on/discard_on)",
+                    "severity": "high",
+                })
+
+        elif ftype == "mailer":
+            result["rules_checked"].append("Mailers must specify default from address")
+            has_default_from = bool(re.search(r'default\s+from:', content))
+            mail_calls = re.findall(r'mail\s*\(', content)
+            if mail_calls and not has_default_from:
+                # Check if individual mail calls specify from:
+                from_in_mail = re.findall(r'mail\s*\([^)]*from:', content)
+                if len(from_in_mail) < len(mail_calls):
+                    result["violations"].append({
+                        "rule": "missing_default_from",
+                        "message": f"Mailer has {len(mail_calls)} mail call(s) but no default from: address",
+                        "severity": "medium",
+                    })
+
+        return result
+
+    # -----------------------------------------------------------------
+    # generate_test_skeleton
+    # -----------------------------------------------------------------
+    def generate_test_skeleton(self, file_path: str, symbol: str) -> Dict[str, Any]:
+        """Generate an RSpec or Minitest skeleton for a Rails class/method."""
+        base = self.base_path
+        full_path = os.path.join(base, file_path) if not os.path.isabs(file_path) else file_path
+        result: Dict[str, Any] = {
+            "status": "success",
+            "file": file_path,
+            "symbol": symbol,
+            "test_skeleton": "",
+            "test_file_path": "",
+            "framework": "rspec",
+        }
+        if not os.path.isfile(full_path):
+            result["status"] = "error"
+            result["error"] = f"File not found: {file_path}"
+            return result
+
+        try:
+            with open(full_path, 'r', encoding='utf-8', errors='replace') as f:
+                content = f.read()
+        except Exception as e:
+            result["status"] = "error"
+            result["error"] = str(e)
+            return result
+
+        # Detect if project uses RSpec or Minitest
+        uses_rspec = os.path.isdir(os.path.join(base, "spec"))
+        uses_minitest = os.path.isdir(os.path.join(base, "test"))
+
+        # Detect class name
+        class_match = re.search(r'class\s+(\w+)', content)
+        class_name = class_match.group(1) if class_match else symbol
+
+        # Detect file type
+        lower_path = file_path.lower()
+        is_controller = '/controllers/' in lower_path
+        is_model = '/models/' in lower_path
+        is_job = '/jobs/' in lower_path
+        is_mailer = '/mailers/' in lower_path
+
+        # Detect methods
+        methods = re.findall(r'def\s+(\w+[?!]?)', content)
+
+        if uses_rspec or not uses_minitest:
+            result["framework"] = "rspec"
+            test_path = file_path.replace("app/", "spec/").replace(".rb", "_spec.rb")
+            result["test_file_path"] = test_path
+
+            if is_controller:
+                skeleton = f"""require 'rails_helper'
+
+RSpec.describe {class_name}, type: :controller do
+  describe '#{symbol}' do
+    context 'when user is authenticated' do
+      before do
+        # TODO: sign in user
+        # sign_in create(:user)
+      end
+
+      it 'returns a successful response' do
+        get :{symbol}
+        expect(response).to be_successful
+      end
+    end
+
+    context 'when user is not authenticated' do
+      it 'redirects to login' do
+        get :{symbol}
+        expect(response).to redirect_to(new_user_session_path)
+      end
+    end
+  end
+end
+"""
+            elif is_model:
+                # Detect associations and validations
+                associations = re.findall(r'(has_many|has_one|belongs_to|has_and_belongs_to_many)\s+:(\w+)', content)
+                validations = re.findall(r'validates?\s+:(\w+)', content)
+
+                assoc_tests = "\n".join(
+                    f"    it {{ is_expected.to {a[0].replace('_', '_')}(:{a[1]}) }}" for a in associations[:5]
+                )
+                valid_tests = "\n".join(
+                    f"    it {{ is_expected.to validate_presence_of(:{v}) }}" for v in validations[:5]
+                )
+
+                skeleton = f"""require 'rails_helper'
+
+RSpec.describe {class_name}, type: :model do
+  subject {{ build(:{class_name.lower()}) }}
+
+  describe 'associations' do
+{assoc_tests if assoc_tests else '    # TODO: add association tests'}
+  end
+
+  describe 'validations' do
+{valid_tests if valid_tests else '    # TODO: add validation tests'}
+  end
+
+  describe '#{symbol}' do
+    context 'with valid data' do
+      it 'succeeds' do
+        # TODO: test {symbol}
+      end
+    end
+
+    context 'with invalid data' do
+      it 'fails gracefully' do
+        # TODO: test failure case
+      end
+    end
+  end
+end
+"""
+            else:
+                method_blocks = "\n\n".join(
+                    f"""  describe '#{m}' do
+    it 'works correctly' do
+      # TODO: test {m}
+    end
+  end""" for m in methods[:5]
+                ) if methods else f"""  describe '#{symbol}' do
+    it 'works correctly' do
+      # TODO: implement test
+    end
+  end"""
+
+                skeleton = f"""require 'rails_helper'
+
+RSpec.describe {class_name} do
+  let(:instance) {{ described_class.new }}
+
+{method_blocks}
+end
+"""
+        else:
+            result["framework"] = "minitest"
+            test_path = file_path.replace("app/", "test/").replace(".rb", "_test.rb")
+            result["test_file_path"] = test_path
+
+            method_tests = "\n\n".join(
+                f"""  test '{m} works correctly' do
+    # TODO: test {m}
+    assert true
+  end""" for m in methods[:5]
+            ) if methods else f"""  test '{symbol} works correctly' do
+    # TODO: implement test
+    assert true
+  end"""
+
+            skeleton = f"""require 'test_helper'
+
+class {class_name}Test < ActiveSupport::TestCase
+  setup do
+    # TODO: set up test fixtures
+  end
+
+{method_tests}
+end
+"""
+        result["test_skeleton"] = skeleton
+        return result
+
+    # -----------------------------------------------------------------
+    # match_view_guards
+    # -----------------------------------------------------------------
+    def match_view_guards(self, file_path: str, symbol: str) -> Dict[str, Any]:
+        """Match before_action auth checks to ERB <% if %> conditions."""
+        base = self.base_path
+        full_path = os.path.join(base, file_path) if not os.path.isabs(file_path) else file_path
+        result: Dict[str, Any] = {
+            "status": "success",
+            "file": file_path,
+            "symbol": symbol,
+            "backend_guards": [],
+            "view_guards": [],
+            "mismatches": [],
+        }
+        if not os.path.isfile(full_path):
+            result["status"] = "error"
+            result["error"] = f"File not found: {file_path}"
+            return result
+
+        try:
+            with open(full_path, 'r', encoding='utf-8', errors='replace') as f:
+                content = f.read()
+        except Exception as e:
+            result["status"] = "error"
+            result["error"] = str(e)
+            return result
+
+        # Extract before_action auth checks
+        before_action_re = re.compile(r'before_action\s+:(\w+)(?:\s*,\s*only:\s*\[([^\]]+)\])?')
+        auth_methods = set()
+        for m in before_action_re.finditer(content):
+            callback = m.group(1)
+            only_actions = m.group(2)
+            if re.search(r'(?:auth|login|sign_in|require.*user|check.*permission|verify.*role|admin)', callback, re.IGNORECASE):
+                actions = [a.strip().strip(':').strip() for a in only_actions.split(',')] if only_actions else ["all"]
+                result["backend_guards"].append({
+                    "type": "before_action",
+                    "callback": callback,
+                    "actions": actions,
+                })
+                auth_methods.add(callback)
+
+        # Extract role/permission checks in methods
+        role_checks = re.findall(r'(?:current_user\.(?:admin\??|role)\s*==?\s*["\':]*(\w+)|can\?\s*:(\w+)|authorize!\s*:(\w+))', content)
+        roles_backend: set = set()
+        for grp in role_checks:
+            for r in grp:
+                if r:
+                    roles_backend.add(r)
+                    result["backend_guards"].append({"type": "role_check", "role": r})
+
+        # Determine controller name to find matching views
+        controller_match = re.search(r'class\s+(\w+)Controller', content)
+        controller_name = controller_match.group(1).lower() if controller_match else None
+
+        # Scan ERB/HAML views
+        roles_frontend: set = set()
+        views_dir = os.path.join(base, "app", "views")
+        if controller_name and os.path.isdir(views_dir):
+            controller_views = os.path.join(views_dir, controller_name)
+            view_search_dirs = [controller_views, os.path.join(views_dir, "layouts"), os.path.join(views_dir, "shared")]
+            for vdir in view_search_dirs:
+                if not os.path.isdir(vdir):
+                    continue
+                for fn in os.listdir(vdir):
+                    if not fn.endswith(('.erb', '.haml', '.slim', '.html')):
+                        continue
+                    tpath = os.path.join(vdir, fn)
+                    try:
+                        with open(tpath, 'r', encoding='utf-8', errors='replace') as f:
+                            tcontent = f.read()
+                    except Exception:
+                        continue
+                    rel_path = os.path.relpath(tpath, base)
+
+                    # ERB: <% if current_user.admin? %> or <% if can? :manage %>
+                    erb_guards = re.findall(r'<%[-=]?\s*if\s+(?:current_user\.(\w+)\??|can\?\s*:(\w+)|user_signed_in\?|(\w+)_signed_in\?)', tcontent)
+                    for grp in erb_guards:
+                        for g in grp:
+                            if g:
+                                result["view_guards"].append({"file": rel_path, "type": "erb_condition", "check": g})
+                                roles_frontend.add(g)
+
+                    # HAML: - if current_user.admin?
+                    haml_guards = re.findall(r'-\s*if\s+(?:current_user\.(\w+)\??|can\?\s*:(\w+))', tcontent)
+                    for grp in haml_guards:
+                        for g in grp:
+                            if g:
+                                result["view_guards"].append({"file": rel_path, "type": "haml_condition", "check": g})
+                                roles_frontend.add(g)
+
+        backend_only = roles_backend - roles_frontend
+        frontend_only = roles_frontend - roles_backend
+        for role in backend_only:
+            result["mismatches"].append({"role": role, "issue": "Backend auth check has no matching view condition"})
+        for role in frontend_only:
+            result["mismatches"].append({"role": role, "issue": "View condition has no matching backend auth check"})
+
+        return result

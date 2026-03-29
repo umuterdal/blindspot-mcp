@@ -1801,3 +1801,486 @@ class GoIntelligenceService(BaseService):
             "checks": checks,
             "total_references": sum(r.get("total", 0) for r in checks["references"]),
         }
+
+    # -----------------------------------------------------------------
+    # verify_schema
+    # -----------------------------------------------------------------
+    def verify_schema(self, entity_or_model: str, fields: list) -> Dict[str, Any]:
+        """Verify fields exist in a GORM struct or golang-migrate .sql files."""
+        base = self.base_path
+        result: Dict[str, Any] = {
+            "status": "success",
+            "model": entity_or_model,
+            "requested_fields": fields,
+            "found_fields": [],
+            "missing_fields": [],
+            "migration_fields": [],
+            "source_file": None,
+            "warnings": [],
+        }
+
+        model_dirs = [
+            os.path.join(base, "internal", "models"),
+            os.path.join(base, "internal", "model"),
+            os.path.join(base, "pkg", "models"),
+            os.path.join(base, "models"),
+        ]
+
+        struct_found = False
+        all_struct_fields: set = set()
+
+        for mdir in model_dirs:
+            if not os.path.isdir(mdir):
+                continue
+            for dirpath, _, filenames in os.walk(mdir):
+                for fn in filenames:
+                    if not fn.endswith('.go') or fn.endswith('_test.go'):
+                        continue
+                    fpath = os.path.join(dirpath, fn)
+                    try:
+                        with open(fpath, 'r', encoding='utf-8', errors='replace') as f:
+                            content = f.read()
+                    except Exception:
+                        continue
+
+                    # Find struct definition
+                    struct_re = re.compile(
+                        rf'type\s+{re.escape(entity_or_model)}\s+struct\s*\{{(.*?)\}}',
+                        re.DOTALL
+                    )
+                    sm = struct_re.search(content)
+                    if not sm:
+                        continue
+
+                    struct_found = True
+                    result["source_file"] = os.path.relpath(fpath, base)
+                    struct_body = sm.group(1)
+
+                    # Parse struct fields: FieldName Type `gorm:"column:col_name" json:"json_name"`
+                    field_lines = struct_body.strip().split('\n')
+                    for line in field_lines:
+                        line = line.strip()
+                        if not line or line.startswith('//') or line.startswith('/*'):
+                            continue
+                        # Embedded struct (e.g., gorm.Model)
+                        parts = line.split()
+                        if len(parts) >= 1:
+                            field_name = parts[0]
+                            all_struct_fields.add(field_name)
+                        # Also extract gorm column name
+                        gorm_col = re.search(r'gorm:"[^"]*column:(\w+)', line)
+                        if gorm_col:
+                            all_struct_fields.add(gorm_col.group(1))
+                        # Also extract json tag name
+                        json_tag = re.search(r'json:"(\w+)', line)
+                        if json_tag:
+                            all_struct_fields.add(json_tag.group(1))
+
+        if not struct_found:
+            result["warnings"].append(f"Struct '{entity_or_model}' not found in model directories")
+            result["missing_fields"] = list(fields)
+        else:
+            for fld in fields:
+                if fld in all_struct_fields:
+                    result["found_fields"].append(fld)
+                else:
+                    result["missing_fields"].append(fld)
+
+        # Check golang-migrate .sql files
+        migration_dirs = [
+            os.path.join(base, "migrations"),
+            os.path.join(base, "db", "migrations"),
+            os.path.join(base, "internal", "db", "migrations"),
+        ]
+        for migdir in migration_dirs:
+            if not os.path.isdir(migdir):
+                continue
+            for fn in sorted(os.listdir(migdir)):
+                if not fn.endswith('.sql'):
+                    continue
+                fpath = os.path.join(migdir, fn)
+                try:
+                    with open(fpath, 'r', encoding='utf-8', errors='replace') as f:
+                        mcontent = f.read()
+                except Exception:
+                    continue
+                for fld in fields:
+                    if re.search(rf'\b{re.escape(fld)}\b', mcontent, re.IGNORECASE):
+                        result["migration_fields"].append({"field": fld, "file": fn})
+
+        return result
+
+    # -----------------------------------------------------------------
+    # detect_transaction_risks
+    # -----------------------------------------------------------------
+    def detect_transaction_risks(self, file_path: str) -> Dict[str, Any]:
+        """Detect missing tx.Begin()/tx.Commit() around multiple DB operations."""
+        base = self.base_path
+        full_path = os.path.join(base, file_path) if not os.path.isabs(file_path) else file_path
+        result: Dict[str, Any] = {
+            "status": "success",
+            "file": file_path,
+            "risks": [],
+            "suggestions": [],
+        }
+        if not os.path.isfile(full_path):
+            result["status"] = "error"
+            result["error"] = f"File not found: {file_path}"
+            return result
+
+        try:
+            with open(full_path, 'r', encoding='utf-8', errors='replace') as f:
+                content = f.read()
+        except Exception as e:
+            result["status"] = "error"
+            result["error"] = str(e)
+            return result
+
+        write_ops_re = re.compile(r'\.(?:Create|Save|Update|Delete|Exec|Updates|FirstOrCreate|Assign)\s*\(')
+        tx_re = re.compile(r'(?:\.Begin\s*\(|\.Transaction\s*\(|tx\s*:=|WithContext\s*\(\s*tx)')
+        cache_re = re.compile(r'(?:redis\.|cache\.|\.Set\s*\(ctx|\.Get\s*\(ctx|\.Del\s*\(ctx|memcache|\.SetNX)')
+
+        # Split into Go functions
+        func_re = re.compile(r'func\s+(?:\(\s*\w+\s+\*?\w+\s*\)\s+)?(\w+)\s*\([^)]*\)[^{]*\{', re.MULTILINE)
+        functions = list(func_re.finditer(content))
+
+        for i, m in enumerate(functions):
+            func_name = m.group(1)
+            start = m.start()
+            # Find matching closing brace (approximate: next func or EOF)
+            end = functions[i + 1].start() if i + 1 < len(functions) else len(content)
+            block = content[start:end]
+
+            writes = write_ops_re.findall(block)
+            has_tx = bool(tx_re.search(block))
+            has_cache = bool(cache_re.search(block))
+
+            if len(writes) >= 2 and not has_tx:
+                result["risks"].append({
+                    "function": func_name,
+                    "type": "missing_transaction",
+                    "write_count": len(writes),
+                    "message": f"Function '{func_name}' has {len(writes)} DB write operations without tx.Begin()/tx.Commit()",
+                    "severity": "high",
+                })
+
+            if has_tx and has_cache:
+                result["risks"].append({
+                    "function": func_name,
+                    "type": "cache_in_transaction",
+                    "message": f"Function '{func_name}' has cache operations inside a DB transaction -- risk of inconsistency on rollback",
+                    "severity": "medium",
+                })
+
+        if not result["risks"]:
+            result["suggestions"].append("No transaction risks detected")
+
+        return result
+
+    # -----------------------------------------------------------------
+    # get_domain_rules
+    # -----------------------------------------------------------------
+    def get_domain_rules(self, file_path: str) -> Dict[str, Any]:
+        """Return Go domain-layer rules for the given file."""
+        base = self.base_path
+        full_path = os.path.join(base, file_path) if not os.path.isabs(file_path) else file_path
+        result: Dict[str, Any] = {
+            "status": "success",
+            "file": file_path,
+            "file_type": "unknown",
+            "violations": [],
+            "rules_checked": [],
+        }
+        if not os.path.isfile(full_path):
+            result["status"] = "error"
+            result["error"] = f"File not found: {file_path}"
+            return result
+
+        try:
+            with open(full_path, 'r', encoding='utf-8', errors='replace') as f:
+                content = f.read()
+        except Exception as e:
+            result["status"] = "error"
+            result["error"] = str(e)
+            return result
+
+        lower_path = file_path.lower()
+        if '/handler' in lower_path or '/controller' in lower_path:
+            ftype = "handler"
+        elif '/service' in lower_path:
+            ftype = "service"
+        elif '/model' in lower_path:
+            ftype = "model"
+        elif '/middleware' in lower_path:
+            ftype = "middleware"
+        else:
+            ftype = "other"
+        result["file_type"] = ftype
+
+        if ftype == "handler":
+            result["rules_checked"].append("Handlers must check errors from service calls")
+            # Find function calls that return error but error is ignored
+            func_re = re.compile(r'func\s+(?:\(\s*\w+\s+\*?\w+\s*\)\s+)?(\w+)\s*\([^)]*\)[^{]*\{', re.MULTILINE)
+            functions = list(func_re.finditer(content))
+            for i, m in enumerate(functions):
+                fname = m.group(1)
+                start = m.start()
+                end = functions[i + 1].start() if i + 1 < len(functions) else len(content)
+                block = content[start:end]
+                # Detect calls that assign to _ for error
+                ignored_errs = re.findall(r'_\s*(?:,\s*_)?\s*(?::)?=\s*\w+\.\w+\s*\(', block)
+                if ignored_errs:
+                    result["violations"].append({
+                        "rule": "ignored_error",
+                        "message": f"Handler '{fname}' ignores {len(ignored_errs)} error return value(s)",
+                        "severity": "high",
+                    })
+                # Check for missing error handling after service calls
+                service_calls = re.findall(r'(\w+),\s*err\s*(?::)?=\s*\w+\.\w+\s*\(', block)
+                err_checks = len(re.findall(r'if\s+err\s*!=\s*nil', block))
+                if len(service_calls) > err_checks:
+                    result["violations"].append({
+                        "rule": "missing_error_check",
+                        "message": f"Handler '{fname}' has {len(service_calls)} error-returning calls but only {err_checks} error checks",
+                        "severity": "high",
+                    })
+
+        elif ftype == "service":
+            result["rules_checked"].append("Services must not write HTTP responses directly")
+            http_writes = re.findall(r'(?:c\.JSON|c\.String|c\.HTML|w\.Write|w\.WriteHeader|http\.Error|ctx\.JSON|ctx\.String)', content)
+            if http_writes:
+                result["violations"].append({
+                    "rule": "http_response_in_service",
+                    "message": f"Service layer writes HTTP responses directly ({len(http_writes)} occurrence(s)) -- violates separation of concerns",
+                    "severity": "high",
+                })
+
+        elif ftype == "model":
+            result["rules_checked"].append("Models must have validation tags")
+            struct_re = re.compile(r'type\s+\w+\s+struct\s*\{(.*?)\}', re.DOTALL)
+            for sm in struct_re.finditer(content):
+                body = sm.group(1)
+                field_count = len([l for l in body.strip().split('\n') if l.strip() and not l.strip().startswith('//')])
+                validate_count = len(re.findall(r'validate:"', body))
+                if field_count > 2 and validate_count == 0:
+                    result["violations"].append({
+                        "rule": "missing_validation_tags",
+                        "message": f"Struct has {field_count} fields but no validate tags",
+                        "severity": "medium",
+                    })
+
+        elif ftype == "middleware":
+            result["rules_checked"].append("Middleware must call next handler")
+            func_re = re.compile(r'func\s+(?:\(\s*\w+\s+\*?\w+\s*\)\s+)?(\w+)\s*\([^)]*\)[^{]*\{', re.MULTILINE)
+            functions = list(func_re.finditer(content))
+            for i, m in enumerate(functions):
+                fname = m.group(1)
+                start = m.start()
+                end = functions[i + 1].start() if i + 1 < len(functions) else len(content)
+                block = content[start:end]
+                if re.search(r'http\.Handler|gin\.HandlerFunc|echo\.MiddlewareFunc|func\s*\(\s*next', block):
+                    if not re.search(r'(?:next\s*\(|next\.ServeHTTP|c\.Next\(\)|next\(c\))', block):
+                        result["violations"].append({
+                            "rule": "missing_next_call",
+                            "message": f"Middleware '{fname}' does not call next handler",
+                            "severity": "high",
+                        })
+
+        return result
+
+    # -----------------------------------------------------------------
+    # generate_test_skeleton
+    # -----------------------------------------------------------------
+    def generate_test_skeleton(self, file_path: str, symbol: str) -> Dict[str, Any]:
+        """Generate a Go table-driven test skeleton."""
+        base = self.base_path
+        full_path = os.path.join(base, file_path) if not os.path.isabs(file_path) else file_path
+        result: Dict[str, Any] = {
+            "status": "success",
+            "file": file_path,
+            "symbol": symbol,
+            "test_skeleton": "",
+            "test_file_path": "",
+            "framework": "go_testing",
+        }
+        if not os.path.isfile(full_path):
+            result["status"] = "error"
+            result["error"] = f"File not found: {file_path}"
+            return result
+
+        try:
+            with open(full_path, 'r', encoding='utf-8', errors='replace') as f:
+                content = f.read()
+        except Exception as e:
+            result["status"] = "error"
+            result["error"] = str(e)
+            return result
+
+        # Detect package name
+        pkg_match = re.search(r'package\s+(\w+)', content)
+        package = pkg_match.group(1) if pkg_match else "main"
+
+        # Detect test file path
+        test_path = file_path.replace('.go', '_test.go')
+        result["test_file_path"] = test_path
+
+        # Find the target function/method signature
+        func_re = re.compile(
+            rf'func\s+(?:\(\s*(\w+)\s+\*?(\w+)\s*\)\s+)?{re.escape(symbol)}\s*\(([^)]*)\)\s*(?:\(([^)]*)\)|(\w+))?',
+            re.MULTILINE
+        )
+        fm = func_re.search(content)
+
+        receiver_var = ""
+        receiver_type = ""
+        params = ""
+        returns = ""
+        if fm:
+            receiver_var = fm.group(1) or ""
+            receiver_type = fm.group(2) or ""
+            params = fm.group(3) or ""
+            returns = fm.group(4) or fm.group(5) or ""
+
+        # Detect interfaces used (for mock setup hints)
+        interfaces = re.findall(r'(\w+)\s+(\w+Interface|\w+Repository|\w+Service|\w+Store)', content)
+
+        mock_setup = ""
+        if interfaces:
+            mock_setup = "\n".join(f"\t\t// TODO: mock {itype} {iname}" for iname, itype in interfaces[:5])
+            mock_setup = f"\n\t// Mock setup\n{mock_setup}\n"
+
+        setup_receiver = ""
+        if receiver_type:
+            setup_receiver = f"\n\t// Create instance\n\t{receiver_var or 's'} := &{receiver_type}{{}}\n"
+
+        skeleton = f"""package {package}
+
+import (
+\t"testing"
+)
+
+func Test{symbol}(t *testing.T) {{
+\ttests := []struct {{
+\t\tname    string
+\t\t// TODO: add input fields
+\t\t// TODO: add expected output fields
+\t\twantErr bool
+\t}}{{
+\t\t{{
+\t\t\tname:    "success case",
+\t\t\twantErr: false,
+\t\t}},
+\t\t{{
+\t\t\tname:    "error case",
+\t\t\twantErr: true,
+\t\t}},
+\t}}
+{setup_receiver}{mock_setup}
+\tfor _, tt := range tests {{
+\t\tt.Run(tt.name, func(t *testing.T) {{
+\t\t\t// Arrange
+\t\t\t// TODO: set up test data
+
+\t\t\t// Act
+\t\t\t// TODO: call {symbol}
+
+\t\t\t// Assert
+\t\t\tif tt.wantErr {{
+\t\t\t\t// TODO: assert error
+\t\t\t}} else {{
+\t\t\t\t// TODO: assert success
+\t\t\t}}
+\t\t}})
+\t}}
+}}
+"""
+        result["test_skeleton"] = skeleton
+        return result
+
+    # -----------------------------------------------------------------
+    # match_view_guards
+    # -----------------------------------------------------------------
+    def match_view_guards(self, file_path: str, symbol: str) -> Dict[str, Any]:
+        """Match Go middleware auth checks to template conditions."""
+        base = self.base_path
+        full_path = os.path.join(base, file_path) if not os.path.isabs(file_path) else file_path
+        result: Dict[str, Any] = {
+            "status": "success",
+            "file": file_path,
+            "symbol": symbol,
+            "backend_guards": [],
+            "view_guards": [],
+            "mismatches": [],
+        }
+        if not os.path.isfile(full_path):
+            result["status"] = "error"
+            result["error"] = f"File not found: {file_path}"
+            return result
+
+        try:
+            with open(full_path, 'r', encoding='utf-8', errors='replace') as f:
+                content = f.read()
+        except Exception as e:
+            result["status"] = "error"
+            result["error"] = str(e)
+            return result
+
+        # Extract auth middleware checks
+        auth_re = re.compile(r'(?:IsAuthenticated|RequireAuth|AuthRequired|RequireRole|CheckPermission|IsAdmin|RequireLogin)\s*(?:\(\s*["\']?(\w+)?["\']?\s*\))?')
+        role_check_re = re.compile(r'(?:user\.Role\s*==\s*["\'](\w+)["\']|claims\.\w+\s*==\s*["\'](\w+)["\']|HasRole\s*\(\s*["\'](\w+)["\'])')
+        ctx_auth_re = re.compile(r'ctx\.(?:Get|Value)\s*\(\s*["\'](?:user|role|auth|isAdmin)["\']\s*\)')
+
+        roles_backend: set = set()
+        for m in auth_re.finditer(content):
+            guard_name = m.group(0).split('(')[0].strip()
+            role = m.group(1)
+            result["backend_guards"].append({"type": "middleware", "guard": guard_name, "role": role})
+            if role:
+                roles_backend.add(role)
+        for m in role_check_re.finditer(content):
+            role = m.group(1) or m.group(2) or m.group(3)
+            if role:
+                roles_backend.add(role)
+                result["backend_guards"].append({"type": "role_check", "role": role})
+        for m in ctx_auth_re.finditer(content):
+            result["backend_guards"].append({"type": "context_auth", "expression": m.group(0)})
+
+        # Scan Go templates
+        template_dirs = [
+            os.path.join(base, "templates"),
+            os.path.join(base, "web", "templates"),
+            os.path.join(base, "internal", "templates"),
+            os.path.join(base, "views"),
+        ]
+        roles_frontend: set = set()
+        for tdir in template_dirs:
+            if not os.path.isdir(tdir):
+                continue
+            for dirpath, _, filenames in os.walk(tdir):
+                for fn in filenames:
+                    if not fn.endswith(('.html', '.tmpl', '.gohtml')):
+                        continue
+                    tpath = os.path.join(dirpath, fn)
+                    try:
+                        with open(tpath, 'r', encoding='utf-8', errors='replace') as f:
+                            tcontent = f.read()
+                    except Exception:
+                        continue
+                    rel_path = os.path.relpath(tpath, base)
+                    # Go template conditions: {{if .IsAdmin}}, {{if eq .Role "admin"}}
+                    tmpl_guards = re.findall(r'\{\{-?\s*if\s+(?:eq\s+)?\.(\w+)\s*(?:["\'](\w+)["\'])?\s*-?\}\}', tcontent)
+                    for field, val in tmpl_guards:
+                        result["view_guards"].append({"file": rel_path, "field": field, "value": val or "truthy"})
+                        if val:
+                            roles_frontend.add(val)
+                        else:
+                            roles_frontend.add(field)
+
+        backend_only = roles_backend - roles_frontend
+        frontend_only = roles_frontend - roles_backend
+        for role in backend_only:
+            result["mismatches"].append({"role": role, "issue": "Backend auth check has no matching template condition"})
+        for role in frontend_only:
+            result["mismatches"].append({"role": role, "issue": "Template condition has no matching backend auth check"})
+
+        return result

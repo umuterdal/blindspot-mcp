@@ -2090,3 +2090,551 @@ class AspNetIntelligenceService(BaseService):
         result["files_affected"] = len(result["references"])
 
         return {"status": "ok", **result}
+
+    # ── verify_schema ─────────────────────────────────────────────────
+    def verify_schema(self, entity_or_model: str, fields: list) -> Dict[str, Any]:
+        """Check EF Core entity [Column] attributes, Fluent API HasColumn, and migrations."""
+        base = self._project_path()
+        if not base:
+            return {"status": "error", "message": "No project path configured"}
+
+        result: Dict[str, Any] = {
+            "entity": entity_or_model,
+            "requested_fields": fields,
+            "column_attributes": [],
+            "fluent_api_mappings": [],
+            "migration_columns": [],
+            "missing_fields": [],
+            "warnings": [],
+        }
+
+        found_fields: Set[str] = set()
+
+        # Scan .cs files for [Column] attributes and property declarations
+        for root, _, files in os.walk(base):
+            for fname in files:
+                if not fname.endswith(".cs"):
+                    continue
+                fpath = os.path.join(root, fname)
+                try:
+                    with open(fpath, "r", encoding="utf-8", errors="replace") as f:
+                        content = f.read()
+                except Exception:
+                    continue
+
+                if entity_or_model not in content:
+                    continue
+
+                rel = os.path.relpath(fpath, base)
+
+                # [Column("col_name")] attribute mappings
+                col_attr_re = re.compile(
+                    r'\[Column\(\s*"([^"]+)"\s*\)\]\s*\n\s*public\s+\S+\s+(\w+)',
+                    re.MULTILINE,
+                )
+                for m in col_attr_re.finditer(content):
+                    col_name, prop_name = m.group(1), m.group(2)
+                    result["column_attributes"].append({
+                        "file": rel, "property": prop_name, "column": col_name,
+                    })
+                    found_fields.add(prop_name)
+
+                # Fluent API HasColumnName / HasColumn
+                fluent_re = re.compile(
+                    r'\.Property\s*\(\s*\w+\s*=>\s*\w+\.(\w+)\s*\)'
+                    r'.*?\.Has(?:Column|ColumnName)\s*\(\s*"([^"]+)"\s*\)',
+                    re.DOTALL,
+                )
+                for m in fluent_re.finditer(content):
+                    prop_name, col_name = m.group(1), m.group(2)
+                    result["fluent_api_mappings"].append({
+                        "file": rel, "property": prop_name, "column": col_name,
+                    })
+                    found_fields.add(prop_name)
+
+                # Simple public property declarations on the entity class
+                prop_re = re.compile(
+                    r'public\s+\S+\s+(\w+)\s*\{\s*get\s*;',
+                )
+                for m in prop_re.finditer(content):
+                    found_fields.add(m.group(1))
+
+        # Scan migrations for column definitions
+        mig_dir = os.path.join(base, "Migrations")
+        if os.path.isdir(mig_dir):
+            for root, _, files in os.walk(mig_dir):
+                for fname in sorted(files):
+                    if not fname.endswith(".cs"):
+                        continue
+                    fpath = os.path.join(root, fname)
+                    try:
+                        with open(fpath, "r", encoding="utf-8", errors="replace") as f:
+                            mig_content = f.read()
+                    except Exception:
+                        continue
+                    # .AddColumn<Type>(name: "ColName"
+                    add_col_re = re.compile(r'\.AddColumn\s*<[^>]+>\s*\(\s*name:\s*"(\w+)"')
+                    for m in add_col_re.finditer(mig_content):
+                        col = m.group(1)
+                        result["migration_columns"].append({
+                            "file": os.path.relpath(fpath, base), "column": col,
+                        })
+                        found_fields.add(col)
+                    # table.Column<Type>(name: "ColName"
+                    tbl_col_re = re.compile(r'table\.Column\s*<[^>]+>\s*\(\s*name:\s*"(\w+)"')
+                    for m in tbl_col_re.finditer(mig_content):
+                        col = m.group(1)
+                        result["migration_columns"].append({
+                            "file": os.path.relpath(fpath, base), "column": col,
+                        })
+                        found_fields.add(col)
+
+        lower_found = {f.lower() for f in found_fields}
+        for field in fields:
+            if field.lower() not in lower_found:
+                result["missing_fields"].append(field)
+
+        if result["missing_fields"]:
+            result["warnings"].append(
+                f"Fields not found in entity or migrations: {', '.join(result['missing_fields'])}"
+            )
+
+        return {"status": "ok", **result}
+
+    # ── detect_transaction_risks ──────────────────────────────────────
+    def detect_transaction_risks(self, file_path: str) -> Dict[str, Any]:
+        """Detect missing transaction scopes and risky SaveChanges patterns."""
+        base = self._project_path()
+        if not base:
+            return {"status": "error", "message": "No project path configured"}
+
+        full_path = os.path.join(base, file_path)
+        if not os.path.isfile(full_path):
+            return {"status": "error", "message": f"File not found: {file_path}"}
+
+        try:
+            with open(full_path, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read()
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+
+        result: Dict[str, Any] = {
+            "file": file_path,
+            "risks": [],
+            "warnings": [],
+            "save_changes_count": 0,
+            "has_transaction_scope": False,
+            "has_begin_transaction": False,
+        }
+
+        lines = content.split("\n")
+
+        # Count SaveChanges calls
+        save_changes_re = re.compile(r'\.SaveChanges(?:Async)?\s*\(')
+        save_locs = [(i + 1, ln.strip()) for i, ln in enumerate(lines) if save_changes_re.search(ln)]
+        result["save_changes_count"] = len(save_locs)
+
+        # Check for transaction patterns
+        result["has_transaction_scope"] = bool(re.search(r'TransactionScope', content))
+        result["has_begin_transaction"] = bool(re.search(r'\.BeginTransaction(?:Async)?\s*\(', content))
+
+        # Multiple SaveChanges without transaction
+        if len(save_locs) > 1 and not result["has_transaction_scope"] and not result["has_begin_transaction"]:
+            result["risks"].append({
+                "type": "multiple_saves_no_transaction",
+                "severity": "error",
+                "message": f"Found {len(save_locs)} SaveChanges calls without TransactionScope or BeginTransaction",
+                "locations": [{"line": loc[0], "code": loc[1]} for loc in save_locs[:5]],
+            })
+
+        # Cache operations inside transaction
+        cache_in_txn = re.compile(
+            r'(TransactionScope|BeginTransaction).*?(IMemoryCache|IDistributedCache|\.Set\s*\(|\.Remove\s*\()',
+            re.DOTALL,
+        )
+        if cache_in_txn.search(content):
+            result["risks"].append({
+                "type": "cache_inside_transaction",
+                "severity": "warning",
+                "message": "Cache operation detected inside transaction scope -- cache may become inconsistent on rollback",
+            })
+
+        # Missing SaveChanges entirely when DbContext is used
+        if re.search(r'\.Add\s*\(|\.Update\s*\(|\.Remove\s*\(', content) and not save_locs:
+            result["risks"].append({
+                "type": "missing_save_changes",
+                "severity": "error",
+                "message": "Entity modification detected (Add/Update/Remove) but no SaveChanges call found",
+            })
+
+        # Async void with SaveChanges
+        async_void_re = re.compile(r'async\s+void\s+\w+.*?SaveChanges', re.DOTALL)
+        if async_void_re.search(content):
+            result["risks"].append({
+                "type": "async_void_save",
+                "severity": "error",
+                "message": "SaveChanges inside async void method -- exceptions will be unhandled",
+            })
+
+        if not result["risks"]:
+            result["warnings"].append("No transaction risks detected")
+
+        return {"status": "ok", **result}
+
+    # ── get_domain_rules ──────────────────────────────────────────────
+    def get_domain_rules(self, file_path: str) -> Dict[str, Any]:
+        """Check ASP.NET domain rules for controllers, services, DbContext usage, config."""
+        base = self._project_path()
+        if not base:
+            return {"status": "error", "message": "No project path configured"}
+
+        full_path = os.path.join(base, file_path)
+        if not os.path.isfile(full_path):
+            return {"status": "error", "message": f"File not found: {file_path}"}
+
+        try:
+            with open(full_path, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read()
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+
+        result: Dict[str, Any] = {
+            "file": file_path,
+            "violations": [],
+            "suggestions": [],
+            "file_type": "unknown",
+        }
+
+        rel_lower = file_path.lower().replace("\\", "/")
+
+        # Detect file type
+        is_controller = bool(re.search(r':\s*(Controller|ControllerBase)\b', content)) or "controller" in rel_lower
+        is_service = "service" in rel_lower and not is_controller
+        is_dbcontext = bool(re.search(r':\s*DbContext\b', content))
+        is_config = "startup" in rel_lower or "program" in rel_lower or "appsettings" in rel_lower
+
+        if is_controller:
+            result["file_type"] = "controller"
+            # Controllers should have [Authorize]
+            has_authorize = bool(re.search(r'\[Authorize', content))
+            has_allow_anon = bool(re.search(r'\[AllowAnonymous\]', content))
+            if not has_authorize and not has_allow_anon:
+                result["violations"].append({
+                    "rule": "controller_requires_authorize",
+                    "severity": "warning",
+                    "message": "Controller lacks [Authorize] attribute -- add [Authorize] or explicit [AllowAnonymous]",
+                })
+
+            # Controllers should not directly use DbContext
+            if re.search(r'DbContext\b', content) and not re.search(r':\s*DbContext', content):
+                result["violations"].append({
+                    "rule": "no_direct_dbcontext_in_controller",
+                    "severity": "error",
+                    "message": "Direct DbContext usage in controller -- use a service/repository layer instead",
+                })
+
+        if is_service:
+            result["file_type"] = "service"
+            # Services should implement an interface
+            class_match = re.search(r'class\s+(\w+)\s*(?::\s*(\w+))?', content)
+            if class_match:
+                class_name = class_match.group(1)
+                parent = class_match.group(2)
+                if not parent or not parent.startswith("I"):
+                    result["violations"].append({
+                        "rule": "service_requires_interface",
+                        "severity": "warning",
+                        "message": f"Service '{class_name}' does not implement an interface -- create I{class_name} for DI",
+                    })
+
+        if is_dbcontext:
+            result["file_type"] = "dbcontext"
+            result["suggestions"].append(
+                "DbContext detected -- ensure it is registered with proper lifetime (Scoped recommended)"
+            )
+
+        if is_config:
+            result["file_type"] = "config"
+            # Check for IOptions pattern
+            if re.search(r'Configuration\[', content) or re.search(r'GetValue\s*<', content):
+                if not re.search(r'IOptions|IOptionsMonitor|IOptionsSnapshot', content):
+                    result["violations"].append({
+                        "rule": "use_ioptions_pattern",
+                        "severity": "warning",
+                        "message": "Direct Configuration access detected -- use IOptions<T> pattern for strongly-typed settings",
+                    })
+
+        return {"status": "ok", **result}
+
+    # ── generate_test_skeleton ────────────────────────────────────────
+    def generate_test_skeleton(self, file_path: str, symbol: str) -> Dict[str, Any]:
+        """Generate xUnit test skeleton with Moq and WebApplicationFactory."""
+        base = self._project_path()
+        if not base:
+            return {"status": "error", "message": "No project path configured"}
+
+        full_path = os.path.join(base, file_path)
+        if not os.path.isfile(full_path):
+            return {"status": "error", "message": f"File not found: {file_path}"}
+
+        try:
+            with open(full_path, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read()
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+
+        result: Dict[str, Any] = {
+            "file": file_path,
+            "symbol": symbol,
+            "test_code": "",
+            "test_type": "unit",
+            "dependencies": [],
+        }
+
+        # Extract namespace
+        ns_match = re.search(r'namespace\s+([\w.]+)', content)
+        namespace = ns_match.group(1) if ns_match else "MyApp"
+
+        # Detect if it's a controller (integration test) or service (unit test)
+        is_controller = bool(re.search(r':\s*(Controller|ControllerBase)\b', content))
+
+        # Extract constructor dependencies
+        ctor_re = re.compile(
+            r'public\s+' + re.escape(symbol) + r'\s*\(([^)]*)\)', re.DOTALL
+        )
+        ctor_match = ctor_re.search(content)
+        deps: List[Dict[str, str]] = []
+        if ctor_match:
+            params = ctor_match.group(1).strip()
+            if params:
+                for param in params.split(","):
+                    param = param.strip()
+                    parts = param.rsplit(None, 1)
+                    if len(parts) == 2:
+                        dep_type, dep_name = parts
+                        deps.append({"type": dep_type.strip(), "name": dep_name.strip()})
+                        result["dependencies"].append(dep_type.strip())
+
+        # Extract method signatures for the symbol class
+        method_re = re.compile(
+            r'public\s+(?:async\s+)?(?:Task\s*<\s*)?(\w+)(?:\s*>)?\s+(\w+)\s*\([^)]*\)',
+        )
+        methods = [(m.group(1), m.group(2)) for m in method_re.finditer(content)]
+
+        if is_controller:
+            result["test_type"] = "integration"
+            mock_setup = ""
+            for d in deps:
+                mock_setup += f"    private readonly Mock<{d['type']}> _{d['name']}Mock = new();\n"
+
+            test_methods = ""
+            for ret_type, method_name in methods:
+                if method_name == symbol:
+                    continue
+                test_methods += f"""
+    [Fact]
+    public async Task {method_name}_ShouldReturnExpectedResult()
+    {{
+        // Arrange
+        await using var application = new WebApplicationFactory<Program>();
+        using var client = application.CreateClient();
+
+        // Act
+        var response = await client.GetAsync("/{symbol.replace('Controller', '').lower()}/{method_name.lower()}");
+
+        // Assert
+        response.EnsureSuccessStatusCode();
+    }}
+"""
+            result["test_code"] = f"""using Xunit;
+using Moq;
+using Microsoft.AspNetCore.Mvc.Testing;
+using {namespace};
+
+namespace {namespace}.Tests;
+
+public class {symbol}Tests : IClassFixture<WebApplicationFactory<Program>>
+{{
+    private readonly WebApplicationFactory<Program> _factory;
+{mock_setup}
+    public {symbol}Tests(WebApplicationFactory<Program> factory)
+    {{
+        _factory = factory;
+    }}
+{test_methods}}}
+"""
+        else:
+            result["test_type"] = "unit"
+            mock_fields = ""
+            mock_setup = ""
+            ctor_args = ""
+            for d in deps:
+                var_name = "_" + d["name"][0].lower() + d["name"][1:] + "Mock"
+                mock_fields += f"    private readonly Mock<{d['type']}> {var_name} = new();\n"
+                ctor_args += f"{var_name}.Object, "
+
+            if ctor_args:
+                ctor_args = ctor_args.rstrip(", ")
+
+            test_methods = ""
+            for ret_type, method_name in methods:
+                if method_name == symbol:
+                    continue
+                test_methods += f"""
+    [Fact]
+    public void {method_name}_ShouldReturnExpectedResult()
+    {{
+        // Arrange
+        var sut = new {symbol}({ctor_args});
+
+        // Act
+        var result = sut.{method_name}();
+
+        // Assert
+        Assert.NotNull(result);
+    }}
+
+    [Theory]
+    [InlineData(1)]
+    [InlineData(2)]
+    public void {method_name}_WithParameters_ShouldWork(int id)
+    {{
+        // Arrange
+        var sut = new {symbol}({ctor_args});
+
+        // Act & Assert
+        Assert.NotNull(sut);
+    }}
+"""
+            result["test_code"] = f"""using Xunit;
+using Moq;
+using {namespace};
+
+namespace {namespace}.Tests;
+
+public class {symbol}Tests
+{{
+{mock_fields}
+{test_methods}}}
+"""
+
+        return {"status": "ok", **result}
+
+    # ── match_view_guards ─────────────────────────────────────────────
+    def match_view_guards(self, file_path: str, symbol: str) -> Dict[str, Any]:
+        """Match [Authorize] policies with Razor @if(User.IsInRole()) conditions."""
+        base = self._project_path()
+        if not base:
+            return {"status": "error", "message": "No project path configured"}
+
+        full_path = os.path.join(base, file_path)
+        if not os.path.isfile(full_path):
+            return {"status": "error", "message": f"File not found: {file_path}"}
+
+        try:
+            with open(full_path, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read()
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+
+        result: Dict[str, Any] = {
+            "file": file_path,
+            "symbol": symbol,
+            "backend_guards": [],
+            "view_conditions": [],
+            "mismatches": [],
+            "warnings": [],
+        }
+
+        # Extract [Authorize] attributes and policies
+        auth_re = re.compile(
+            r'\[Authorize\s*(?:\(\s*(?:Policy\s*=\s*"([^"]+)"|Roles\s*=\s*"([^"]+)")?\s*\))?\s*\]'
+        )
+        for m in auth_re.finditer(content):
+            policy = m.group(1)
+            roles = m.group(2)
+            guard = {"type": "authorize"}
+            if policy:
+                guard["policy"] = policy
+            if roles:
+                guard["roles"] = [r.strip() for r in roles.split(",")]
+            result["backend_guards"].append(guard)
+
+        # Extract role/claim checks in code
+        role_check_re = re.compile(r'User\.IsInRole\s*\(\s*"([^"]+)"\s*\)')
+        for m in role_check_re.finditer(content):
+            result["backend_guards"].append({
+                "type": "role_check", "role": m.group(1),
+            })
+
+        claim_check_re = re.compile(r'User\.HasClaim\s*\(\s*"([^"]+)"')
+        for m in claim_check_re.finditer(content):
+            result["backend_guards"].append({
+                "type": "claim_check", "claim": m.group(1),
+            })
+
+        # Scan Razor views for matching conditions
+        backend_roles: Set[str] = set()
+        backend_policies: Set[str] = set()
+        for guard in result["backend_guards"]:
+            if "roles" in guard:
+                backend_roles.update(guard["roles"])
+            if "role" in guard:
+                backend_roles.add(guard["role"])
+            if "policy" in guard:
+                backend_policies.add(guard["policy"])
+
+        views_dir = os.path.join(base, "Views")
+        pages_dir = os.path.join(base, "Pages")
+        view_dirs = [d for d in [views_dir, pages_dir] if os.path.isdir(d)]
+
+        view_roles: Set[str] = set()
+        for vdir in view_dirs:
+            for root, _, files in os.walk(vdir):
+                for fname in files:
+                    if not fname.endswith((".cshtml", ".razor")):
+                        continue
+                    vpath = os.path.join(root, fname)
+                    try:
+                        with open(vpath, "r", encoding="utf-8", errors="replace") as f:
+                            vcontent = f.read()
+                    except Exception:
+                        continue
+
+                    rel_v = os.path.relpath(vpath, base)
+
+                    # @if (User.IsInRole("..."))
+                    view_role_re = re.compile(r'User\.IsInRole\s*\(\s*"([^"]+)"\s*\)')
+                    for m in view_role_re.finditer(vcontent):
+                        role = m.group(1)
+                        view_roles.add(role)
+                        result["view_conditions"].append({
+                            "file": rel_v, "type": "role_check", "role": role,
+                        })
+
+                    # @if (User.Identity.IsAuthenticated)
+                    if re.search(r'User\.Identity\.IsAuthenticated', vcontent):
+                        result["view_conditions"].append({
+                            "file": rel_v, "type": "auth_check",
+                        })
+
+        # Find mismatches
+        for role in backend_roles:
+            if role not in view_roles:
+                result["mismatches"].append({
+                    "type": "backend_role_no_view_guard",
+                    "role": role,
+                    "message": f"Backend requires role '{role}' but no matching view guard found",
+                })
+        for role in view_roles:
+            if role not in backend_roles:
+                result["mismatches"].append({
+                    "type": "view_guard_no_backend_role",
+                    "role": role,
+                    "message": f"View checks role '{role}' but no matching backend [Authorize] found",
+                })
+
+        if not result["backend_guards"]:
+            result["warnings"].append("No authorization attributes found on this symbol")
+
+        return {"status": "ok", **result}

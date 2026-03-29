@@ -3215,3 +3215,528 @@ class DjangoIntelligenceService(BaseService):
 
         result["total_references"] = len(references)
         return result
+
+    # ------------------------------------------------------------------ #
+    #  verify_schema / detect_transaction_risks / get_domain_rules /      #
+    #  generate_test_skeleton / match_view_guards                         #
+    # ------------------------------------------------------------------ #
+
+    def verify_schema(self, table_or_model: str, columns: list) -> Dict[str, Any]:
+        """
+        Verify that fields exist in Django model definitions (models.py).
+
+        Checks for CharField, IntegerField, ForeignKey, etc.
+        Returns missing columns.
+        """
+        base = self._get_project_path()
+        if not base:
+            return {"status": "error", "message": "Project path not set"}
+
+        found_fields: Set[str] = set()
+        source_files: List[str] = []
+
+        all_field_types = self.MODEL_FIELD_TYPES | self.RELATIONSHIP_FIELDS
+        field_type_pattern = "|".join(re.escape(ft) for ft in all_field_types)
+
+        # Build regex for model class and its field definitions
+        model_class_pattern = re.compile(
+            rf"class\s+{re.escape(table_or_model)}\s*\([^)]*\)\s*:(.*?)(?=\nclass\s|\Z)",
+            re.DOTALL,
+        )
+        field_pattern = re.compile(
+            rf"(\w+)\s*=\s*(?:models\.)?(?:{field_type_pattern})\s*\(",
+        )
+
+        # Search all models.py files
+        for root, _dirs, files in os.walk(base):
+            # Skip hidden dirs, venv, migrations
+            rel_root = os.path.relpath(root, base)
+            if any(part.startswith(".") or part in ("venv", "env", ".venv", "node_modules", "__pycache__")
+                   for part in rel_root.split(os.sep)):
+                continue
+
+            for fname in files:
+                if fname != "models.py":
+                    continue
+                fpath = os.path.join(root, fname)
+                try:
+                    with open(fpath, "r", encoding="utf-8", errors="replace") as f:
+                        content = f.read()
+                except Exception:
+                    continue
+
+                for mm in model_class_pattern.finditer(content):
+                    model_body = mm.group(1)
+                    for fm in field_pattern.finditer(model_body):
+                        found_fields.add(fm.group(1))
+                    source_files.append(os.path.relpath(fpath, base))
+
+        # Also add implicit fields
+        if found_fields:
+            found_fields.add("id")  # Django auto PK
+            found_fields.add("pk")
+
+        found = [c for c in columns if c in found_fields]
+        missing = [c for c in columns if c not in found_fields]
+
+        return {
+            "status": "ok",
+            "model": table_or_model,
+            "found": found,
+            "missing": missing,
+            "all_model_fields": sorted(found_fields),
+            "source_files": source_files,
+        }
+
+    def detect_transaction_risks(self, file_path: str) -> Dict[str, Any]:
+        """
+        Detect transaction / atomicity risks in a Django file.
+
+        Looks for multiple .save()/.create()/.delete() without
+        transaction.atomic(), and cache operations inside atomic blocks.
+        """
+        base = self._get_project_path()
+        if not base:
+            return {"status": "error", "message": "Project path not set"}
+
+        full_path = os.path.join(base, file_path)
+        if not os.path.isfile(full_path):
+            return {"status": "error", "message": f"File not found: {file_path}"}
+
+        try:
+            with open(full_path, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read()
+        except Exception as exc:
+            return {"status": "error", "message": str(exc)}
+
+        risks: List[Dict[str, Any]] = []
+
+        write_pattern = re.compile(
+            r"\.(save|create|bulk_create|update|bulk_update|delete|get_or_create|"
+            r"update_or_create)\s*\("
+        )
+        atomic_pattern = re.compile(
+            r"(transaction\.atomic\s*\(|@transaction\.atomic)"
+        )
+        cache_pattern = re.compile(
+            r"(cache\.(set|get|delete|clear|get_or_set)|django\.core\.cache)"
+        )
+
+        # Parse function/method blocks using indentation
+        func_pattern = re.compile(
+            r"^(\s*)def\s+(\w+)\s*\([^)]*\)\s*(?:->.*?)?:",
+            re.MULTILINE,
+        )
+
+        for fm in func_pattern.finditer(content):
+            indent = len(fm.group(1))
+            func_name = fm.group(2)
+            start = fm.end()
+
+            # Find the function body by indentation
+            lines = content[start:].split("\n")
+            body_lines = []
+            for line in lines[1:]:  # skip the def line itself
+                stripped = line.lstrip()
+                if stripped == "" or stripped.startswith("#"):
+                    body_lines.append(line)
+                    continue
+                current_indent = len(line) - len(stripped)
+                if current_indent > indent:
+                    body_lines.append(line)
+                else:
+                    break
+            func_body = "\n".join(body_lines)
+
+            write_calls = write_pattern.findall(func_body)
+            has_atomic = bool(atomic_pattern.search(func_body))
+
+            if len(write_calls) >= 2 and not has_atomic:
+                line_num = content[:fm.start()].count("\n") + 1
+                risks.append({
+                    "type": "missing_atomic",
+                    "function": func_name,
+                    "line": line_num,
+                    "write_count": len(write_calls),
+                    "message": f"Function '{func_name}' has {len(write_calls)} DB writes without "
+                               "transaction.atomic()",
+                    "severity": "high",
+                })
+
+            if has_atomic:
+                cache_calls = cache_pattern.findall(func_body)
+                if cache_calls:
+                    line_num = content[:fm.start()].count("\n") + 1
+                    risks.append({
+                        "type": "cache_in_atomic",
+                        "function": func_name,
+                        "line": line_num,
+                        "message": f"Cache operations inside transaction.atomic() in '{func_name}' – "
+                                   "cache may be set before transaction commits",
+                        "severity": "medium",
+                    })
+
+        return {
+            "status": "ok",
+            "file": file_path,
+            "risks": risks,
+            "risk_count": len(risks),
+        }
+
+    def get_domain_rules(self, file_path: str) -> Dict[str, Any]:
+        """
+        Return domain-aware anti-pattern rules based on file location / type.
+        """
+        base = self._get_project_path()
+        if not base:
+            return {"status": "error", "message": "Project path not set"}
+
+        rules: List[Dict[str, str]] = []
+        norm = file_path.replace("\\", "/").lower()
+
+        full_path = os.path.join(base, file_path)
+        content = ""
+        if os.path.isfile(full_path):
+            try:
+                with open(full_path, "r", encoding="utf-8", errors="replace") as f:
+                    content = f.read()
+            except Exception:
+                pass
+
+        # Views → require permission checks
+        if "views" in norm or "viewsets" in norm:
+            if content and not re.search(
+                r"permission_classes|login_required|@permission_required|"
+                r"LoginRequiredMixin|PermissionRequiredMixin|IsAuthenticated|"
+                r"@staff_member_required",
+                content,
+            ):
+                rules.append({
+                    "rule": "require_permissions",
+                    "message": "View should declare permission_classes or use permission decorators/mixins",
+                    "severity": "warning",
+                })
+            if "viewsets" in norm and content and not re.search(r"serializer_class\s*=", content):
+                rules.append({
+                    "rule": "require_serializer",
+                    "message": "ViewSet should declare serializer_class",
+                    "severity": "warning",
+                })
+
+        # Models → require __str__
+        if "models" in norm and norm.endswith(".py"):
+            if content:
+                # Find model classes without __str__
+                model_classes = re.findall(
+                    r"class\s+(\w+)\s*\(\s*(?:models\.Model|AbstractUser|AbstractBaseUser)[^)]*\)",
+                    content,
+                )
+                for mc in model_classes:
+                    # Check if __str__ is defined in that class
+                    class_body_match = re.search(
+                        rf"class\s+{re.escape(mc)}\s*\([^)]*\)\s*:(.*?)(?=\nclass\s|\Z)",
+                        content, re.DOTALL,
+                    )
+                    if class_body_match and "__str__" not in class_body_match.group(1):
+                        rules.append({
+                            "rule": "require_str_method",
+                            "message": f"Model '{mc}' should define __str__() for admin and debugging",
+                            "severity": "info",
+                        })
+                    if class_body_match and "class Meta" not in class_body_match.group(1):
+                        rules.append({
+                            "rule": "recommend_meta_class",
+                            "message": f"Model '{mc}' should define class Meta with ordering/verbose_name",
+                            "severity": "info",
+                        })
+
+        # Serializers → require validation
+        if "serializer" in norm and norm.endswith(".py"):
+            if content and not re.search(r"def validate|validators\s*=|validate_\w+", content):
+                rules.append({
+                    "rule": "require_validation",
+                    "message": "Serializer should include field validators or validate() method",
+                    "severity": "warning",
+                })
+
+        # URLs → require named routes
+        if "urls" in norm and norm.endswith(".py"):
+            # Check for path() calls without name=
+            unnamed_paths = re.findall(r"path\s*\([^)]*\)", content)
+            unnamed_count = sum(1 for p in unnamed_paths if "name=" not in p and "include(" not in p)
+            if unnamed_count > 0:
+                rules.append({
+                    "rule": "require_named_routes",
+                    "message": f"{unnamed_count} path() call(s) without name= parameter – "
+                               "named routes are needed for {% url %} and reverse()",
+                    "severity": "warning",
+                })
+
+        # Admin files
+        if "admin" in norm and norm.endswith(".py"):
+            if content and not re.search(r"list_display\s*=", content):
+                rules.append({
+                    "rule": "recommend_list_display",
+                    "message": "ModelAdmin should set list_display for better admin usability",
+                    "severity": "info",
+                })
+
+        return {
+            "status": "ok",
+            "file": file_path,
+            "rules": rules,
+            "rule_count": len(rules),
+        }
+
+    def generate_test_skeleton(self, file_path: str, symbol: str) -> Dict[str, Any]:
+        """
+        Generate a pytest / Django TestCase test skeleton for a given function or class method.
+        """
+        base = self._get_project_path()
+        if not base:
+            return {"status": "error", "message": "Project path not set"}
+
+        full_path = os.path.join(base, file_path)
+        if not os.path.isfile(full_path):
+            return {"status": "error", "message": f"File not found: {file_path}"}
+
+        try:
+            with open(full_path, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read()
+        except Exception as exc:
+            return {"status": "error", "message": str(exc)}
+
+        norm = file_path.replace("\\", "/").lower()
+
+        # Extract class name if symbol is a method
+        class_match = re.search(r"class\s+(\w+)", content)
+        class_name = class_match.group(1) if class_match else None
+
+        # Determine module import path from file_path
+        module_path = file_path.replace("/", ".").replace("\\", ".")
+        if module_path.endswith(".py"):
+            module_path = module_path[:-3]
+
+        if "views" in norm or "viewsets" in norm:
+            test_type = "view"
+            skeleton = (
+                f"import pytest\n"
+                f"from django.test import TestCase, Client\n"
+                f"from django.urls import reverse\n"
+                f"from django.contrib.auth import get_user_model\n\n"
+                f"User = get_user_model()\n\n\n"
+                f"class {class_name or 'View'}Test(TestCase):\n"
+                f"    def setUp(self):\n"
+                f"        self.client = Client()\n"
+                f"        self.user = User.objects.create_user(\n"
+                f"            username='testuser', password='testpass123'\n"
+                f"        )\n\n"
+                f"    def test_{symbol}_authenticated(self):\n"
+                f"        self.client.login(username='testuser', password='testpass123')\n"
+                f"        # TODO: replace with actual URL name\n"
+                f"        response = self.client.get(reverse('{symbol}'))\n"
+                f"        self.assertEqual(response.status_code, 200)\n\n"
+                f"    def test_{symbol}_unauthenticated(self):\n"
+                f"        # TODO: replace with actual URL name\n"
+                f"        response = self.client.get(reverse('{symbol}'))\n"
+                f"        self.assertEqual(response.status_code, 302)  # redirect to login\n"
+            )
+        elif "models" in norm:
+            test_type = "model"
+            skeleton = (
+                f"import pytest\n"
+                f"from django.test import TestCase\n"
+                f"from {module_path} import {class_name or symbol}\n\n\n"
+                f"class {class_name or symbol}Test(TestCase):\n"
+                f"    def setUp(self):\n"
+                f"        self.instance = {class_name or symbol}.objects.create(\n"
+                f"            # TODO: provide required fields\n"
+                f"        )\n\n"
+                f"    def test_{symbol}(self):\n"
+                f"        result = self.instance.{symbol}()\n"
+                f"        self.assertIsNotNone(result)\n\n"
+                f"    def test_str_representation(self):\n"
+                f"        self.assertIsInstance(str(self.instance), str)\n"
+            )
+        elif "serializer" in norm:
+            test_type = "serializer"
+            skeleton = (
+                f"import pytest\n"
+                f"from django.test import TestCase\n"
+                f"from {module_path} import {class_name or symbol}\n\n\n"
+                f"class {class_name or symbol}Test(TestCase):\n"
+                f"    def test_{symbol}_valid_data(self):\n"
+                f"        data = {{\n"
+                f"            # TODO: provide valid data\n"
+                f"        }}\n"
+                f"        serializer = {class_name or symbol}(data=data)\n"
+                f"        self.assertTrue(serializer.is_valid(), serializer.errors)\n\n"
+                f"    def test_{symbol}_invalid_data(self):\n"
+                f"        data = {{}}  # empty data\n"
+                f"        serializer = {class_name or symbol}(data=data)\n"
+                f"        self.assertFalse(serializer.is_valid())\n"
+            )
+        else:
+            test_type = "unit"
+            if class_name:
+                skeleton = (
+                    f"import pytest\n"
+                    f"from {module_path} import {class_name}\n\n\n"
+                    f"class {class_name}Test:\n"
+                    f"    def setup_method(self):\n"
+                    f"        self.instance = {class_name}()\n\n"
+                    f"    def test_{symbol}(self):\n"
+                    f"        # Arrange\n"
+                    f"        # TODO: set up test data\n\n"
+                    f"        # Act\n"
+                    f"        result = self.instance.{symbol}()\n\n"
+                    f"        # Assert\n"
+                    f"        assert result is not None\n"
+                )
+            else:
+                skeleton = (
+                    f"import pytest\n"
+                    f"from {module_path} import {symbol}\n\n\n"
+                    f"def test_{symbol}():\n"
+                    f"    # Arrange\n"
+                    f"    # TODO: set up test data\n\n"
+                    f"    # Act\n"
+                    f"    result = {symbol}()\n\n"
+                    f"    # Assert\n"
+                    f"    assert result is not None\n\n\n"
+                    f"def test_{symbol}_edge_case():\n"
+                    f"    # TODO: test edge cases\n"
+                    f"    pass\n"
+                )
+
+        return {
+            "status": "ok",
+            "file": file_path,
+            "symbol": symbol,
+            "test_type": test_type,
+            "test_class": class_name,
+            "skeleton": skeleton,
+        }
+
+    def match_view_guards(self, file_path: str, symbol: str) -> Dict[str, Any]:
+        """
+        Cross-reference Django view permission checks with matching
+        {% if %} conditions in templates.
+        """
+        base = self._get_project_path()
+        if not base:
+            return {"status": "error", "message": "Project path not set"}
+
+        full_path = os.path.join(base, file_path)
+        if not os.path.isfile(full_path):
+            return {"status": "error", "message": f"File not found: {file_path}"}
+
+        try:
+            with open(full_path, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read()
+        except Exception as exc:
+            return {"status": "error", "message": str(exc)}
+
+        # Extract permission/guard conditions from views
+        guards: List[Dict[str, Any]] = []
+        guard_patterns = [
+            (r"@login_required", "login_required"),
+            (r"@permission_required\s*\(\s*['\"]([^'\"]+)['\"]", "permission_required"),
+            (r"@staff_member_required", "staff_required"),
+            (r"@user_passes_test\s*\(\s*(\w+)", "user_passes_test"),
+            (r"permission_classes\s*=\s*\[([^\]]+)\]", "permission_classes"),
+            (r"LoginRequiredMixin", "login_mixin"),
+            (r"PermissionRequiredMixin", "permission_mixin"),
+            (r"permission_required\s*=\s*['\"]([^'\"]+)['\"]", "permission_attr"),
+            (r"request\.user\.is_authenticated", "is_authenticated_check"),
+            (r"request\.user\.is_staff", "is_staff_check"),
+            (r"request\.user\.is_superuser", "is_superuser_check"),
+            (r"request\.user\.has_perm\s*\(\s*['\"]([^'\"]+)['\"]", "has_perm"),
+        ]
+
+        for pattern, guard_type in guard_patterns:
+            for m in re.finditer(pattern, content):
+                line_num = content[:m.start()].count("\n") + 1
+                guards.append({
+                    "type": guard_type,
+                    "condition": m.group(0),
+                    "value": m.group(1) if m.lastindex else None,
+                    "line": line_num,
+                })
+
+        # Search templates for matching {% if %} conditions
+        template_matches: List[Dict[str, Any]] = []
+        template_dirs = []
+        for candidate in ["templates", "*/templates"]:
+            import glob as glob_mod
+            for d in glob_mod.glob(os.path.join(base, candidate)):
+                if os.path.isdir(d):
+                    template_dirs.append(d)
+
+        template_patterns = [
+            (r"\{%\s*if\s+user\.is_authenticated\s*%\}", "template_auth_check"),
+            (r"\{%\s*if\s+user\.is_staff\s*%\}", "template_staff_check"),
+            (r"\{%\s*if\s+user\.is_superuser\s*%\}", "template_superuser_check"),
+            (r"\{%\s*if\s+perms\.(\w+\.\w+)\s*%\}", "template_perm_check"),
+            (r"\{%\s*if\s+user\.has_perm\s+['\"]([^'\"]+)['\"]\s*%\}", "template_has_perm"),
+            (r"\{%\s*if\s+not\s+user\.is_authenticated\s*%\}", "template_not_auth"),
+            (r"\{%\s*if\s+request\.user\.is_authenticated\s*%\}", "template_request_auth"),
+        ]
+
+        for tdir in template_dirs:
+            for root, _dirs, files in os.walk(tdir):
+                for fname in files:
+                    if not fname.endswith(".html"):
+                        continue
+                    tpath = os.path.join(root, fname)
+                    try:
+                        with open(tpath, "r", encoding="utf-8", errors="replace") as f:
+                            tcontent = f.read()
+                    except Exception:
+                        continue
+
+                    rel_template = os.path.relpath(tpath, base)
+                    for tp, ttype in template_patterns:
+                        for tm in re.finditer(tp, tcontent):
+                            tline = tcontent[:tm.start()].count("\n") + 1
+                            for guard in guards:
+                                is_match = False
+                                if guard["type"] in ("login_required", "login_mixin",
+                                                     "is_authenticated_check") and ttype in (
+                                    "template_auth_check", "template_request_auth"
+                                ):
+                                    is_match = True
+                                elif guard["type"] in ("staff_required", "is_staff_check") and \
+                                        ttype == "template_staff_check":
+                                    is_match = True
+                                elif guard["type"] == "is_superuser_check" and \
+                                        ttype == "template_superuser_check":
+                                    is_match = True
+                                elif guard["type"] in ("permission_required", "permission_attr",
+                                                       "has_perm") and ttype in (
+                                    "template_perm_check", "template_has_perm"
+                                ):
+                                    if guard.get("value") and tm.lastindex:
+                                        if guard["value"] == tm.group(1):
+                                            is_match = True
+                                    else:
+                                        is_match = True
+
+                                if is_match:
+                                    template_matches.append({
+                                        "template_file": rel_template,
+                                        "template_line": tline,
+                                        "template_type": ttype,
+                                        "template_condition": tm.group(0),
+                                        "backend_guard": guard,
+                                    })
+
+        return {
+            "status": "ok",
+            "file": file_path,
+            "symbol": symbol,
+            "backend_guards": guards,
+            "template_matches": template_matches,
+            "matched_count": len(template_matches),
+            "unmatched_guards": len(guards) - len({m["backend_guard"]["line"] for m in template_matches}),
+        }

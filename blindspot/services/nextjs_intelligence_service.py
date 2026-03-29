@@ -2915,3 +2915,463 @@ class NextjsIntelligenceService(BaseService):
             )
 
         return {"status": "ok", **result}
+
+    # ------------------------------------------------------------------ #
+    #  verify_schema / detect_transaction_risks / get_domain_rules /      #
+    #  generate_test_skeleton / match_view_guards                         #
+    # ------------------------------------------------------------------ #
+
+    def verify_schema(self, table_or_model: str, columns: list) -> Dict[str, Any]:
+        """
+        Verify that fields exist in the Prisma schema for a given model.
+
+        Checks prisma/schema.prisma for model field definitions.
+        Returns missing columns/fields.
+        """
+        base = self._get_project_path()
+        if not base:
+            return {"status": "error", "message": "Project path not set"}
+
+        # Try common prisma schema locations
+        schema_paths = [
+            os.path.join(base, "prisma", "schema.prisma"),
+            os.path.join(base, "schema.prisma"),
+        ]
+        schema_content = ""
+        schema_file = None
+        for sp in schema_paths:
+            if os.path.isfile(sp):
+                try:
+                    with open(sp, "r", encoding="utf-8", errors="replace") as f:
+                        schema_content = f.read()
+                    schema_file = sp
+                    break
+                except Exception:
+                    continue
+
+        if not schema_content:
+            return {"status": "ok", "model": table_or_model, "found": [], "missing": list(columns),
+                    "message": "Prisma schema not found – cannot verify"}
+
+        # Find the model block
+        model_pattern = re.compile(
+            rf"model\s+{re.escape(table_or_model)}\s*\{{([^}}]*)\}}",
+            re.DOTALL | re.IGNORECASE,
+        )
+        model_match = model_pattern.search(schema_content)
+        if not model_match:
+            return {"status": "ok", "model": table_or_model, "found": [], "missing": list(columns),
+                    "message": f"Model '{table_or_model}' not found in Prisma schema"}
+
+        model_body = model_match.group(1)
+        # Extract field names (first word on each non-empty, non-comment, non-@@ line)
+        field_names: Set[str] = set()
+        for line in model_body.split("\n"):
+            line = line.strip()
+            if not line or line.startswith("//") or line.startswith("@@"):
+                continue
+            field_match = re.match(r"(\w+)\s+", line)
+            if field_match:
+                field_names.add(field_match.group(1))
+
+        found = [c for c in columns if c in field_names]
+        missing = [c for c in columns if c not in field_names]
+
+        return {
+            "status": "ok",
+            "model": table_or_model,
+            "found": found,
+            "missing": missing,
+            "all_schema_fields": sorted(field_names),
+            "schema_file": os.path.relpath(schema_file, base) if schema_file else None,
+        }
+
+    def detect_transaction_risks(self, file_path: str) -> Dict[str, Any]:
+        """
+        Detect transaction / atomicity risks in a Next.js/Prisma file.
+
+        Looks for multiple prisma calls without prisma.$transaction(),
+        and side effects inside transactions.
+        """
+        base = self._get_project_path()
+        if not base:
+            return {"status": "error", "message": "Project path not set"}
+
+        full_path = os.path.join(base, file_path)
+        if not os.path.isfile(full_path):
+            return {"status": "error", "message": f"File not found: {file_path}"}
+
+        try:
+            with open(full_path, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read()
+        except Exception as exc:
+            return {"status": "error", "message": str(exc)}
+
+        risks: List[Dict[str, Any]] = []
+
+        prisma_write = re.compile(
+            r"prisma\.\w+\.(create|update|delete|upsert|createMany|updateMany|deleteMany)\s*\("
+        )
+        prisma_transaction = re.compile(r"prisma\.\$transaction\s*\(")
+        side_effect_pattern = re.compile(
+            r"(fetch\s*\(|axios\.|sendEmail|console\.log|res\.json|res\.send|"
+            r"cache\.|redis\.|fs\.|writeFile|sendNotification)"
+        )
+
+        # Parse function/handler blocks
+        func_pattern = re.compile(
+            r"(?:export\s+)?(?:async\s+)?function\s+(\w+)\s*\([^)]*\)\s*\{|"
+            r"(?:const|let|var)\s+(\w+)\s*=\s*(?:async\s+)?\([^)]*\)\s*(?:=>)\s*\{|"
+            r"(?:export\s+)?(?:async\s+)?(?:const|let|var)\s+(\w+)\s*=\s*(?:async\s+)?function\s*\([^)]*\)\s*\{"
+        )
+
+        for fm in func_pattern.finditer(content):
+            func_name = fm.group(1) or fm.group(2) or fm.group(3) or "anonymous"
+            start = fm.end()
+            brace_depth = 1
+            pos = start
+            while pos < len(content) and brace_depth > 0:
+                if content[pos] == "{":
+                    brace_depth += 1
+                elif content[pos] == "}":
+                    brace_depth -= 1
+                pos += 1
+            func_body = content[start:pos]
+
+            write_calls = prisma_write.findall(func_body)
+            has_transaction = bool(prisma_transaction.search(func_body))
+
+            if len(write_calls) >= 2 and not has_transaction:
+                line_num = content[:fm.start()].count("\n") + 1
+                risks.append({
+                    "type": "missing_transaction",
+                    "function": func_name,
+                    "line": line_num,
+                    "write_count": len(write_calls),
+                    "message": f"Function '{func_name}' has {len(write_calls)} Prisma writes without $transaction()",
+                    "severity": "high",
+                })
+
+            if has_transaction:
+                se_matches = side_effect_pattern.findall(func_body)
+                if se_matches:
+                    line_num = content[:fm.start()].count("\n") + 1
+                    risks.append({
+                        "type": "side_effect_in_transaction",
+                        "function": func_name,
+                        "line": line_num,
+                        "side_effects": list(set(se_matches)),
+                        "message": f"Side effects inside $transaction() in '{func_name}' – "
+                                   "these may execute even if transaction rolls back",
+                        "severity": "medium",
+                    })
+
+        return {
+            "status": "ok",
+            "file": file_path,
+            "risks": risks,
+            "risk_count": len(risks),
+        }
+
+    def get_domain_rules(self, file_path: str) -> Dict[str, Any]:
+        """
+        Return domain-aware anti-pattern rules based on file location / type.
+        """
+        base = self._get_project_path()
+        if not base:
+            return {"status": "error", "message": "Project path not set"}
+
+        rules: List[Dict[str, str]] = []
+        norm = file_path.replace("\\", "/").lower()
+
+        full_path = os.path.join(base, file_path)
+        content = ""
+        if os.path.isfile(full_path):
+            try:
+                with open(full_path, "r", encoding="utf-8", errors="replace") as f:
+                    content = f.read()
+            except Exception:
+                pass
+
+        # API routes → require error handling + auth check
+        is_api = "/api/" in norm or "route.ts" in norm or "route.js" in norm
+        if is_api:
+            if content and not re.search(r"try\s*\{|\.catch\s*\(", content):
+                rules.append({
+                    "rule": "require_error_handling",
+                    "message": "API route should have try/catch error handling",
+                    "severity": "high",
+                })
+            if content and not re.search(
+                r"getServerSession|getSession|auth\(|NextAuth|getToken|cookies\(\)|headers\(\)", content
+            ):
+                rules.append({
+                    "rule": "require_auth_check",
+                    "message": "API route should verify authentication/authorization",
+                    "severity": "warning",
+                })
+
+        # Components → no direct DB calls from client
+        is_component = bool(re.search(r"\.(tsx|jsx)$", norm)) and not is_api
+        if is_component and content and "'use client'" in content[:200]:
+            if re.search(r"prisma\.|DB\.|sql`", content):
+                rules.append({
+                    "rule": "no_db_in_client_component",
+                    "message": "Client component should not import or use database directly",
+                    "severity": "high",
+                })
+
+        # Store files → no side effects in reducers
+        if "store" in norm or "slice" in norm or "reducer" in norm:
+            if content and re.search(r"(fetch\s*\(|axios\.|localStorage|sessionStorage)", content):
+                rules.append({
+                    "rule": "no_side_effects_in_store",
+                    "message": "Store reducers should be pure – move side effects to thunks/middleware",
+                    "severity": "warning",
+                })
+
+        # Middleware → no heavy computation
+        if "middleware" in norm and (norm.endswith(".ts") or norm.endswith(".js")):
+            rules.append({
+                "rule": "middleware_performance",
+                "message": "Middleware runs on every matching request – avoid heavy DB queries or computation",
+                "severity": "info",
+            })
+            if content and re.search(r"prisma\.|mongoose\.|sql`", content):
+                rules.append({
+                    "rule": "no_db_in_middleware",
+                    "message": "Avoid database queries in middleware – use lightweight checks only",
+                    "severity": "warning",
+                })
+
+        # Layout files
+        if "layout" in norm and (norm.endswith(".tsx") or norm.endswith(".jsx")):
+            rules.append({
+                "rule": "layout_impact",
+                "message": "Layout changes affect all child routes – ensure changes are intentional",
+                "severity": "info",
+            })
+
+        return {
+            "status": "ok",
+            "file": file_path,
+            "rules": rules,
+            "rule_count": len(rules),
+        }
+
+    def generate_test_skeleton(self, file_path: str, symbol: str) -> Dict[str, Any]:
+        """
+        Generate a Jest/Vitest test skeleton for a given function or component.
+        """
+        base = self._get_project_path()
+        if not base:
+            return {"status": "error", "message": "Project path not set"}
+
+        full_path = os.path.join(base, file_path)
+        if not os.path.isfile(full_path):
+            return {"status": "error", "message": f"File not found: {file_path}"}
+
+        try:
+            with open(full_path, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read()
+        except Exception as exc:
+            return {"status": "error", "message": str(exc)}
+
+        norm = file_path.replace("\\", "/").lower()
+        rel_import = os.path.splitext(file_path)[0]
+
+        # Detect if it's a React component (PascalCase + JSX return)
+        is_component = bool(re.search(
+            rf"(?:export\s+(?:default\s+)?)?(?:function|const)\s+{re.escape(symbol)}\b.*?(?:return\s*\(?\s*<|\bJSX\b)",
+            content, re.DOTALL,
+        ))
+
+        # Detect if it's an API route handler
+        is_api = "/api/" in norm or ("route" in norm and re.search(
+            r"export\s+(?:async\s+)?function\s+(GET|POST|PUT|DELETE|PATCH)", content
+        ))
+
+        if is_component:
+            skeleton = (
+                f"import {{ render, screen, fireEvent }} from '@testing-library/react';\n"
+                f"import {{ {symbol} }} from './{os.path.basename(rel_import)}';\n\n"
+                f"describe('{symbol}', () => {{\n"
+                f"  it('renders without crashing', () => {{\n"
+                f"    render(<{symbol} />);\n"
+                f"  }});\n\n"
+                f"  it('displays expected content', () => {{\n"
+                f"    render(<{symbol} />);\n"
+                f"    // TODO: Add assertions\n"
+                f"    // expect(screen.getByText('...')).toBeInTheDocument();\n"
+                f"  }});\n\n"
+                f"  it('handles user interaction', () => {{\n"
+                f"    render(<{symbol} />);\n"
+                f"    // TODO: Add interaction tests\n"
+                f"    // fireEvent.click(screen.getByRole('button'));\n"
+                f"  }});\n"
+                f"}});\n"
+            )
+            test_type = "component"
+        elif is_api:
+            skeleton = (
+                f"import {{ createMocks }} from 'node-mocks-http';\n"
+                f"import {{ {symbol} }} from './{os.path.basename(rel_import)}';\n\n"
+                f"describe('{symbol} API route', () => {{\n"
+                f"  it('returns 200 on success', async () => {{\n"
+                f"    const {{ req, res }} = createMocks({{ method: 'GET' }});\n\n"
+                f"    await {symbol}(req, res);\n\n"
+                f"    expect(res._getStatusCode()).toBe(200);\n"
+                f"  }});\n\n"
+                f"  it('returns 401 when unauthenticated', async () => {{\n"
+                f"    const {{ req, res }} = createMocks({{ method: 'GET' }});\n\n"
+                f"    await {symbol}(req, res);\n\n"
+                f"    expect(res._getStatusCode()).toBe(401);\n"
+                f"  }});\n"
+                f"}});\n"
+            )
+            test_type = "api"
+        else:
+            skeleton = (
+                f"import {{ {symbol} }} from './{os.path.basename(rel_import)}';\n\n"
+                f"describe('{symbol}', () => {{\n"
+                f"  beforeEach(() => {{\n"
+                f"    // TODO: Set up mocks\n"
+                f"  }});\n\n"
+                f"  it('should return expected result', () => {{\n"
+                f"    // Arrange\n"
+                f"    // TODO: set up test data\n\n"
+                f"    // Act\n"
+                f"    const result = {symbol}();\n\n"
+                f"    // Assert\n"
+                f"    expect(result).toBeDefined();\n"
+                f"  }});\n\n"
+                f"  it('should handle edge cases', () => {{\n"
+                f"    // TODO: Add edge case tests\n"
+                f"    expect(() => {symbol}()).not.toThrow();\n"
+                f"  }});\n"
+                f"}});\n"
+            )
+            test_type = "unit"
+
+        return {
+            "status": "ok",
+            "file": file_path,
+            "symbol": symbol,
+            "test_type": test_type,
+            "skeleton": skeleton,
+        }
+
+    def match_view_guards(self, file_path: str, symbol: str) -> Dict[str, Any]:
+        """
+        Cross-reference API route auth checks with matching conditional renders
+        in React components.
+        """
+        base = self._get_project_path()
+        if not base:
+            return {"status": "error", "message": "Project path not set"}
+
+        full_path = os.path.join(base, file_path)
+        if not os.path.isfile(full_path):
+            return {"status": "error", "message": f"File not found: {file_path}"}
+
+        try:
+            with open(full_path, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read()
+        except Exception as exc:
+            return {"status": "error", "message": str(exc)}
+
+        # Extract auth/guard conditions from API routes or server-side code
+        guards: List[Dict[str, Any]] = []
+        guard_patterns = [
+            (r"getServerSession\s*\(([^)]*)\)", "session_check"),
+            (r"getSession\s*\(([^)]*)\)", "session_check"),
+            (r"auth\s*\(\s*\)", "auth_check"),
+            (r"getToken\s*\(([^)]*)\)", "token_check"),
+            (r"if\s*\(\s*!session", "session_guard"),
+            (r"if\s*\(\s*!user", "user_guard"),
+            (r"if\s*\(\s*!token", "token_guard"),
+            (r"session\.user\.role\s*===?\s*['\"](\w+)['\"]", "role_check"),
+            (r"hasPermission\s*\(\s*['\"](\w+)['\"]", "permission_check"),
+        ]
+
+        for pattern, guard_type in guard_patterns:
+            for m in re.finditer(pattern, content):
+                line_num = content[:m.start()].count("\n") + 1
+                guards.append({
+                    "type": guard_type,
+                    "condition": m.group(0),
+                    "value": m.group(1) if m.lastindex else None,
+                    "line": line_num,
+                })
+
+        # Search components for matching conditional renders
+        component_matches: List[Dict[str, Any]] = []
+        search_dirs = []
+        for candidate in ["src/app", "src/components", "src/pages", "app", "components", "pages"]:
+            d = os.path.join(base, candidate)
+            if os.path.isdir(d):
+                search_dirs.append(d)
+
+        component_patterns = [
+            (r"\{session\s*&&", "session_conditional"),
+            (r"\{user\s*&&", "user_conditional"),
+            (r"\{isAuthenticated\s*&&", "auth_conditional"),
+            (r"\{!session\s*&&", "no_session_conditional"),
+            (r"session\?\.\s*user", "optional_session"),
+            (r"role\s*===?\s*['\"](\w+)['\"]", "role_conditional"),
+            (r"hasPermission\s*\(\s*['\"](\w+)['\"]", "permission_conditional"),
+            (r"isAdmin\s*&&", "admin_conditional"),
+            (r"status\s*===?\s*['\"](?:authenticated|unauthenticated)['\"]", "status_conditional"),
+        ]
+
+        for search_dir in search_dirs:
+            for root, _dirs, files in os.walk(search_dir):
+                for fname in files:
+                    if not re.search(r"\.(tsx|jsx|ts|js)$", fname):
+                        continue
+                    comp_path = os.path.join(root, fname)
+                    try:
+                        with open(comp_path, "r", encoding="utf-8", errors="replace") as f:
+                            comp_content = f.read()
+                    except Exception:
+                        continue
+
+                    rel_comp = os.path.relpath(comp_path, base)
+                    for cp, ctype in component_patterns:
+                        for cm in re.finditer(cp, comp_content):
+                            comp_line = comp_content[:cm.start()].count("\n") + 1
+                            for guard in guards:
+                                is_match = False
+                                if guard["type"] in ("session_check", "session_guard") and ctype in (
+                                    "session_conditional", "no_session_conditional", "optional_session"
+                                ):
+                                    is_match = True
+                                elif guard["type"] in ("auth_check",) and ctype in (
+                                    "auth_conditional", "status_conditional"
+                                ):
+                                    is_match = True
+                                elif guard["type"] == "role_check" and ctype == "role_conditional":
+                                    if guard.get("value") and cm.lastindex and guard["value"] == cm.group(1):
+                                        is_match = True
+                                elif guard["type"] == "permission_check" and ctype == "permission_conditional":
+                                    if guard.get("value") and cm.lastindex and guard["value"] == cm.group(1):
+                                        is_match = True
+
+                                if is_match:
+                                    component_matches.append({
+                                        "component_file": rel_comp,
+                                        "component_line": comp_line,
+                                        "component_type": ctype,
+                                        "component_condition": cm.group(0),
+                                        "backend_guard": guard,
+                                    })
+
+        return {
+            "status": "ok",
+            "file": file_path,
+            "symbol": symbol,
+            "backend_guards": guards,
+            "frontend_matches": component_matches,
+            "matched_count": len(component_matches),
+            "unmatched_guards": len(guards) - len({m["backend_guard"]["line"] for m in component_matches}),
+        }

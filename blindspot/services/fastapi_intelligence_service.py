@@ -1938,3 +1938,512 @@ class FastAPIIntelligenceService(BaseService):
             "checks": checks,
             "total_references": sum(r.get("total", 0) for r in checks["references"]),
         }
+
+    # ── verify_schema ────────────────────────────────────────────────
+
+    def verify_schema(self, model_name: str, fields: list) -> Dict[str, Any]:
+        """Verify that a model's fields are consistent across SQLAlchemy models,
+        Pydantic schemas, and Alembic migrations."""
+        base = self._get_project_path()
+        if not base:
+            return {"status": "error", "message": "Project path not set"}
+
+        result: Dict[str, Any] = {
+            "model": model_name,
+            "expected_fields": fields,
+            "sqlalchemy_fields": [],
+            "pydantic_fields": [],
+            "alembic_fields": [],
+            "mismatches": [],
+        }
+
+        # Scan SQLAlchemy Column definitions
+        sa_pattern = re.compile(
+            rf"class\s+{re.escape(model_name)}\b[^:]*:.*?(?=\nclass\s|\Z)",
+            re.DOTALL,
+        )
+        col_pattern = re.compile(r"(\w+)\s*=\s*(?:Column|mapped_column)\s*\(")
+
+        for finfo in self._scan_files(base, "app/models"):
+            match = sa_pattern.search(finfo["content"])
+            if match:
+                body = match.group(0)
+                for col_m in col_pattern.finditer(body):
+                    col_name = col_m.group(1)
+                    if not col_name.startswith("__"):
+                        result["sqlalchemy_fields"].append(col_name)
+
+        # Scan Pydantic BaseModel fields
+        pydantic_pattern = re.compile(
+            rf"class\s+{re.escape(model_name)}(?:Base|Create|Update|Read|Schema|Response|Request)?\s*\(\s*(?:BaseModel|BaseSchema)[^)]*\)\s*:(.*?)(?=\nclass\s|\Z)",
+            re.DOTALL,
+        )
+        field_pattern = re.compile(r"^\s+(\w+)\s*:\s*", re.MULTILINE)
+
+        for subdir in ["app/schemas", "app/models", "app"]:
+            for finfo in self._scan_files(base, subdir):
+                for pm in pydantic_pattern.finditer(finfo["content"]):
+                    body = pm.group(1)
+                    for fm in field_pattern.finditer(body):
+                        fname = fm.group(1)
+                        if not fname.startswith("_") and fname not in ("model_config", "Config"):
+                            result["pydantic_fields"].append(fname)
+
+        # Scan Alembic migration columns
+        alembic_dir = os.path.join(base, "alembic", "versions")
+        if not os.path.isdir(alembic_dir):
+            alembic_dir = os.path.join(base, "migrations", "versions")
+
+        if os.path.isdir(alembic_dir):
+            table_name = model_name.lower() + "s"
+            add_col_pattern = re.compile(
+                rf"(?:add_column|create_table)\s*\(\s*['\"](?:{re.escape(table_name)}|{re.escape(model_name.lower())})['\"]"
+                r".*?sa\.Column\s*\(\s*['\"](\w+)['\"]",
+                re.DOTALL,
+            )
+            for root, _, fnames in os.walk(alembic_dir):
+                for fn in fnames:
+                    if fn.endswith(".py"):
+                        fpath = os.path.join(root, fn)
+                        try:
+                            with open(fpath, "r", encoding="utf-8", errors="replace") as f:
+                                content = f.read()
+                            for am in add_col_pattern.finditer(content):
+                                result["alembic_fields"].append(am.group(1))
+                        except Exception:
+                            continue
+
+        # Check mismatches
+        sa_set = set(result["sqlalchemy_fields"])
+        pydantic_set = set(result["pydantic_fields"])
+        expected_set = set(fields)
+
+        for field in fields:
+            if sa_set and field not in sa_set:
+                result["mismatches"].append({
+                    "field": field,
+                    "issue": "missing_in_sqlalchemy",
+                    "message": f"Field '{field}' not found in SQLAlchemy model",
+                })
+            if pydantic_set and field not in pydantic_set:
+                result["mismatches"].append({
+                    "field": field,
+                    "issue": "missing_in_pydantic",
+                    "message": f"Field '{field}' not found in Pydantic schema",
+                })
+
+        for sa_field in sa_set - expected_set:
+            result["mismatches"].append({
+                "field": sa_field,
+                "issue": "extra_in_sqlalchemy",
+                "message": f"Field '{sa_field}' in SQLAlchemy but not in expected fields",
+            })
+
+        result["status"] = "ok" if not result["mismatches"] else "mismatches_found"
+        return result
+
+    # ── detect_transaction_risks ─────────────────────────────────────
+
+    def detect_transaction_risks(self, file_path: str) -> Dict[str, Any]:
+        """Detect missing transaction management around multiple DB operations."""
+        base = self._get_project_path()
+        if not base:
+            return {"status": "error", "message": "Project path not set"}
+
+        full_path = os.path.join(base, file_path) if not os.path.isabs(file_path) else file_path
+        if not os.path.isfile(full_path):
+            return {"status": "error", "message": f"File not found: {file_path}"}
+
+        try:
+            with open(full_path, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read()
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+
+        risks: List[Dict[str, Any]] = []
+        lines = content.split("\n")
+
+        # Find function boundaries
+        func_pattern = re.compile(r"^(\s*)(?:async\s+)?def\s+(\w+)\s*\(", re.MULTILINE)
+        functions = list(func_pattern.finditer(content))
+
+        for idx, func_match in enumerate(functions):
+            func_name = func_match.group(2)
+            start = func_match.start()
+            end = functions[idx + 1].start() if idx + 1 < len(functions) else len(content)
+            func_body = content[start:end]
+
+            # Count DB write operations
+            db_writes = len(re.findall(
+                r"(?:session|db)\s*\.\s*(?:add|delete|execute|commit|flush|merge|bulk_save_objects|bulk_insert_mappings)\s*\(",
+                func_body,
+            ))
+
+            if db_writes >= 2:
+                has_transaction = bool(re.search(
+                    r"(?:async\s+)?with\s+.*(?:session\.begin|begin_nested|transaction)\s*\(",
+                    func_body,
+                ))
+                if not has_transaction:
+                    line_num = content[:start].count("\n") + 1
+                    risks.append({
+                        "function": func_name,
+                        "line": line_num,
+                        "db_operations": db_writes,
+                        "risk": "multiple_db_writes_without_transaction",
+                        "message": f"Function '{func_name}' has {db_writes} DB write operations without explicit transaction management",
+                        "suggestion": "Wrap in 'async with session.begin():' or use session.begin_nested()",
+                    })
+
+            # Check for cache operations inside transaction
+            if re.search(r"(?:async\s+)?with\s+.*(?:session\.begin|transaction)", func_body):
+                cache_in_txn = re.findall(
+                    r"(?:cache|redis)\s*\.\s*(?:set|delete|invalidate|put)\s*\(",
+                    func_body,
+                )
+                if cache_in_txn:
+                    line_num = content[:start].count("\n") + 1
+                    risks.append({
+                        "function": func_name,
+                        "line": line_num,
+                        "risk": "cache_in_transaction",
+                        "message": f"Cache operation inside transaction in '{func_name}' -- cache may become inconsistent on rollback",
+                        "suggestion": "Move cache operations after transaction commit",
+                    })
+
+        return {"status": "ok", "file": file_path, "risks": risks, "total_risks": len(risks)}
+
+    # ── get_domain_rules ─────────────────────────────────────────────
+
+    def get_domain_rules(self, file_path: str) -> Dict[str, Any]:
+        """Check domain-specific rules for FastAPI file types."""
+        base = self._get_project_path()
+        if not base:
+            return {"status": "error", "message": "Project path not set"}
+
+        full_path = os.path.join(base, file_path) if not os.path.isabs(file_path) else file_path
+        if not os.path.isfile(full_path):
+            return {"status": "error", "message": f"File not found: {file_path}"}
+
+        try:
+            with open(full_path, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read()
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+
+        violations: List[Dict[str, Any]] = []
+        file_type = "unknown"
+        rel_path = os.path.relpath(full_path, base) if base else file_path
+
+        # Determine file type and apply rules
+        if re.search(r"(?:routers?|api|endpoints?|routes?)", rel_path, re.IGNORECASE):
+            file_type = "router"
+            # Rule: routers require Depends(auth)
+            route_decorators = re.findall(
+                r"@(?:router|app)\s*\.\s*(?:get|post|put|delete|patch)\s*\([^)]*\)\s*\n\s*(?:async\s+)?def\s+(\w+)\s*\(([^)]*)\)",
+                content,
+            )
+            for func_name, params in route_decorators:
+                if "Depends" not in params and func_name not in ("health", "healthcheck", "health_check", "root"):
+                    violations.append({
+                        "rule": "router_requires_auth",
+                        "severity": "warning",
+                        "function": func_name,
+                        "message": f"Route handler '{func_name}' has no Depends() injection -- consider adding authentication",
+                    })
+
+        elif re.search(r"schemas?", rel_path, re.IGNORECASE):
+            file_type = "schema"
+            # Rule: Pydantic schemas should have Field validators
+            class_matches = re.finditer(
+                r"class\s+(\w+)\s*\([^)]*BaseModel[^)]*\)\s*:(.*?)(?=\nclass\s|\Z)",
+                content, re.DOTALL,
+            )
+            for cm in class_matches:
+                cls_name = cm.group(1)
+                body = cm.group(2)
+                field_count = len(re.findall(r"^\s+\w+\s*:", body, re.MULTILINE))
+                validator_count = len(re.findall(r"@(?:field_validator|validator|model_validator)", body))
+                if field_count > 3 and validator_count == 0:
+                    violations.append({
+                        "rule": "schema_requires_validators",
+                        "severity": "info",
+                        "class": cls_name,
+                        "message": f"Schema '{cls_name}' has {field_count} fields but no validators",
+                    })
+
+        elif re.search(r"(?:crud|repository|dal|dao)", rel_path, re.IGNORECASE):
+            file_type = "crud"
+            # Rule: CRUD functions require session management
+            func_pattern = re.compile(r"(?:async\s+)?def\s+(\w+)\s*\(([^)]*)\)", re.MULTILINE)
+            for fm in func_pattern.finditer(content):
+                func_name = fm.group(1)
+                params = fm.group(2)
+                if func_name.startswith("_"):
+                    continue
+                if not re.search(r"(?:session|db|Session|AsyncSession)", params):
+                    violations.append({
+                        "rule": "crud_requires_session",
+                        "severity": "warning",
+                        "function": func_name,
+                        "message": f"CRUD function '{func_name}' does not accept a session parameter",
+                    })
+
+        elif re.search(r"(?:tasks?|background|workers?|jobs?|celery)", rel_path, re.IGNORECASE):
+            file_type = "background_task"
+            # Rule: background tasks require error handling
+            func_matches = re.finditer(
+                r"(?:async\s+)?def\s+(\w+)\s*\([^)]*\)\s*(?:->.*?)?:(.*?)(?=\n(?:async\s+)?def\s|\Z)",
+                content, re.DOTALL,
+            )
+            for fm in func_matches:
+                func_name = fm.group(1)
+                body = fm.group(2)
+                if func_name.startswith("_"):
+                    continue
+                has_try = "try:" in body
+                has_except = "except" in body
+                if not (has_try and has_except):
+                    violations.append({
+                        "rule": "background_task_requires_error_handling",
+                        "severity": "error",
+                        "function": func_name,
+                        "message": f"Background task '{func_name}' lacks try/except error handling",
+                    })
+
+        return {
+            "status": "ok",
+            "file": file_path,
+            "file_type": file_type,
+            "violations": violations,
+            "total_violations": len(violations),
+        }
+
+    # ── generate_test_skeleton ───────────────────────────────────────
+
+    def generate_test_skeleton(self, file_path: str, symbol: str) -> Dict[str, Any]:
+        """Generate a pytest test skeleton for a FastAPI endpoint or function."""
+        base = self._get_project_path()
+        if not base:
+            return {"status": "error", "message": "Project path not set"}
+
+        full_path = os.path.join(base, file_path) if not os.path.isabs(file_path) else file_path
+        if not os.path.isfile(full_path):
+            return {"status": "error", "message": f"File not found: {file_path}"}
+
+        try:
+            with open(full_path, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read()
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+
+        result: Dict[str, Any] = {"file": file_path, "symbol": symbol, "skeleton": "", "test_type": "unknown"}
+        rel_path = os.path.relpath(full_path, base) if base else file_path
+        module_path = rel_path.replace(os.sep, ".").replace(".py", "")
+
+        # Find the symbol definition
+        func_match = re.search(
+            rf"(async\s+)?def\s+{re.escape(symbol)}\s*\(([^)]*)\)(?:\s*->\s*([^\s:]+))?\s*:",
+            content,
+        )
+
+        is_async = bool(func_match and func_match.group(1))
+        params = func_match.group(2).strip() if func_match else ""
+        return_type = func_match.group(3) if func_match and func_match.group(3) else "None"
+
+        # Detect if it's a route handler
+        is_route = bool(re.search(
+            rf"@(?:router|app)\s*\.\s*(?:get|post|put|delete|patch)\s*\([^)]*\)\s*\n.*?def\s+{re.escape(symbol)}\s*\(",
+            content, re.DOTALL,
+        ))
+
+        # Extract HTTP method and path
+        route_method = "get"
+        route_path = f"/{symbol}"
+        if is_route:
+            route_match = re.search(
+                rf"@(?:router|app)\s*\.\s*(get|post|put|delete|patch)\s*\(\s*['\"]([^'\"]+)['\"]",
+                content[:content.index(f"def {symbol}")],
+            )
+            if route_match:
+                route_method = route_match.group(1)
+                route_path = route_match.group(2)
+
+        # Extract dependencies from params
+        deps = re.findall(r"(\w+)\s*:\s*\w+\s*=\s*Depends\s*\(\s*(\w+)\s*\)", params)
+
+        if is_route and is_async:
+            result["test_type"] = "async_route"
+            dep_mocks = "\n".join(
+                f"    # Mock dependency: {d[1]}\n    app.dependency_overrides[{d[1]}] = lambda: mock_{d[0]}"
+                for d in deps
+            )
+            result["skeleton"] = (
+                f"import pytest\n"
+                f"from httpx import AsyncClient, ASGITransport\n"
+                f"from {module_path.split('.')[0]}.main import app\n\n\n"
+                f"@pytest.mark.anyio\n"
+                f"async def test_{symbol}():\n"
+                f"    \"\"\"Test {symbol} endpoint.\"\"\"\n"
+                f"{dep_mocks}\n"
+                f"    async with AsyncClient(transport=ASGITransport(app=app), base_url='http://test') as client:\n"
+                f"        response = await client.{route_method}('{route_path}')\n"
+                f"        assert response.status_code == 200\n"
+                f"        data = response.json()\n"
+                f"        # TODO: Add specific assertions\n"
+            )
+        elif is_route:
+            result["test_type"] = "sync_route"
+            dep_mocks = "\n".join(
+                f"    # Mock dependency: {d[1]}\n    app.dependency_overrides[{d[1]}] = lambda: mock_{d[0]}"
+                for d in deps
+            )
+            result["skeleton"] = (
+                f"import pytest\n"
+                f"from fastapi.testclient import TestClient\n"
+                f"from {module_path.split('.')[0]}.main import app\n\n\n"
+                f"@pytest.fixture\n"
+                f"def client():\n"
+                f"    return TestClient(app)\n\n\n"
+                f"def test_{symbol}(client):\n"
+                f"    \"\"\"Test {symbol} endpoint.\"\"\"\n"
+                f"{dep_mocks}\n"
+                f"    response = client.{route_method}('{route_path}')\n"
+                f"    assert response.status_code == 200\n"
+                f"    data = response.json()\n"
+                f"    # TODO: Add specific assertions\n"
+            )
+        else:
+            result["test_type"] = "async_unit" if is_async else "unit"
+            prefix = "@pytest.mark.anyio\nasync " if is_async else ""
+            await_prefix = "await " if is_async else ""
+            result["skeleton"] = (
+                f"import pytest\n"
+                f"from {module_path} import {symbol}\n\n\n"
+                f"{prefix}def test_{symbol}():\n"
+                f"    \"\"\"Test {symbol} function.\"\"\"\n"
+                f"    # TODO: Set up test fixtures\n"
+                f"    result = {await_prefix}{symbol}()\n"
+                f"    # TODO: Add assertions\n"
+                f"    assert result is not None\n"
+            )
+
+        result["status"] = "ok"
+        return result
+
+    # ── match_view_guards ────────────────────────────────────────────
+
+    def match_view_guards(self, file_path: str, symbol: str) -> Dict[str, Any]:
+        """Match backend Depends(auth) checks in routers to frontend conditional renders."""
+        base = self._get_project_path()
+        if not base:
+            return {"status": "error", "message": "Project path not set"}
+
+        full_path = os.path.join(base, file_path) if not os.path.isabs(file_path) else file_path
+        if not os.path.isfile(full_path):
+            return {"status": "error", "message": f"File not found: {file_path}"}
+
+        try:
+            with open(full_path, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read()
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+
+        result: Dict[str, Any] = {
+            "file": file_path,
+            "symbol": symbol,
+            "backend_guards": [],
+            "frontend_guards": [],
+            "unmatched": [],
+        }
+
+        # Find auth dependencies on the symbol (route handler)
+        func_match = re.search(
+            rf"@(?:router|app)\s*\.\s*(get|post|put|delete|patch)\s*\(\s*['\"]([^'\"]+)['\"].*?\)\s*\n"
+            rf".*?def\s+{re.escape(symbol)}\s*\(([^)]*)\)",
+            content, re.DOTALL,
+        )
+
+        if not func_match:
+            return {"status": "ok", "file": file_path, "symbol": symbol,
+                    "message": f"Symbol '{symbol}' is not a route handler", **result}
+
+        route_path = func_match.group(2)
+        params = func_match.group(3)
+
+        # Extract auth-related dependencies
+        auth_deps = re.findall(
+            r"Depends\s*\(\s*(\w*(?:auth|current_user|permission|role|token|security)\w*)\s*\)",
+            params, re.IGNORECASE,
+        )
+        for dep in auth_deps:
+            result["backend_guards"].append({
+                "type": "depends",
+                "dependency": dep,
+                "route": route_path,
+            })
+
+        # Also check for security decorators
+        decorator_guards = re.findall(
+            rf"@(?:requires|has_permission|role_required|auth_required)\s*\(([^)]*)\)\s*\n.*?def\s+{re.escape(symbol)}",
+            content, re.DOTALL,
+        )
+        for dg in decorator_guards:
+            result["backend_guards"].append({
+                "type": "decorator",
+                "permission": dg.strip().strip("'\""),
+                "route": route_path,
+            })
+
+        # Scan frontend files for matching conditional renders
+        frontend_dirs = ["frontend/src", "frontend", "static", "client/src", "web/src", "app/templates"]
+        frontend_exts = (".vue", ".tsx", ".jsx", ".svelte", ".html", ".js", ".ts")
+
+        for fdir in frontend_dirs:
+            scan_dir = os.path.join(base, fdir)
+            if not os.path.isdir(scan_dir):
+                continue
+            for root, dirs, files in os.walk(scan_dir):
+                dirs[:] = [d for d in dirs if d not in ("node_modules", ".next", "dist", "build")]
+                for fname in files:
+                    if not fname.endswith(frontend_exts):
+                        continue
+                    fpath = os.path.join(root, fname)
+                    try:
+                        with open(fpath, "r", encoding="utf-8", errors="replace") as f:
+                            fe_content = f.read()
+                    except Exception:
+                        continue
+
+                    rel = os.path.relpath(fpath, base)
+
+                    # Check if this frontend file references the route
+                    if not re.search(re.escape(route_path), fe_content):
+                        continue
+
+                    # Look for conditional renders related to auth
+                    auth_conditions = re.findall(
+                        r"(?:v-if|v-show|\{.*?&&|\? )\s*['\"]?[\w.]*(?:auth|isAuth|logged|user|role|permission|token)[\w.]*",
+                        fe_content, re.IGNORECASE,
+                    )
+                    for cond in auth_conditions:
+                        result["frontend_guards"].append({
+                            "file": rel,
+                            "condition": cond.strip()[:80],
+                            "route_reference": route_path,
+                        })
+
+        # Identify unmatched guards
+        if result["backend_guards"] and not result["frontend_guards"]:
+            result["unmatched"].append({
+                "severity": "warning",
+                "message": f"Route '{route_path}' has backend auth guards but no matching frontend conditional rendering found",
+            })
+        if result["frontend_guards"] and not result["backend_guards"]:
+            result["unmatched"].append({
+                "severity": "error",
+                "message": f"Route '{route_path}' has frontend auth checks but no backend Depends() guard -- potential security issue",
+            })
+
+        result["status"] = "ok"
+        return result

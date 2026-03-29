@@ -3220,3 +3220,452 @@ class SpringIntelligenceService(BaseService):
         if 'Test' in file_path or '@Test' in content:
             return "test"
         return "other"
+
+    # -----------------------------------------------------------------
+    # verify_schema
+    # -----------------------------------------------------------------
+    def verify_schema(self, entity_or_model: str, fields: list) -> Dict[str, Any]:
+        """Verify that fields exist in a Spring @Entity class or migration files."""
+        base = self.base_path
+        result: Dict[str, Any] = {
+            "status": "success",
+            "entity": entity_or_model,
+            "requested_fields": fields,
+            "found_fields": [],
+            "missing_fields": [],
+            "migration_fields": [],
+            "warnings": [],
+        }
+
+        # 1. Scan @Entity classes for @Column fields
+        entity_found = False
+        for src_root in [self.JAVA_SRC, self.KOTLIN_SRC]:
+            src_dir = os.path.join(base, src_root)
+            if not os.path.isdir(src_dir):
+                continue
+            for dirpath, _, filenames in os.walk(src_dir):
+                for fn in filenames:
+                    if not fn.endswith(('.java', '.kt')):
+                        continue
+                    fpath = os.path.join(dirpath, fn)
+                    try:
+                        with open(fpath, 'r', encoding='utf-8', errors='replace') as f:
+                            content = f.read()
+                    except Exception:
+                        continue
+                    # Check if this file contains the entity class
+                    if not re.search(rf'@Entity\b.*?class\s+{re.escape(entity_or_model)}\b', content, re.DOTALL):
+                        continue
+                    entity_found = True
+                    # Extract field names from @Column annotations and plain fields
+                    col_names = re.findall(
+                        r'@Column\s*(?:\([^)]*name\s*=\s*["\'](\w+)["\'][^)]*\))?.*?(?:private|protected|public|var|val)\s+\S+\s+(\w+)',
+                        content, re.DOTALL
+                    )
+                    plain_fields = re.findall(
+                        r'(?:private|protected|public|var|val)\s+\S+\s+(\w+)\s*[;=]', content
+                    )
+                    all_entity_fields = set()
+                    for col_name, field_name in col_names:
+                        all_entity_fields.add(col_name if col_name else field_name)
+                        all_entity_fields.add(field_name)
+                    all_entity_fields.update(plain_fields)
+                    for fld in fields:
+                        if fld in all_entity_fields:
+                            result["found_fields"].append(fld)
+                        else:
+                            result["missing_fields"].append(fld)
+
+        if not entity_found:
+            result["warnings"].append(f"Entity class '{entity_or_model}' not found in source tree")
+            result["missing_fields"] = list(fields)
+
+        # 2. Check Flyway / Liquibase migrations
+        migration_dirs = [
+            os.path.join(base, self.RESOURCES, "db", "migration"),
+            os.path.join(base, self.RESOURCES, "db", "changelog"),
+        ]
+        for mdir in migration_dirs:
+            if not os.path.isdir(mdir):
+                continue
+            for dirpath, _, filenames in os.walk(mdir):
+                for fn in sorted(filenames):
+                    fpath = os.path.join(dirpath, fn)
+                    try:
+                        with open(fpath, 'r', encoding='utf-8', errors='replace') as f:
+                            mcontent = f.read()
+                    except Exception:
+                        continue
+                    for fld in fields:
+                        if re.search(rf'\b{re.escape(fld)}\b', mcontent, re.IGNORECASE):
+                            result["migration_fields"].append({"field": fld, "file": fn})
+
+        return result
+
+    # -----------------------------------------------------------------
+    # detect_transaction_risks
+    # -----------------------------------------------------------------
+    def detect_transaction_risks(self, file_path: str) -> Dict[str, Any]:
+        """Detect missing @Transactional and cache-inside-transaction risks."""
+        base = self.base_path
+        full_path = os.path.join(base, file_path) if not os.path.isabs(file_path) else file_path
+        result: Dict[str, Any] = {
+            "status": "success",
+            "file": file_path,
+            "risks": [],
+            "suggestions": [],
+        }
+        if not os.path.isfile(full_path):
+            result["status"] = "error"
+            result["error"] = f"File not found: {file_path}"
+            return result
+
+        try:
+            with open(full_path, 'r', encoding='utf-8', errors='replace') as f:
+                content = f.read()
+        except Exception as e:
+            result["status"] = "error"
+            result["error"] = str(e)
+            return result
+
+        # Find methods with multiple write operations (save/delete/update/persist)
+        write_ops = re.compile(r'\b(?:save|delete|update|persist|merge|remove|flush)\s*\(')
+        transactional_re = re.compile(r'@Transactional')
+        cache_ops = re.compile(r'\b(?:cacheManager|@Cacheable|@CachePut|@CacheEvict|cachePut|cacheEvict|redisTemplate|cache\.put)')
+
+        # Split into methods
+        method_re = re.compile(
+            r'(?:@\w+(?:\([^)]*\))?[\s\n]*)*(public|protected|private)\s+\S+\s+(\w+)\s*\([^)]*\)\s*(?:throws\s+[\w,\s]+)?\s*\{',
+            re.MULTILINE
+        )
+        methods = list(method_re.finditer(content))
+
+        for i, m in enumerate(methods):
+            start = m.start()
+            end = methods[i + 1].start() if i + 1 < len(methods) else len(content)
+            method_block = content[start:end]
+            method_name = m.group(2)
+
+            writes = write_ops.findall(method_block)
+            has_transactional = bool(transactional_re.search(content[max(0, start - 200):start + len(m.group(0))]))
+            has_cache = bool(cache_ops.search(method_block))
+
+            if len(writes) >= 2 and not has_transactional:
+                result["risks"].append({
+                    "method": method_name,
+                    "type": "missing_transactional",
+                    "message": f"Method '{method_name}' has {len(writes)} write operations but no @Transactional",
+                    "severity": "high",
+                })
+
+            if has_transactional and has_cache:
+                result["risks"].append({
+                    "method": method_name,
+                    "type": "cache_in_transaction",
+                    "message": f"Method '{method_name}' has cache operations inside @Transactional -- may cause inconsistency on rollback",
+                    "severity": "medium",
+                })
+
+        if not result["risks"]:
+            result["suggestions"].append("No transaction risks detected")
+
+        return result
+
+    # -----------------------------------------------------------------
+    # get_domain_rules
+    # -----------------------------------------------------------------
+    def get_domain_rules(self, file_path: str) -> Dict[str, Any]:
+        """Return domain-layer rules applicable to a Spring file."""
+        base = self.base_path
+        full_path = os.path.join(base, file_path) if not os.path.isabs(file_path) else file_path
+        result: Dict[str, Any] = {
+            "status": "success",
+            "file": file_path,
+            "file_type": "unknown",
+            "violations": [],
+            "rules_checked": [],
+        }
+        if not os.path.isfile(full_path):
+            result["status"] = "error"
+            result["error"] = f"File not found: {file_path}"
+            return result
+
+        try:
+            with open(full_path, 'r', encoding='utf-8', errors='replace') as f:
+                content = f.read()
+        except Exception as e:
+            result["status"] = "error"
+            result["error"] = str(e)
+            return result
+
+        ftype = self._classify_spring_file(content, file_path)
+        result["file_type"] = ftype
+
+        if ftype == "controller":
+            result["rules_checked"].append("Controllers must use @Valid on request body params")
+            # Find methods with @RequestBody but no @Valid
+            methods_with_body = re.findall(
+                r'(public\s+\S+\s+\w+\s*\([^)]*@RequestBody\s+(?!.*@Valid)[^)]*\))', content
+            )
+            for sig in methods_with_body:
+                result["violations"].append({
+                    "rule": "missing_valid_annotation",
+                    "message": f"@RequestBody without @Valid: {sig.strip()[:80]}",
+                    "severity": "medium",
+                })
+
+        elif ftype == "service":
+            result["rules_checked"].append("Service write methods should have @Transactional")
+            write_re = re.compile(r'\b(?:save|delete|update|create|remove|persist)\s*\(')
+            method_re = re.compile(r'(public\s+\S+\s+(\w+)\s*\([^)]*\))', re.MULTILINE)
+            for m in method_re.finditer(content):
+                method_block_start = max(0, m.start() - 300)
+                preceding = content[method_block_start:m.start()]
+                method_name = m.group(2)
+                # Rough check: look ahead for write ops
+                next_method = method_re.search(content, m.end())
+                body = content[m.end():(next_method.start() if next_method else len(content))]
+                if write_re.search(body) and '@Transactional' not in preceding:
+                    result["violations"].append({
+                        "rule": "missing_transactional",
+                        "message": f"Service method '{method_name}' performs writes without @Transactional",
+                        "severity": "high",
+                    })
+
+        elif ftype == "repository":
+            result["rules_checked"].append("Repositories must not contain business logic")
+            biz_indicators = re.findall(r'\b(?:if\s*\(|for\s*\(|while\s*\(|switch\s*\()', content)
+            if len(biz_indicators) > 3:
+                result["violations"].append({
+                    "rule": "business_logic_in_repository",
+                    "message": f"Repository contains {len(biz_indicators)} control-flow statements -- possible business logic leak",
+                    "severity": "medium",
+                })
+
+        elif ftype == "configuration":
+            result["rules_checked"].append("Configuration must not have hardcoded values")
+            hardcoded = re.findall(
+                r'(?:url|host|port|password|secret|key|token)\s*=\s*["\'][^$\{][^"\']+["\']',
+                content, re.IGNORECASE,
+            )
+            for hc in hardcoded:
+                result["violations"].append({
+                    "rule": "hardcoded_config_value",
+                    "message": f"Hardcoded value detected: {hc.strip()[:60]}",
+                    "severity": "high",
+                })
+
+        return result
+
+    # -----------------------------------------------------------------
+    # generate_test_skeleton
+    # -----------------------------------------------------------------
+    def generate_test_skeleton(self, file_path: str, symbol: str) -> Dict[str, Any]:
+        """Generate a JUnit 5 test skeleton for a Spring class/method."""
+        base = self.base_path
+        full_path = os.path.join(base, file_path) if not os.path.isabs(file_path) else file_path
+        result: Dict[str, Any] = {
+            "status": "success",
+            "file": file_path,
+            "symbol": symbol,
+            "test_skeleton": "",
+            "test_file_path": "",
+            "framework": "junit5",
+        }
+        if not os.path.isfile(full_path):
+            result["status"] = "error"
+            result["error"] = f"File not found: {file_path}"
+            return result
+
+        try:
+            with open(full_path, 'r', encoding='utf-8', errors='replace') as f:
+                content = f.read()
+        except Exception as e:
+            result["status"] = "error"
+            result["error"] = str(e)
+            return result
+
+        # Detect package
+        pkg_match = re.search(r'package\s+([\w.]+);', content)
+        package = pkg_match.group(1) if pkg_match else "com.example"
+
+        # Detect class name
+        class_match = re.search(r'class\s+(\w+)', content)
+        class_name = class_match.group(1) if class_match else symbol
+
+        ftype = self._classify_spring_file(content, file_path)
+
+        # Detect injected dependencies for @MockBean
+        injected = re.findall(r'(?:@Autowired|@Inject)\s+(?:private\s+)?(\w+)\s+(\w+)', content)
+
+        # Determine test file path
+        test_path = file_path.replace(self.JAVA_SRC, self.TEST_JAVA).replace(
+            self.KOTLIN_SRC, self.TEST_KOTLIN
+        )
+        if test_path.endswith('.java'):
+            test_path = test_path.replace('.java', 'Test.java')
+        elif test_path.endswith('.kt'):
+            test_path = test_path.replace('.kt', 'Test.kt')
+        result["test_file_path"] = test_path
+
+        mock_beans = "\n".join(
+            f"    @MockBean\n    private {typ} {name};" for typ, name in injected
+        )
+
+        if ftype == "controller":
+            skeleton = f"""package {package};
+
+import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.autoconfigure.web.servlet.WebMvcTest;
+import org.springframework.boot.test.mock.bean.MockBean;
+import org.springframework.test.web.servlet.MockMvc;
+
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.*;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.*;
+
+@WebMvcTest({class_name}.class)
+class {class_name}Test {{
+
+    @Autowired
+    private MockMvc mockMvc;
+
+{mock_beans}
+
+    @Test
+    void {symbol}_shouldReturnExpectedResult() throws Exception {{
+        // Arrange
+        // TODO: set up mock behaviour
+
+        // Act & Assert
+        mockMvc.perform(get("/TODO"))
+            .andExpect(status().isOk());
+    }}
+}}
+"""
+        else:
+            skeleton = f"""package {package};
+
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.InjectMocks;
+import org.mockito.Mock;
+import org.mockito.junit.jupiter.MockitoExtension;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.Mockito.*;
+
+@ExtendWith(MockitoExtension.class)
+class {class_name}Test {{
+
+{mock_beans}
+
+    @InjectMocks
+    private {class_name} {class_name[0].lower() + class_name[1:]};
+
+    @BeforeEach
+    void setUp() {{
+        // TODO: common setup
+    }}
+
+    @Test
+    void {symbol}_shouldWork() {{
+        // Arrange
+        // TODO: set up mocks
+
+        // Act
+        // TODO: call method
+
+        // Assert
+        // TODO: verify results
+    }}
+}}
+"""
+        result["test_skeleton"] = skeleton
+        return result
+
+    # -----------------------------------------------------------------
+    # match_view_guards
+    # -----------------------------------------------------------------
+    def match_view_guards(self, file_path: str, symbol: str) -> Dict[str, Any]:
+        """Match @PreAuthorize / SecurityContext checks to Thymeleaf sec:authorize."""
+        base = self.base_path
+        full_path = os.path.join(base, file_path) if not os.path.isabs(file_path) else file_path
+        result: Dict[str, Any] = {
+            "status": "success",
+            "file": file_path,
+            "symbol": symbol,
+            "backend_guards": [],
+            "view_guards": [],
+            "mismatches": [],
+        }
+        if not os.path.isfile(full_path):
+            result["status"] = "error"
+            result["error"] = f"File not found: {file_path}"
+            return result
+
+        try:
+            with open(full_path, 'r', encoding='utf-8', errors='replace') as f:
+                content = f.read()
+        except Exception as e:
+            result["status"] = "error"
+            result["error"] = str(e)
+            return result
+
+        # Extract @PreAuthorize roles/expressions
+        pre_auth_re = re.compile(r"@PreAuthorize\s*\(\s*[\"'](.+?)[\"']\s*\)")
+        security_ctx_re = re.compile(r'SecurityContext.*?getAuthentication.*?hasRole\s*\(\s*["\'](\w+)["\']', re.DOTALL)
+        secured_re = re.compile(r'@Secured\s*\(\s*\{?\s*["\']([^"\']+)["\']')
+
+        roles_backend: Set[str] = set()
+        for m in pre_auth_re.finditer(content):
+            expr = m.group(1)
+            result["backend_guards"].append({"type": "PreAuthorize", "expression": expr})
+            for role in re.findall(r"ROLE_\w+|\w+", expr):
+                if role not in ('hasRole', 'hasAuthority', 'hasAnyRole', 'and', 'or', 'not', 'true', 'false'):
+                    roles_backend.add(role)
+        for m in security_ctx_re.finditer(content):
+            roles_backend.add(m.group(1))
+            result["backend_guards"].append({"type": "SecurityContext", "role": m.group(1)})
+        for m in secured_re.finditer(content):
+            roles_backend.add(m.group(1))
+            result["backend_guards"].append({"type": "Secured", "role": m.group(1)})
+
+        # Scan Thymeleaf templates for sec:authorize
+        templates_dir = os.path.join(base, self.RESOURCES, "templates")
+        roles_frontend: Set[str] = set()
+        if os.path.isdir(templates_dir):
+            for dirpath, _, filenames in os.walk(templates_dir):
+                for fn in filenames:
+                    if not fn.endswith('.html'):
+                        continue
+                    tpath = os.path.join(dirpath, fn)
+                    try:
+                        with open(tpath, 'r', encoding='utf-8', errors='replace') as f:
+                            tcontent = f.read()
+                    except Exception:
+                        continue
+                    sec_matches = re.findall(r'sec:authorize\s*=\s*["\']([^"\']+)["\']', tcontent)
+                    for expr in sec_matches:
+                        rel_path = os.path.relpath(tpath, base)
+                        result["view_guards"].append({"file": rel_path, "expression": expr})
+                        for role in re.findall(r"ROLE_\w+|\w+", expr):
+                            if role not in ('hasRole', 'hasAuthority', 'hasAnyRole', 'and', 'or', 'not'):
+                                roles_frontend.add(role)
+
+        # Compare
+        backend_only = roles_backend - roles_frontend
+        frontend_only = roles_frontend - roles_backend
+        for role in backend_only:
+            result["mismatches"].append({
+                "role": role,
+                "issue": "Backend guard has no matching Thymeleaf sec:authorize",
+            })
+        for role in frontend_only:
+            result["mismatches"].append({
+                "role": role,
+                "issue": "Thymeleaf sec:authorize has no matching backend guard",
+            })
+
+        return result

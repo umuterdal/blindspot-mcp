@@ -2386,3 +2386,547 @@ class ReactNativeIntelligenceService(BaseService):
                 f"No native implementation files found for module '{module_name}'. "
                 "Ensure native bridge code exists."
             )
+
+    # ── verify_schema ─────────────────────────────────────────────────
+    def verify_schema(self, entity_or_model: str, fields: list) -> Dict[str, Any]:
+        """Check TypeScript interfaces/types for API response models and AsyncStorage keys."""
+        base = self._project_path()
+        if not base:
+            return {"status": "error", "message": "No project path configured"}
+
+        result: Dict[str, Any] = {
+            "model": entity_or_model,
+            "requested_fields": fields,
+            "interface_fields": [],
+            "type_alias_fields": [],
+            "async_storage_keys": [],
+            "missing_fields": [],
+            "warnings": [],
+        }
+
+        found_fields: Set[str] = set()
+
+        ts_extensions = (".ts", ".tsx", ".d.ts")
+        for root, _, files in os.walk(base):
+            if "node_modules" in root or ".git" in root:
+                continue
+            for fname in files:
+                if not any(fname.endswith(ext) for ext in ts_extensions):
+                    continue
+                fpath = os.path.join(root, fname)
+                try:
+                    with open(fpath, "r", encoding="utf-8", errors="replace") as f:
+                        content = f.read()
+                except Exception:
+                    continue
+
+                if entity_or_model not in content:
+                    continue
+
+                rel = os.path.relpath(fpath, base)
+
+                # Match interface fields: interface Model { field: type; }
+                iface_re = re.compile(
+                    r'(?:export\s+)?interface\s+' + re.escape(entity_or_model)
+                    + r'\s*(?:extends\s+[^{]*)?\{([^}]*)\}',
+                    re.DOTALL,
+                )
+                iface_match = iface_re.search(content)
+                if iface_match:
+                    body = iface_match.group(1)
+                    field_re = re.compile(r'(\w+)\s*[?]?\s*:\s*([^;]+);')
+                    for fm in field_re.finditer(body):
+                        field_name = fm.group(1)
+                        field_type = fm.group(2).strip()
+                        result["interface_fields"].append({
+                            "file": rel, "field": field_name, "type": field_type,
+                        })
+                        found_fields.add(field_name)
+
+                # Match type alias fields: type Model = { field: type; }
+                type_re = re.compile(
+                    r'(?:export\s+)?type\s+' + re.escape(entity_or_model)
+                    + r'\s*=\s*\{([^}]*)\}',
+                    re.DOTALL,
+                )
+                type_match = type_re.search(content)
+                if type_match:
+                    body = type_match.group(1)
+                    field_re = re.compile(r'(\w+)\s*[?]?\s*:\s*([^;]+);')
+                    for fm in field_re.finditer(body):
+                        field_name = fm.group(1)
+                        field_type = fm.group(2).strip()
+                        result["type_alias_fields"].append({
+                            "file": rel, "field": field_name, "type": field_type,
+                        })
+                        found_fields.add(field_name)
+
+                # AsyncStorage key references for this model
+                storage_re = re.compile(
+                    r'AsyncStorage\.(?:getItem|setItem|removeItem)\s*\(\s*[\'"`]([^\'"`]+)[\'"`]'
+                )
+                for sm in storage_re.finditer(content):
+                    key = sm.group(1)
+                    if entity_or_model.lower() in key.lower():
+                        result["async_storage_keys"].append({
+                            "file": rel, "key": key,
+                        })
+
+        for field in fields:
+            if field not in found_fields:
+                result["missing_fields"].append(field)
+
+        if result["missing_fields"]:
+            result["warnings"].append(
+                f"Fields not found in any interface/type: {', '.join(result['missing_fields'])}"
+            )
+
+        return {"status": "ok", **result}
+
+    # ── detect_transaction_risks ──────────────────────────────────────
+    def detect_transaction_risks(self, file_path: str) -> Dict[str, Any]:
+        """Detect missing error handling around AsyncStorage batch ops and API calls without retry."""
+        base = self._project_path()
+        if not base:
+            return {"status": "error", "message": "No project path configured"}
+
+        full_path = os.path.join(base, file_path)
+        if not os.path.isfile(full_path):
+            return {"status": "error", "message": f"File not found: {file_path}"}
+
+        try:
+            with open(full_path, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read()
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+
+        result: Dict[str, Any] = {
+            "file": file_path,
+            "risks": [],
+            "warnings": [],
+            "async_storage_ops": 0,
+            "api_calls": 0,
+        }
+
+        lines = content.split("\n")
+
+        # Detect AsyncStorage operations
+        storage_re = re.compile(r'AsyncStorage\.(?:multiSet|multiGet|multiRemove|multiMerge)\s*\(')
+        storage_single_re = re.compile(r'AsyncStorage\.(?:setItem|getItem|removeItem|mergeItem)\s*\(')
+        storage_locs = []
+        for i, line in enumerate(lines):
+            if storage_re.search(line) or storage_single_re.search(line):
+                storage_locs.append((i + 1, line.strip()))
+        result["async_storage_ops"] = len(storage_locs)
+
+        # Check if AsyncStorage batch ops are inside try/catch
+        batch_ops = re.compile(r'AsyncStorage\.multi(?:Set|Get|Remove|Merge)\s*\(')
+        for i, line in enumerate(lines):
+            if batch_ops.search(line):
+                # Look backward for try block
+                has_try = False
+                for j in range(max(0, i - 10), i):
+                    if re.search(r'\btry\s*\{', lines[j]):
+                        has_try = True
+                        break
+                if not has_try:
+                    result["risks"].append({
+                        "type": "unhandled_batch_storage",
+                        "severity": "error",
+                        "message": "AsyncStorage batch operation without try/catch",
+                        "line": i + 1,
+                        "code": line.strip(),
+                    })
+
+        # Detect API calls without retry/offline support
+        api_re = re.compile(r'(?:fetch|axios|api)\s*[\.(]')
+        api_locs = [(i + 1, ln.strip()) for i, ln in enumerate(lines) if api_re.search(ln)]
+        result["api_calls"] = len(api_locs)
+
+        has_retry = bool(re.search(r'retry|retries|maxRetries|retryCount|withRetry', content))
+        has_offline = bool(re.search(r'NetInfo|isConnected|isOnline|offline|connectivity', content))
+
+        if api_locs and not has_retry:
+            result["risks"].append({
+                "type": "api_no_retry",
+                "severity": "warning",
+                "message": f"Found {len(api_locs)} API calls without retry mechanism",
+                "locations": [{"line": loc[0], "code": loc[1]} for loc in api_locs[:5]],
+            })
+
+        if api_locs and not has_offline:
+            result["risks"].append({
+                "type": "api_no_offline_support",
+                "severity": "warning",
+                "message": "API calls detected without offline/connectivity check",
+            })
+
+        # Multiple sequential AsyncStorage calls without batching
+        consecutive_storage = 0
+        for i, line in enumerate(lines):
+            if storage_single_re.search(line):
+                consecutive_storage += 1
+            else:
+                if consecutive_storage >= 3:
+                    result["risks"].append({
+                        "type": "unbatched_storage_ops",
+                        "severity": "warning",
+                        "message": f"{consecutive_storage} sequential AsyncStorage calls -- use multiSet/multiGet instead",
+                        "line": i + 1 - consecutive_storage,
+                    })
+                consecutive_storage = 0
+
+        if not result["risks"]:
+            result["warnings"].append("No transaction risks detected")
+
+        return {"status": "ok", **result}
+
+    # ── get_domain_rules ──────────────────────────────────────────────
+    def get_domain_rules(self, file_path: str) -> Dict[str, Any]:
+        """Check RN domain rules: screen typing, component storage, hooks, native modules."""
+        base = self._project_path()
+        if not base:
+            return {"status": "error", "message": "No project path configured"}
+
+        full_path = os.path.join(base, file_path)
+        if not os.path.isfile(full_path):
+            return {"status": "error", "message": f"File not found: {file_path}"}
+
+        try:
+            with open(full_path, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read()
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+
+        result: Dict[str, Any] = {
+            "file": file_path,
+            "violations": [],
+            "suggestions": [],
+            "file_type": "unknown",
+        }
+
+        rel_lower = file_path.lower().replace("\\", "/")
+
+        is_screen = "screen" in rel_lower or bool(re.search(r'Screen\b', os.path.basename(file_path)))
+        is_component = ("component" in rel_lower) and not is_screen
+        is_hook = "hook" in rel_lower or bool(re.search(r'^use[A-Z]', os.path.basename(file_path)))
+        is_native_module = "native" in rel_lower or bool(re.search(r'NativeModules', content))
+
+        if is_screen:
+            result["file_type"] = "screen"
+            # Screens should have navigation typing
+            has_nav_typing = bool(re.search(
+                r'(?:StackScreenProps|NativeStackScreenProps|ScreenProps|NavigationProp|RouteProp)\s*<', content
+            ))
+            has_route_params = bool(re.search(r'route\.params', content))
+            if not has_nav_typing and has_route_params:
+                result["violations"].append({
+                    "rule": "screen_requires_navigation_typing",
+                    "severity": "warning",
+                    "message": "Screen uses route.params without typed navigation props",
+                })
+            elif not has_nav_typing:
+                result["suggestions"].append(
+                    "Consider adding typed navigation props (StackScreenProps<RootStackParamList>)"
+                )
+
+        if is_component:
+            result["file_type"] = "component"
+            # Components should not directly use AsyncStorage
+            if re.search(r'AsyncStorage', content):
+                result["violations"].append({
+                    "rule": "no_direct_async_storage_in_component",
+                    "severity": "warning",
+                    "message": "Component directly uses AsyncStorage -- move storage logic to a hook or service",
+                })
+
+        if is_hook:
+            result["file_type"] = "hook"
+            # Hooks with async operations should have error boundaries
+            has_async = bool(re.search(r'async\s|\.then\s*\(|await\s', content))
+            has_error_handling = bool(re.search(r'catch\s*\(|\.catch\s*\(|onError|setError|error\s*,', content))
+            if has_async and not has_error_handling:
+                result["violations"].append({
+                    "rule": "hook_requires_error_handling",
+                    "severity": "warning",
+                    "message": "Hook has async operations without error handling",
+                })
+
+        if is_native_module:
+            result["file_type"] = "native_module"
+            # Native modules should have platform checks
+            has_platform_check = bool(re.search(r'Platform\.(?:OS|select|Version)', content))
+            if not has_platform_check:
+                result["violations"].append({
+                    "rule": "native_module_requires_platform_check",
+                    "severity": "warning",
+                    "message": "Native module usage without Platform.OS check -- may crash on unsupported platform",
+                })
+
+        return {"status": "ok", **result}
+
+    # ── generate_test_skeleton ────────────────────────────────────────
+    def generate_test_skeleton(self, file_path: str, symbol: str) -> Dict[str, Any]:
+        """Generate Jest + @testing-library/react-native test skeleton."""
+        base = self._project_path()
+        if not base:
+            return {"status": "error", "message": "No project path configured"}
+
+        full_path = os.path.join(base, file_path)
+        if not os.path.isfile(full_path):
+            return {"status": "error", "message": f"File not found: {file_path}"}
+
+        try:
+            with open(full_path, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read()
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+
+        result: Dict[str, Any] = {
+            "file": file_path,
+            "symbol": symbol,
+            "test_code": "",
+            "test_type": "component",
+            "dependencies": [],
+        }
+
+        # Detect if it's a component, hook, or utility
+        is_hook = symbol.startswith("use") and symbol[3:4].isupper()
+        is_component = bool(re.search(
+            r'(?:export\s+(?:default\s+)?(?:function|const)\s+' + re.escape(symbol) + r'|'
+            r'class\s+' + re.escape(symbol) + r'\s+extends\s+(?:React\.)?(?:Component|PureComponent))',
+            content,
+        ))
+
+        # Extract props interface
+        props_re = re.compile(
+            r'(?:interface|type)\s+' + re.escape(symbol) + r'Props\s*[={]\s*\{?([^}]*)\}',
+            re.DOTALL,
+        )
+        props_match = props_re.search(content)
+        mock_props = ""
+        if props_match:
+            body = props_match.group(1)
+            prop_fields = re.findall(r'(\w+)\s*[?]?\s*:\s*([^;]+);', body)
+            for pname, ptype in prop_fields:
+                ptype = ptype.strip()
+                if "string" in ptype:
+                    mock_props += f"    {pname}: 'test-{pname}',\n"
+                elif "number" in ptype:
+                    mock_props += f"    {pname}: 1,\n"
+                elif "boolean" in ptype:
+                    mock_props += f"    {pname}: false,\n"
+                elif "()" in ptype or "=>" in ptype:
+                    mock_props += f"    {pname}: jest.fn(),\n"
+                else:
+                    mock_props += f"    {pname}: undefined as any,\n"
+
+        # Detect navigation usage
+        uses_navigation = bool(re.search(r'useNavigation|navigation\.navigate', content))
+        nav_mock = ""
+        if uses_navigation:
+            nav_mock = """
+jest.mock('@react-navigation/native', () => ({
+  useNavigation: () => ({
+    navigate: jest.fn(),
+    goBack: jest.fn(),
+  }),
+  useRoute: () => ({
+    params: {},
+  }),
+}));
+"""
+            result["dependencies"].append("@react-navigation/native")
+
+        import_path = file_path.replace(".tsx", "").replace(".ts", "").replace(".jsx", "").replace(".js", "")
+        import_path = f"../{import_path}" if not import_path.startswith(".") else import_path
+
+        if is_hook:
+            result["test_type"] = "hook"
+            result["test_code"] = f"""import {{ renderHook, act, waitFor }} from '@testing-library/react-native';
+import {{ {symbol} }} from '{import_path}';
+{nav_mock}
+describe('{symbol}', () => {{
+  it('should return initial state', () => {{
+    const {{ result }} = renderHook(() => {symbol}());
+    expect(result.current).toBeDefined();
+  }});
+
+  it('should handle updates', async () => {{
+    const {{ result }} = renderHook(() => {symbol}());
+
+    await act(async () => {{
+      // trigger state change
+    }});
+
+    await waitFor(() => {{
+      expect(result.current).toBeDefined();
+    }});
+  }});
+
+  it('should handle errors gracefully', async () => {{
+    const {{ result }} = renderHook(() => {symbol}());
+    // Verify error state
+    expect(result.current).toBeDefined();
+  }});
+}});
+"""
+        elif is_component:
+            result["test_type"] = "component"
+            props_block = f"""const defaultProps = {{
+{mock_props}}};
+""" if mock_props else ""
+            props_arg = "{{...defaultProps}}" if mock_props else ""
+            result["test_code"] = f"""import React from 'react';
+import {{ render, fireEvent, waitFor }} from '@testing-library/react-native';
+import {{ {symbol} }} from '{import_path}';
+{nav_mock}
+{props_block}
+describe('{symbol}', () => {{
+  it('should render correctly', () => {{
+    const {{ toJSON }} = render(<{symbol} {props_arg} />);
+    expect(toJSON()).toBeTruthy();
+  }});
+
+  it('should handle user interaction', () => {{
+    const {{ getByTestId }} = render(<{symbol} {props_arg} />);
+    // fireEvent.press(getByTestId('button-id'));
+  }});
+
+  it('should update on prop changes', async () => {{
+    const {{ rerender }} = render(<{symbol} {props_arg} />);
+    // rerender(<{symbol} {{...defaultProps, someProp: 'new'}} />);
+    await waitFor(() => {{
+      // assert new state
+    }});
+  }});
+}});
+"""
+        else:
+            result["test_type"] = "utility"
+            result["test_code"] = f"""import {{ {symbol} }} from '{import_path}';
+
+describe('{symbol}', () => {{
+  it('should work with valid input', () => {{
+    const result = {symbol}();
+    expect(result).toBeDefined();
+  }});
+
+  it('should handle edge cases', () => {{
+    expect(() => {symbol}()).not.toThrow();
+  }});
+}});
+"""
+
+        return {"status": "ok", **result}
+
+    # ── match_view_guards ─────────────────────────────────────────────
+    def match_view_guards(self, file_path: str, symbol: str) -> Dict[str, Any]:
+        """Match navigation auth guards with conditional screen renders and auth state."""
+        base = self._project_path()
+        if not base:
+            return {"status": "error", "message": "No project path configured"}
+
+        full_path = os.path.join(base, file_path)
+        if not os.path.isfile(full_path):
+            return {"status": "error", "message": f"File not found: {file_path}"}
+
+        try:
+            with open(full_path, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read()
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+
+        result: Dict[str, Any] = {
+            "file": file_path,
+            "symbol": symbol,
+            "auth_guards": [],
+            "conditional_renders": [],
+            "auth_providers": [],
+            "mismatches": [],
+            "warnings": [],
+        }
+
+        # Detect navigation auth guards
+        nav_guard_patterns = [
+            (r'isAuthenticated\s*\?\s*', "isAuthenticated_ternary"),
+            (r'isLoggedIn\s*\?\s*', "isLoggedIn_ternary"),
+            (r'(?:user|token|auth)\s*\?\s*<\s*\w+\.Navigator', "auth_navigator_guard"),
+            (r'if\s*\(\s*!(?:isAuthenticated|isLoggedIn|user|token)', "auth_redirect_guard"),
+        ]
+        for pattern, guard_type in nav_guard_patterns:
+            matches = list(re.finditer(pattern, content))
+            for m in matches:
+                line_no = content[:m.start()].count("\n") + 1
+                result["auth_guards"].append({
+                    "type": guard_type, "line": line_no,
+                })
+
+        # Detect conditional screen rendering
+        cond_screen_re = re.compile(
+            r'(?:isAuthenticated|isLoggedIn|user|token|auth)\s*(?:&&|\?)\s*.*?<\s*(?:Stack|Tab|Drawer)\.Screen',
+            re.DOTALL,
+        )
+        for m in cond_screen_re.finditer(content):
+            line_no = content[:m.start()].count("\n") + 1
+            result["conditional_renders"].append({
+                "type": "conditional_screen", "line": line_no,
+                "code": m.group(0)[:80],
+            })
+
+        # Scan for auth context/provider patterns across project
+        auth_state_vars: Set[str] = set()
+        src_dir = os.path.join(base, "src")
+        scan_dirs = [src_dir] if os.path.isdir(src_dir) else [base]
+        for scan_dir in scan_dirs:
+            for root, _, files in os.walk(scan_dir):
+                if "node_modules" in root:
+                    continue
+                for fname in files:
+                    if not fname.endswith((".ts", ".tsx", ".js", ".jsx")):
+                        continue
+                    fpath = os.path.join(root, fname)
+                    try:
+                        with open(fpath, "r", encoding="utf-8", errors="replace") as f:
+                            fcontent = f.read()
+                    except Exception:
+                        continue
+
+                    # Auth provider/context definitions
+                    provider_re = re.compile(
+                        r'(?:export\s+)?(?:const|function)\s+(Auth\w*(?:Provider|Context))',
+                    )
+                    for pm in provider_re.finditer(fcontent):
+                        result["auth_providers"].append({
+                            "name": pm.group(1),
+                            "file": os.path.relpath(fpath, base),
+                        })
+
+                    # Auth state variables
+                    auth_var_re = re.compile(
+                        r'(?:const|let)\s+\[?\s*(isAuthenticated|isLoggedIn|authState|user|token)',
+                    )
+                    for av in auth_var_re.finditer(fcontent):
+                        auth_state_vars.add(av.group(1))
+
+        # Check for mismatches
+        has_guard = len(result["auth_guards"]) > 0
+        has_conditional = len(result["conditional_renders"]) > 0
+        has_provider = len(result["auth_providers"]) > 0
+
+        if has_guard and not has_provider:
+            result["mismatches"].append({
+                "type": "guard_without_provider",
+                "message": "Auth guard found but no AuthProvider/AuthContext detected in project",
+            })
+
+        if has_conditional and not has_guard:
+            result["mismatches"].append({
+                "type": "conditional_render_without_guard",
+                "message": "Conditional screen rendering found but no navigation-level auth guard",
+            })
+
+        if not has_guard and not has_conditional:
+            result["warnings"].append("No auth guards or conditional renders detected in this file")
+
+        return {"status": "ok", **result}

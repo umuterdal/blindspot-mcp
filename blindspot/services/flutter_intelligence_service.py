@@ -2402,3 +2402,640 @@ class FlutterIntelligenceService(BaseService):
                 f"Model '{model_name}' is used in {len(repo_usages)} repository files. "
                 "Check data layer compatibility."
             )
+
+    # ── verify_schema ────────────────────────────────────────────────
+
+    def verify_schema(self, model_name: str, fields: list) -> Dict[str, Any]:
+        """Verify Dart model class fields and fromJson/toJson field mappings."""
+        base = self._get_project_path()
+        if not base:
+            return {"status": "error", "message": "Project path not set"}
+
+        result: Dict[str, Any] = {
+            "model": model_name,
+            "expected_fields": fields,
+            "class_fields": [],
+            "from_json_fields": [],
+            "to_json_fields": [],
+            "mismatches": [],
+        }
+
+        dart_files = self._collect_dart_files(base, ["lib"])
+
+        class_pattern = re.compile(
+            rf"class\s+{re.escape(model_name)}\b[^{{]*\{{(.*?)\n\}}",
+            re.DOTALL,
+        )
+        # Dart field: final Type name; or Type name; or Type? name;
+        field_pattern = re.compile(
+            r"(?:final\s+)?(?:\w+[?]?\s+)(\w+)\s*;",
+        )
+
+        for fpath, rel in dart_files:
+            content = self._read_file(fpath)
+            if not content:
+                continue
+
+            cm = class_pattern.search(content)
+            if not cm:
+                continue
+
+            body = cm.group(1)
+
+            # Extract class fields
+            for fm in field_pattern.finditer(body):
+                fname = fm.group(1)
+                if not fname.startswith("_") and fname not in result["class_fields"]:
+                    result["class_fields"].append(fname)
+
+            # Extract constructor named params as fields too
+            constructor_match = re.search(
+                rf"{re.escape(model_name)}\s*\(\s*\{{(.*?)\}}\s*\)",
+                body, re.DOTALL,
+            )
+            if constructor_match:
+                ctor_body = constructor_match.group(1)
+                ctor_fields = re.findall(r"(?:required\s+)?(?:this\.)?(\w+)", ctor_body)
+                for cf in ctor_fields:
+                    if cf not in result["class_fields"] and cf not in ("required", "super", "key"):
+                        result["class_fields"].append(cf)
+
+            # Extract fromJson field mappings
+            from_json_match = re.search(
+                rf"(?:factory\s+)?{re.escape(model_name)}\.fromJson\s*\([^)]*\)\s*(?:=>|:|\{{)(.*?)(?:\}}\s*;|\);)",
+                body, re.DOTALL,
+            )
+            if from_json_match:
+                fj_body = from_json_match.group(1)
+                # json['field'] or json["field"] or map['field']
+                json_keys = re.findall(r"(?:json|map|data)\s*\[\s*['\"](\w+)['\"]\s*\]", fj_body)
+                result["from_json_fields"] = list(dict.fromkeys(json_keys))
+
+            # Extract toJson field mappings
+            to_json_match = re.search(
+                r"(?:Map<String,\s*dynamic>|Map)\s+toJson\s*\(\s*\)\s*(?:=>|{)(.*?)(?:};|;)",
+                body, re.DOTALL,
+            )
+            if to_json_match:
+                tj_body = to_json_match.group(1)
+                json_keys = re.findall(r"['\"](\w+)['\"]\s*:", tj_body)
+                result["to_json_fields"] = list(dict.fromkeys(json_keys))
+
+        # Check mismatches
+        expected_set = set(fields)
+        class_set = set(result["class_fields"])
+        fj_set = set(result["from_json_fields"])
+        tj_set = set(result["to_json_fields"])
+
+        for field in fields:
+            if class_set and field not in class_set:
+                result["mismatches"].append({
+                    "field": field, "issue": "missing_in_class",
+                    "message": f"Field '{field}' not found in class definition",
+                })
+            if fj_set and field not in fj_set:
+                result["mismatches"].append({
+                    "field": field, "issue": "missing_in_from_json",
+                    "message": f"Field '{field}' not mapped in fromJson",
+                })
+            if tj_set and field not in tj_set:
+                result["mismatches"].append({
+                    "field": field, "issue": "missing_in_to_json",
+                    "message": f"Field '{field}' not mapped in toJson",
+                })
+
+        # Cross-check fromJson vs toJson
+        if fj_set and tj_set:
+            for fj_field in fj_set - tj_set:
+                result["mismatches"].append({
+                    "field": fj_field, "issue": "in_from_json_not_to_json",
+                    "message": f"Field '{fj_field}' is in fromJson but missing from toJson",
+                })
+            for tj_field in tj_set - fj_set:
+                result["mismatches"].append({
+                    "field": tj_field, "issue": "in_to_json_not_from_json",
+                    "message": f"Field '{tj_field}' is in toJson but missing from fromJson",
+                })
+
+        result["status"] = "ok" if not result["mismatches"] else "mismatches_found"
+        return result
+
+    # ── detect_transaction_risks ─────────────────────────────────────
+
+    def detect_transaction_risks(self, file_path: str) -> Dict[str, Any]:
+        """Detect missing database transactions in repository methods with multiple writes."""
+        base = self._get_project_path()
+        if not base:
+            return {"status": "error", "message": "Project path not set"}
+
+        full_path = os.path.join(base, file_path) if not os.path.isabs(file_path) else file_path
+        if not os.path.isfile(full_path):
+            return {"status": "error", "message": f"File not found: {file_path}"}
+
+        content = self._read_file(full_path)
+        if not content:
+            return {"status": "error", "message": "Could not read file"}
+
+        risks: List[Dict[str, Any]] = []
+
+        # Find method boundaries
+        method_pattern = re.compile(
+            r"(?:Future<[^>]*>|void|Future)\s+(\w+)\s*\([^)]*\)\s*(?:async\s*)?\{",
+        )
+        methods = list(method_pattern.finditer(content))
+
+        for idx, mm in enumerate(methods):
+            method_name = mm.group(1)
+            start = mm.start()
+            end = methods[idx + 1].start() if idx + 1 < len(methods) else len(content)
+            body = content[start:end]
+
+            # Count DB write operations
+            db_writes = re.findall(
+                r"(?:db|database|_db|dao)\s*\.\s*(?:insert|update|delete|rawInsert|rawUpdate|rawDelete|execute|batch)\s*\(",
+                body,
+            )
+            # Also check for sqflite-style operations
+            sqflite_writes = re.findall(
+                r"(?:insert|update|delete|rawInsert|rawUpdate|rawDelete)\s*\(\s*['\"]",
+                body,
+            )
+            # Drift/Moor style
+            drift_writes = re.findall(
+                r"(?:into|update|deleteWhere|customInsert|customUpdate)\s*\(\s*",
+                body,
+            )
+
+            total_writes = len(db_writes) + len(sqflite_writes) + len(drift_writes)
+
+            if total_writes >= 2:
+                has_transaction = bool(re.search(
+                    r"(?:\.transaction\s*\(|batch\s*\(\s*\(|\.batch\s*\(|runInTransaction)",
+                    body,
+                ))
+                if not has_transaction:
+                    line_num = content[:start].count("\n") + 1
+                    risks.append({
+                        "method": method_name,
+                        "line": line_num,
+                        "write_operations": total_writes,
+                        "risk": "multiple_writes_without_transaction",
+                        "message": f"Method '{method_name}' has {total_writes} DB write operations without a transaction",
+                        "suggestion": "Wrap in db.transaction(() async { ... }) or use batch operations",
+                    })
+
+            # Check for await inside loops (N+1 risk)
+            loop_await = re.findall(
+                r"(?:for|while)\s*\([^)]*\)\s*\{[^}]*await\s+.*?(?:insert|update|delete|rawInsert|rawUpdate|rawDelete)\s*\(",
+                body, re.DOTALL,
+            )
+            if loop_await:
+                line_num = content[:start].count("\n") + 1
+                risks.append({
+                    "method": method_name,
+                    "line": line_num,
+                    "risk": "db_writes_in_loop",
+                    "message": f"Method '{method_name}' has DB write operations inside a loop -- use batch operations",
+                    "suggestion": "Use db.batch() or collect operations and execute in a single transaction",
+                })
+
+        return {"status": "ok", "file": file_path, "risks": risks, "total_risks": len(risks)}
+
+    # ── get_domain_rules ─────────────────────────────────────────────
+
+    def get_domain_rules(self, file_path: str) -> Dict[str, Any]:
+        """Check Flutter domain-specific rules for file types."""
+        base = self._get_project_path()
+        if not base:
+            return {"status": "error", "message": "Project path not set"}
+
+        full_path = os.path.join(base, file_path) if not os.path.isabs(file_path) else file_path
+        if not os.path.isfile(full_path):
+            return {"status": "error", "message": f"File not found: {file_path}"}
+
+        content = self._read_file(full_path)
+        if not content:
+            return {"status": "error", "message": "Could not read file"}
+
+        violations: List[Dict[str, Any]] = []
+        file_type = "unknown"
+        rel_path = os.path.relpath(full_path, base) if base else file_path
+
+        # Detect file type from content and path
+        is_screen = bool(re.search(
+            r"(?:Screen|Page|View)\s*extends\s*(?:Stateful|Stateless)Widget",
+            content,
+        )) or re.search(r"(?:screens?|pages?|views?)/", rel_path, re.IGNORECASE)
+
+        is_bloc = bool(re.search(r"extends\s+(?:Bloc|Cubit)\b", content))
+        is_repo = bool(re.search(r"(?:repository|repo)/", rel_path, re.IGNORECASE)) or \
+                  bool(re.search(r"class\s+\w*Repository\b", content))
+        is_provider = bool(re.search(
+            r"(?:extends\s+ChangeNotifier|StateNotifier|@riverpod|final\s+\w+Provider\s*=)",
+            content,
+        ))
+
+        if is_screen:
+            file_type = "screen"
+            # Rule: screens with StatefulWidget require dispose cleanup
+            stateful_classes = re.finditer(
+                r"class\s+_(\w+State)\s+extends\s+State<\w+>\s*\{(.*?)(?=\nclass\s|\Z)",
+                content, re.DOTALL,
+            )
+            for sm in stateful_classes:
+                state_name = sm.group(1)
+                state_body = sm.group(2)
+
+                # Check for controllers/subscriptions without dispose
+                controllers = re.findall(
+                    r"(?:TextEditingController|ScrollController|AnimationController|TabController|FocusNode|StreamSubscription)\s+",
+                    state_body,
+                )
+                has_dispose = bool(re.search(r"@override\s*\n\s*void\s+dispose\s*\(", state_body))
+
+                if controllers and not has_dispose:
+                    violations.append({
+                        "rule": "screen_requires_dispose",
+                        "severity": "error",
+                        "class": state_name,
+                        "controllers": len(controllers),
+                        "message": f"State class '{state_name}' has {len(controllers)} controller(s) but no dispose() override -- memory leak risk",
+                    })
+
+        elif is_bloc:
+            file_type = "bloc"
+            # Rule: BLoC/Cubit must have error states
+            bloc_classes = re.finditer(
+                r"class\s+(\w+)\s+extends\s+(?:Bloc|Cubit)<(\w+)>\s*\{(.*?)(?=\nclass\s|\Z)",
+                content, re.DOTALL,
+            )
+            for bm in bloc_classes:
+                bloc_name = bm.group(1)
+                state_type = bm.group(2)
+                bloc_body = bm.group(3)
+
+                # Check if error state is emitted
+                has_error_emit = bool(re.search(
+                    r"emit\s*\(\s*\w*(?:Error|Failure|Failed)\w*\s*\(",
+                    bloc_body,
+                ))
+                has_try_catch = "try" in bloc_body and "catch" in bloc_body
+
+                if not has_error_emit:
+                    violations.append({
+                        "rule": "bloc_requires_error_state",
+                        "severity": "warning",
+                        "class": bloc_name,
+                        "message": f"BLoC '{bloc_name}' never emits an error state -- add error handling with error state emission",
+                    })
+                if not has_try_catch:
+                    violations.append({
+                        "rule": "bloc_requires_try_catch",
+                        "severity": "warning",
+                        "class": bloc_name,
+                        "message": f"BLoC '{bloc_name}' lacks try-catch blocks -- async operations should handle exceptions",
+                    })
+
+        elif is_repo:
+            file_type = "repository"
+            # Rule: repository methods require try-catch
+            method_pattern = re.compile(
+                r"(?:Future<[^>]*>|Stream<[^>]*>)\s+(\w+)\s*\([^)]*\)\s*(?:async\s*)?\{(.*?)(?=\n\s*(?:Future|Stream|void|static|@|\}))",
+                content, re.DOTALL,
+            )
+            for mm in method_pattern.finditer(content):
+                method_name = mm.group(1)
+                method_body = mm.group(2)
+                if method_name.startswith("_"):
+                    continue
+                if "try" not in method_body or "catch" not in method_body:
+                    violations.append({
+                        "rule": "repository_requires_try_catch",
+                        "severity": "warning",
+                        "method": method_name,
+                        "message": f"Repository method '{method_name}' lacks try-catch -- network/DB errors will propagate unhandled",
+                    })
+
+        elif is_provider:
+            file_type = "provider"
+            # Rule: providers require error handling
+            provider_methods = re.finditer(
+                r"(?:Future<[^>]*>|void)\s+(\w+)\s*\([^)]*\)\s*(?:async\s*)?\{(.*?)(?=\n\s*(?:Future|void|static|@|\}))",
+                content, re.DOTALL,
+            )
+            for pm in provider_methods.finditer(content) if hasattr(provider_methods, 'finditer') else provider_methods:
+                method_name = pm.group(1)
+                method_body = pm.group(2)
+                if method_name.startswith("_"):
+                    continue
+                has_error_handling = "try" in method_body and "catch" in method_body
+                has_error_state = bool(re.search(r"(?:state\s*=|_error|hasError|errorMessage)", method_body))
+                if not has_error_handling:
+                    violations.append({
+                        "rule": "provider_requires_error_handling",
+                        "severity": "warning",
+                        "method": method_name,
+                        "message": f"Provider method '{method_name}' lacks error handling -- wrap in try-catch and update error state",
+                    })
+
+        return {
+            "status": "ok",
+            "file": file_path,
+            "file_type": file_type,
+            "violations": violations,
+            "total_violations": len(violations),
+        }
+
+    # ── generate_test_skeleton ───────────────────────────────────────
+
+    def generate_test_skeleton(self, file_path: str, symbol: str) -> Dict[str, Any]:
+        """Generate Flutter test skeleton: widget test, unit test, or mock setup."""
+        base = self._get_project_path()
+        if not base:
+            return {"status": "error", "message": "Project path not set"}
+
+        full_path = os.path.join(base, file_path) if not os.path.isabs(file_path) else file_path
+        if not os.path.isfile(full_path):
+            return {"status": "error", "message": f"File not found: {file_path}"}
+
+        content = self._read_file(full_path)
+        if not content:
+            return {"status": "error", "message": "Could not read file"}
+
+        result: Dict[str, Any] = {"file": file_path, "symbol": symbol, "skeleton": "", "test_type": "unknown"}
+        rel_path = os.path.relpath(full_path, base) if base else file_path
+        import_path = rel_path.replace("lib/", "").replace(os.sep, "/")
+        package_name = "app"  # default
+
+        # Try to get package name from pubspec
+        pubspec_path = os.path.join(base, "pubspec.yaml")
+        if os.path.isfile(pubspec_path):
+            pubspec = self._read_file(pubspec_path) or ""
+            pkg_match = re.search(r"^name:\s*(\S+)", pubspec, re.MULTILINE)
+            if pkg_match:
+                package_name = pkg_match.group(1)
+
+        # Check if symbol is a widget
+        is_widget = bool(re.search(
+            rf"class\s+{re.escape(symbol)}\s+extends\s+(?:Stateless|Stateful|HookWidget|Consumer)Widget",
+            content,
+        ))
+        is_bloc = bool(re.search(rf"class\s+{re.escape(symbol)}\s+extends\s+(?:Bloc|Cubit)", content))
+
+        # Extract constructor params for the widget
+        ctor_params = []
+        ctor_match = re.search(
+            rf"(?:const\s+)?{re.escape(symbol)}\s*\(\s*\{{([^}}]*)\}}\s*\)",
+            content, re.DOTALL,
+        )
+        if ctor_match:
+            raw_params = ctor_match.group(1)
+            ctor_params = re.findall(r"(?:required\s+)?(?:this\.)?(\w+)", raw_params)
+            ctor_params = [p for p in ctor_params if p not in ("required", "super", "key", "Key")]
+
+        # Extract dependencies (constructor injections for non-widgets)
+        deps = re.findall(
+            rf"(?:final\s+)?(\w+Repository|\w+Service|\w+UseCase|\w+Api|\w+Client)\s+(?:_)?(\w+)\s*;",
+            content,
+        )
+
+        if is_widget:
+            result["test_type"] = "widget"
+            props_str = ", ".join(f"{p}: TODO" for p in ctor_params[:6]) if ctor_params else ""
+            mock_setup = ""
+            if deps:
+                mock_classes = "\n".join(f"class Mock{d[0]} extends Mock implements {d[0]} {{}}" for d in deps)
+                mock_vars = "\n".join(f"  late Mock{d[0]} mock{d[0]};" for d in deps)
+                mock_inits = "\n".join(f"    mock{d[0]} = Mock{d[0]}();" for d in deps)
+                mock_setup = f"\n{mock_classes}\n"
+
+            result["skeleton"] = (
+                f"import 'package:flutter_test/flutter_test.dart';\n"
+                f"import 'package:mockito/mockito.dart';\n"
+                f"import 'package:{package_name}/{import_path}';\n"
+                f"{mock_setup}\n"
+                f"void main() {{\n"
+                f"  group('{symbol}', () {{\n"
+                f"    testWidgets('should render successfully', (WidgetTester tester) async {{\n"
+                f"      await tester.pumpWidget(\n"
+                f"        MaterialApp(home: {symbol}({props_str})),\n"
+                f"      );\n"
+                f"      expect(find.byType({symbol}), findsOneWidget);\n"
+                f"    }});\n\n"
+                f"    testWidgets('should display expected content', (WidgetTester tester) async {{\n"
+                f"      await tester.pumpWidget(\n"
+                f"        MaterialApp(home: {symbol}({props_str})),\n"
+                f"      );\n"
+                f"      // TODO: Add specific widget content assertions\n"
+                f"      await tester.pump();\n"
+                f"    }});\n"
+                f"  }});\n"
+                f"}}\n"
+            )
+
+        elif is_bloc:
+            result["test_type"] = "bloc"
+            # Find state type and events
+            bloc_match = re.search(
+                rf"class\s+{re.escape(symbol)}\s+extends\s+(?:Bloc|Cubit)<(\w+)>",
+                content,
+            )
+            state_type = bloc_match.group(1) if bloc_match else "dynamic"
+            events = re.findall(r"on<(\w+)>\s*\(", content)
+
+            mock_classes = "\n".join(f"class Mock{d[0]} extends Mock implements {d[0]} {{}}" for d in deps)
+            mock_vars = "\n".join(f"  late Mock{d[0]} mock{d[0]};" for d in deps)
+            mock_inits = "\n".join(f"    mock{d[0]} = Mock{d[0]}();" for d in deps)
+
+            event_tests = "\n\n".join(
+                f"    test('should handle {e}', () {{\n"
+                f"      // TODO: stub dependencies\n"
+                f"      bloc.add({e}());\n"
+                f"      // TODO: expectLater with emitsInOrder\n"
+                f"    }});"
+                for e in events[:5]
+            )
+
+            result["skeleton"] = (
+                f"import 'package:flutter_test/flutter_test.dart';\n"
+                f"import 'package:bloc_test/bloc_test.dart';\n"
+                f"import 'package:mockito/mockito.dart';\n"
+                f"import 'package:{package_name}/{import_path}';\n\n"
+                f"{mock_classes}\n\n"
+                f"void main() {{\n"
+                f"  group('{symbol}', () {{\n"
+                f"{mock_vars}\n"
+                f"    late {symbol} bloc;\n\n"
+                f"    setUp(() {{\n"
+                f"{mock_inits}\n"
+                f"      bloc = {symbol}({', '.join(f'mock{d[0]}' for d in deps)});\n"
+                f"    }});\n\n"
+                f"    tearDown(() => bloc.close());\n\n"
+                f"    test('initial state is correct', () {{\n"
+                f"      expect(bloc.state, isA<{state_type}>());\n"
+                f"    }});\n\n"
+                f"{event_tests}\n"
+                f"  }});\n"
+                f"}}\n"
+            )
+        else:
+            result["test_type"] = "unit"
+            mock_classes = "\n".join(f"class Mock{d[0]} extends Mock implements {d[0]} {{}}" for d in deps)
+            mock_vars = "\n".join(f"  late Mock{d[0]} mock{d[0]};" for d in deps)
+            mock_inits = "\n".join(f"    mock{d[0]} = Mock{d[0]}();" for d in deps)
+            ctor_args = ", ".join(f"mock{d[0]}" for d in deps) if deps else ""
+
+            result["skeleton"] = (
+                f"import 'package:flutter_test/flutter_test.dart';\n"
+                f"import 'package:mockito/mockito.dart';\n"
+                f"import 'package:{package_name}/{import_path}';\n\n"
+                f"{mock_classes}\n\n"
+                f"void main() {{\n"
+                f"  group('{symbol}', () {{\n"
+                f"{mock_vars}\n"
+                f"    late {symbol} sut;\n\n"
+                f"    setUp(() {{\n"
+                f"{mock_inits}\n"
+                f"      sut = {symbol}({ctor_args});\n"
+                f"    }});\n\n"
+                f"    test('should be created', () {{\n"
+                f"      expect(sut, isNotNull);\n"
+                f"    }});\n\n"
+                f"    // TODO: Add specific method tests\n"
+                f"  }});\n"
+                f"}}\n"
+            )
+
+        result["status"] = "ok"
+        return result
+
+    # ── match_view_guards ────────────────────────────────────────────
+
+    def match_view_guards(self, file_path: str, symbol: str) -> Dict[str, Any]:
+        """Match route guard redirects to widget conditional builds and provider auth state checks."""
+        base = self._get_project_path()
+        if not base:
+            return {"status": "error", "message": "Project path not set"}
+
+        full_path = os.path.join(base, file_path) if not os.path.isabs(file_path) else file_path
+        if not os.path.isfile(full_path):
+            return {"status": "error", "message": f"File not found: {file_path}"}
+
+        content = self._read_file(full_path)
+        if not content:
+            return {"status": "error", "message": "Could not read file"}
+
+        result: Dict[str, Any] = {
+            "file": file_path,
+            "symbol": symbol,
+            "route_guards": [],
+            "widget_guards": [],
+            "provider_guards": [],
+            "unmatched": [],
+        }
+
+        rel_path = os.path.relpath(full_path, base) if base else file_path
+
+        # Check for route guard redirects in router configuration
+        # GoRouter redirect pattern
+        redirect_matches = re.findall(
+            r"redirect\s*:\s*\([^)]*\)\s*(?:=>)?\s*\{?(.*?)(?:\}|,\s*(?:routes|path|name|builder))",
+            content, re.DOTALL,
+        )
+        for rm in redirect_matches:
+            auth_checks = re.findall(
+                r"(?:isAuth|isLoggedIn|token|currentUser|authState|isSignedIn|user)\s*(?:==|!=|\?\?|\.)",
+                rm, re.IGNORECASE,
+            )
+            for ac in auth_checks:
+                result["route_guards"].append({
+                    "type": "route_redirect",
+                    "check": ac.strip()[:60],
+                    "file": rel_path,
+                })
+
+        # AutoRoute guard pattern
+        auto_route_guards = re.findall(
+            r"class\s+(\w*(?:Auth|Guard)\w*)\s+extends\s+AutoRouteGuard\s*\{(.*?)(?=\nclass\s|\Z)",
+            content, re.DOTALL,
+        )
+        for guard_name, guard_body in auto_route_guards:
+            result["route_guards"].append({
+                "type": "auto_route_guard",
+                "class": guard_name,
+                "file": rel_path,
+            })
+
+        # Navigator guard pattern
+        nav_guards = re.findall(
+            r"(?:onGenerateRoute|MaterialPageRoute|pushNamed|pushReplacement).*?(?:isAuth|isLoggedIn|token|currentUser)",
+            content, re.IGNORECASE | re.DOTALL,
+        )
+        for ng in nav_guards:
+            result["route_guards"].append({
+                "type": "navigator_guard",
+                "detail": ng.strip()[:60],
+                "file": rel_path,
+            })
+
+        # Scan widget files for conditional builds based on auth
+        dart_files = self._collect_dart_files(base, ["lib"])
+
+        for fpath, drel in dart_files:
+            dart_content = self._read_file(fpath)
+            if not dart_content:
+                continue
+
+            # Look for conditional widget builds based on auth
+            auth_if_builds = re.findall(
+                r"(?:if\s*\(\s*|(?:case|when)\s+)(?:[\w.]*(?:isAuth|isLoggedIn|token|currentUser|authState|isSignedIn|user|role|permission)[\w.]*)\s*(?:[!=]==?|\.|\?\.)",
+                dart_content, re.IGNORECASE,
+            )
+            for ab in auth_if_builds:
+                result["widget_guards"].append({
+                    "file": drel,
+                    "condition": ab.strip()[:80],
+                    "type": "conditional_build",
+                })
+
+            # Look for ternary auth checks in build methods
+            ternary_auth = re.findall(
+                r"(?:[\w.]*(?:isAuth|isLoggedIn|currentUser|authState|isSignedIn)[\w.]*)\s*\?\s*\w+",
+                dart_content, re.IGNORECASE,
+            )
+            for ta in ternary_auth:
+                result["widget_guards"].append({
+                    "file": drel,
+                    "condition": ta.strip()[:80],
+                    "type": "ternary_auth_check",
+                })
+
+            # Check for provider/BLoC auth state consumption
+            provider_auth = re.findall(
+                r"(?:context\.(?:read|watch|select)|ref\.(?:read|watch)|BlocBuilder|BlocListener)\s*[<(]\s*(\w*(?:Auth|Login|Session)\w*)",
+                dart_content, re.IGNORECASE,
+            )
+            for pa in provider_auth:
+                result["provider_guards"].append({
+                    "file": drel,
+                    "provider": pa,
+                    "type": "provider_auth_consumption",
+                })
+
+        # Identify unmatched guards
+        has_route = bool(result["route_guards"])
+        has_widget = bool(result["widget_guards"]) or bool(result["provider_guards"])
+
+        if has_route and not has_widget:
+            result["unmatched"].append({
+                "severity": "warning",
+                "message": "Route guards exist but no matching conditional widget builds found -- consider showing/hiding UI based on auth state",
+            })
+        if has_widget and not has_route:
+            result["unmatched"].append({
+                "severity": "error",
+                "message": "Widget auth conditionals exist but no route guard found -- unauthorized users may access protected screens",
+            })
+
+        result["status"] = "ok"
+        return result

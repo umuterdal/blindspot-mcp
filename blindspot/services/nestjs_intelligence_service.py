@@ -1802,3 +1802,518 @@ class NestJSIntelligenceService(BaseService):
         result["files_affected"] = len(result["references"])
 
         return {"status": "ok", **result}
+
+    # ------------------------------------------------------------------ #
+    #  verify_schema / detect_transaction_risks / get_domain_rules /      #
+    #  generate_test_skeleton / match_view_guards                         #
+    # ------------------------------------------------------------------ #
+
+    def verify_schema(self, table_or_model: str, columns: list) -> Dict[str, Any]:
+        """
+        Verify that columns/fields exist in entity or Prisma schema definitions.
+
+        Checks TypeORM @Entity @Column decorators and/or prisma/schema.prisma.
+        Returns missing columns.
+        """
+        base = self._get_project_path()
+        if not base:
+            return {"status": "error", "message": "Project path not set"}
+
+        found_columns: Set[str] = set()
+        source_files: List[str] = []
+
+        # Strategy 1: Check TypeORM entity files in src/
+        src_dir = os.path.join(base, "src")
+        if os.path.isdir(src_dir):
+            entity_pattern = re.compile(
+                rf"class\s+{re.escape(table_or_model)}\s*(?:extends\s+\w+\s*)?\{{(.*?)\}}",
+                re.DOTALL,
+            )
+            column_decorator = re.compile(
+                r"@(?:Column|PrimaryColumn|PrimaryGeneratedColumn|CreateDateColumn|"
+                r"UpdateDateColumn|DeleteDateColumn|VersionColumn|Generated)\s*\([^)]*\)\s*"
+                r"(\w+)\s*[!?]?\s*:",
+            )
+            for root, _dirs, files in os.walk(src_dir):
+                for fname in files:
+                    if not fname.endswith(".ts"):
+                        continue
+                    fpath = os.path.join(root, fname)
+                    try:
+                        with open(fpath, "r", encoding="utf-8", errors="replace") as f:
+                            content = f.read()
+                    except Exception:
+                        continue
+
+                    if "@Entity" not in content:
+                        continue
+
+                    for em in entity_pattern.finditer(content):
+                        entity_body = em.group(1)
+                        for cm in column_decorator.finditer(entity_body):
+                            found_columns.add(cm.group(1))
+                        # Also grab plain property declarations that follow decorators
+                        prop_pattern = re.compile(r"@\w+\([^)]*\)\s*\n\s*(\w+)\s*[!?]?\s*:")
+                        for pm in prop_pattern.finditer(entity_body):
+                            found_columns.add(pm.group(1))
+                        source_files.append(os.path.relpath(fpath, base))
+
+        # Strategy 2: Check Prisma schema
+        prisma_path = os.path.join(base, "prisma", "schema.prisma")
+        if os.path.isfile(prisma_path):
+            try:
+                with open(prisma_path, "r", encoding="utf-8", errors="replace") as f:
+                    prisma_content = f.read()
+                model_pattern = re.compile(
+                    rf"model\s+{re.escape(table_or_model)}\s*\{{([^}}]*)\}}",
+                    re.DOTALL | re.IGNORECASE,
+                )
+                mm = model_pattern.search(prisma_content)
+                if mm:
+                    for line in mm.group(1).split("\n"):
+                        line = line.strip()
+                        if not line or line.startswith("//") or line.startswith("@@"):
+                            continue
+                        fm = re.match(r"(\w+)\s+", line)
+                        if fm:
+                            found_columns.add(fm.group(1))
+                    source_files.append("prisma/schema.prisma")
+            except Exception:
+                pass
+
+        found = [c for c in columns if c in found_columns]
+        missing = [c for c in columns if c not in found_columns]
+
+        return {
+            "status": "ok",
+            "entity": table_or_model,
+            "found": found,
+            "missing": missing,
+            "all_schema_fields": sorted(found_columns),
+            "source_files": source_files,
+        }
+
+    def detect_transaction_risks(self, file_path: str) -> Dict[str, Any]:
+        """
+        Detect transaction / atomicity risks in a NestJS file.
+
+        Looks for missing @Transaction decorator, QueryRunner not used
+        for multi-write operations, and cache calls inside transactions.
+        """
+        base = self._get_project_path()
+        if not base:
+            return {"status": "error", "message": "Project path not set"}
+
+        full_path = os.path.join(base, file_path)
+        if not os.path.isfile(full_path):
+            return {"status": "error", "message": f"File not found: {file_path}"}
+
+        try:
+            with open(full_path, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read()
+        except Exception as exc:
+            return {"status": "error", "message": str(exc)}
+
+        risks: List[Dict[str, Any]] = []
+
+        write_pattern = re.compile(
+            r"\.(save|insert|update|delete|remove|softDelete|softRemove|create|createMany)\s*\("
+        )
+        transaction_pattern = re.compile(
+            r"(@Transaction\b|queryRunner|getConnection\(\)\.transaction|"
+            r"dataSource\.transaction|manager\.transaction|entityManager\.transaction)"
+        )
+        cache_pattern = re.compile(
+            r"(cacheManager\.|@CacheKey|CACHE_MANAGER|this\.cache\.|redis\.)"
+        )
+
+        # Parse method blocks
+        method_pattern = re.compile(
+            r"(?:async\s+)?(\w+)\s*\([^)]*\)\s*(?::\s*\w+[^{]*)?\{",
+        )
+
+        for m_match in method_pattern.finditer(content):
+            method_name = m_match.group(1)
+            if method_name in ("if", "for", "while", "switch", "catch", "constructor"):
+                continue
+
+            start = m_match.end()
+            brace_depth = 1
+            pos = start
+            while pos < len(content) and brace_depth > 0:
+                if content[pos] == "{":
+                    brace_depth += 1
+                elif content[pos] == "}":
+                    brace_depth -= 1
+                pos += 1
+            method_body = content[start:pos]
+
+            write_calls = write_pattern.findall(method_body)
+            has_transaction = bool(transaction_pattern.search(method_body))
+
+            if len(write_calls) >= 2 and not has_transaction:
+                line_num = content[:m_match.start()].count("\n") + 1
+                risks.append({
+                    "type": "missing_transaction",
+                    "method": method_name,
+                    "line": line_num,
+                    "write_count": len(write_calls),
+                    "message": f"Method '{method_name}' has {len(write_calls)} DB writes without "
+                               "transaction/QueryRunner",
+                    "severity": "high",
+                })
+
+            if has_transaction:
+                cache_calls = cache_pattern.findall(method_body)
+                if cache_calls:
+                    line_num = content[:m_match.start()].count("\n") + 1
+                    risks.append({
+                        "type": "cache_in_transaction",
+                        "method": method_name,
+                        "line": line_num,
+                        "message": f"Cache operations inside transaction in '{method_name}' – "
+                                   "cache may be set before transaction commits",
+                        "severity": "medium",
+                    })
+
+        return {
+            "status": "ok",
+            "file": file_path,
+            "risks": risks,
+            "risk_count": len(risks),
+        }
+
+    def get_domain_rules(self, file_path: str) -> Dict[str, Any]:
+        """
+        Return domain-aware anti-pattern rules based on file location / type.
+        """
+        base = self._get_project_path()
+        if not base:
+            return {"status": "error", "message": "Project path not set"}
+
+        rules: List[Dict[str, str]] = []
+        norm = file_path.replace("\\", "/").lower()
+
+        full_path = os.path.join(base, file_path)
+        content = ""
+        if os.path.isfile(full_path):
+            try:
+                with open(full_path, "r", encoding="utf-8", errors="replace") as f:
+                    content = f.read()
+            except Exception:
+                pass
+
+        # Controllers → require guards
+        if "controller" in norm:
+            if content and not re.search(r"@UseGuards\s*\(|@Public\s*\(", content):
+                rules.append({
+                    "rule": "require_guards",
+                    "message": "Controller should use @UseGuards() or mark routes as @Public()",
+                    "severity": "warning",
+                })
+            if content and not re.search(r"@ApiTags|@ApiOperation|@ApiResponse", content):
+                rules.append({
+                    "rule": "recommend_swagger",
+                    "message": "Consider adding Swagger decorators (@ApiTags, @ApiOperation) for API documentation",
+                    "severity": "info",
+                })
+
+        # Services → require @Injectable
+        if "service" in norm and norm.endswith(".ts"):
+            if content and not re.search(r"@Injectable\s*\(", content):
+                rules.append({
+                    "rule": "require_injectable",
+                    "message": "Service class should have @Injectable() decorator for NestJS DI",
+                    "severity": "high",
+                })
+
+        # DTOs → require class-validator decorators
+        if "dto" in norm:
+            if content and not re.search(r"@Is\w+|@Min|@Max|@Length|@IsNotEmpty|@IsOptional|@ValidateNested", content):
+                rules.append({
+                    "rule": "require_validation_decorators",
+                    "message": "DTO should use class-validator decorators for input validation",
+                    "severity": "warning",
+                })
+            if content and not re.search(r"@ApiProperty", content):
+                rules.append({
+                    "rule": "recommend_api_property",
+                    "message": "DTO should use @ApiProperty() for Swagger schema generation",
+                    "severity": "info",
+                })
+
+        # Modules → require proper exports
+        if "module" in norm and norm.endswith(".ts"):
+            if content and re.search(r"@Module\s*\(", content):
+                if not re.search(r"exports\s*:\s*\[", content):
+                    rules.append({
+                        "rule": "require_module_exports",
+                        "message": "Module should declare exports array for providers used by other modules",
+                        "severity": "info",
+                    })
+
+        # Entity files
+        if "entity" in norm and norm.endswith(".ts"):
+            if content and not re.search(r"@Entity\s*\(", content):
+                rules.append({
+                    "rule": "require_entity_decorator",
+                    "message": "Entity file should have @Entity() decorator",
+                    "severity": "high",
+                })
+
+        return {
+            "status": "ok",
+            "file": file_path,
+            "rules": rules,
+            "rule_count": len(rules),
+        }
+
+    def generate_test_skeleton(self, file_path: str, symbol: str) -> Dict[str, Any]:
+        """
+        Generate a Jest test skeleton with TestingModule for a NestJS class/method.
+        """
+        base = self._get_project_path()
+        if not base:
+            return {"status": "error", "message": "Project path not set"}
+
+        full_path = os.path.join(base, file_path)
+        if not os.path.isfile(full_path):
+            return {"status": "error", "message": f"File not found: {file_path}"}
+
+        try:
+            with open(full_path, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read()
+        except Exception as exc:
+            return {"status": "error", "message": str(exc)}
+
+        norm = file_path.replace("\\", "/").lower()
+        rel_import = os.path.splitext(file_path)[0]
+
+        # Extract class name
+        class_match = re.search(r"class\s+(\w+)", content)
+        class_name = class_match.group(1) if class_match else symbol
+
+        # Extract injected dependencies
+        deps: List[str] = []
+        constructor_match = re.search(r"constructor\s*\((.*?)\)", content, re.DOTALL)
+        if constructor_match:
+            params = constructor_match.group(1)
+            for dep_match in re.finditer(r"(?:private|protected|readonly)\s+(?:readonly\s+)?(\w+)\s*:\s*(\w+)", params):
+                deps.append({"var": dep_match.group(1), "type": dep_match.group(2)})
+
+        # Build mock providers
+        mock_providers = ""
+        for dep in deps:
+            mock_providers += (
+                f"          {{\n"
+                f"            provide: {dep['type']},\n"
+                f"            useValue: {{\n"
+                f"              // TODO: mock {dep['type']} methods\n"
+                f"            }},\n"
+                f"          }},\n"
+            )
+
+        var_name = class_name[0].lower() + class_name[1:]
+
+        if "controller" in norm:
+            test_type = "controller"
+            skeleton = (
+                f"import {{ Test, TestingModule }} from '@nestjs/testing';\n"
+                f"import {{ {class_name} }} from './{os.path.basename(rel_import)}';\n\n"
+                f"describe('{class_name}', () => {{\n"
+                f"  let {var_name}: {class_name};\n\n"
+                f"  beforeEach(async () => {{\n"
+                f"    const module: TestingModule = await Test.createTestingModule({{\n"
+                f"      controllers: [{class_name}],\n"
+                f"      providers: [\n{mock_providers}"
+                f"      ],\n"
+                f"    }}).compile();\n\n"
+                f"    {var_name} = module.get<{class_name}>({class_name});\n"
+                f"  }});\n\n"
+                f"  it('should be defined', () => {{\n"
+                f"    expect({var_name}).toBeDefined();\n"
+                f"  }});\n\n"
+                f"  describe('{symbol}', () => {{\n"
+                f"    it('should return expected result', async () => {{\n"
+                f"      // Arrange\n"
+                f"      // TODO: set up test data\n\n"
+                f"      // Act\n"
+                f"      const result = await {var_name}.{symbol}();\n\n"
+                f"      // Assert\n"
+                f"      expect(result).toBeDefined();\n"
+                f"    }});\n"
+                f"  }});\n"
+                f"}});\n"
+            )
+        elif "service" in norm:
+            test_type = "service"
+            skeleton = (
+                f"import {{ Test, TestingModule }} from '@nestjs/testing';\n"
+                f"import {{ {class_name} }} from './{os.path.basename(rel_import)}';\n\n"
+                f"describe('{class_name}', () => {{\n"
+                f"  let {var_name}: {class_name};\n\n"
+                f"  beforeEach(async () => {{\n"
+                f"    const module: TestingModule = await Test.createTestingModule({{\n"
+                f"      providers: [\n"
+                f"        {class_name},\n{mock_providers}"
+                f"      ],\n"
+                f"    }}).compile();\n\n"
+                f"    {var_name} = module.get<{class_name}>({class_name});\n"
+                f"  }});\n\n"
+                f"  it('should be defined', () => {{\n"
+                f"    expect({var_name}).toBeDefined();\n"
+                f"  }});\n\n"
+                f"  describe('{symbol}', () => {{\n"
+                f"    it('should return expected result', async () => {{\n"
+                f"      // Arrange\n"
+                f"      // TODO: set up test data and mock dependencies\n\n"
+                f"      // Act\n"
+                f"      const result = await {var_name}.{symbol}();\n\n"
+                f"      // Assert\n"
+                f"      expect(result).toBeDefined();\n"
+                f"    }});\n\n"
+                f"    it('should handle errors gracefully', async () => {{\n"
+                f"      // TODO: mock dependency to throw\n"
+                f"      await expect({var_name}.{symbol}()).rejects.toThrow();\n"
+                f"    }});\n"
+                f"  }});\n"
+                f"}});\n"
+            )
+        else:
+            test_type = "unit"
+            skeleton = (
+                f"import {{ Test, TestingModule }} from '@nestjs/testing';\n"
+                f"import {{ {class_name} }} from './{os.path.basename(rel_import)}';\n\n"
+                f"describe('{class_name}', () => {{\n"
+                f"  let instance: {class_name};\n\n"
+                f"  beforeEach(async () => {{\n"
+                f"    const module: TestingModule = await Test.createTestingModule({{\n"
+                f"      providers: [{class_name}],\n"
+                f"    }}).compile();\n\n"
+                f"    instance = module.get<{class_name}>({class_name});\n"
+                f"  }});\n\n"
+                f"  describe('{symbol}', () => {{\n"
+                f"    it('should work correctly', async () => {{\n"
+                f"      const result = await instance.{symbol}();\n"
+                f"      expect(result).toBeDefined();\n"
+                f"    }});\n"
+                f"  }});\n"
+                f"}});\n"
+            )
+
+        return {
+            "status": "ok",
+            "file": file_path,
+            "symbol": symbol,
+            "test_type": test_type,
+            "test_class": class_name,
+            "skeleton": skeleton,
+        }
+
+    def match_view_guards(self, file_path: str, symbol: str) -> Dict[str, Any]:
+        """
+        Cross-reference NestJS guard/middleware conditions with frontend
+        conditional renders.
+        """
+        base = self._get_project_path()
+        if not base:
+            return {"status": "error", "message": "Project path not set"}
+
+        full_path = os.path.join(base, file_path)
+        if not os.path.isfile(full_path):
+            return {"status": "error", "message": f"File not found: {file_path}"}
+
+        try:
+            with open(full_path, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read()
+        except Exception as exc:
+            return {"status": "error", "message": str(exc)}
+
+        # Extract guard/auth conditions from NestJS backend code
+        guards: List[Dict[str, Any]] = []
+        guard_patterns = [
+            (r"@UseGuards\s*\(\s*(\w+)", "use_guards"),
+            (r"@Roles\s*\(\s*['\"](\w+)['\"]", "roles"),
+            (r"@SetMetadata\s*\(\s*['\"](\w+)['\"]", "metadata"),
+            (r"canActivate\s*\(", "can_activate"),
+            (r"request\.user\.role\s*===?\s*['\"](\w+)['\"]", "role_check"),
+            (r"request\.user\.permissions.*?['\"](\w+)['\"]", "permission_check"),
+        ]
+
+        for pattern, guard_type in guard_patterns:
+            for m in re.finditer(pattern, content):
+                line_num = content[:m.start()].count("\n") + 1
+                guards.append({
+                    "type": guard_type,
+                    "condition": m.group(0),
+                    "value": m.group(1) if m.lastindex else None,
+                    "line": line_num,
+                })
+
+        # Search frontend files for matching conditional renders
+        frontend_matches: List[Dict[str, Any]] = []
+        search_dirs = []
+        for candidate in ["client/src", "frontend/src", "src/client", "public", "views"]:
+            d = os.path.join(base, candidate)
+            if os.path.isdir(d):
+                search_dirs.append(d)
+
+        frontend_patterns = [
+            (r"\{user\s*&&", "user_conditional"),
+            (r"\{isAuthenticated\s*&&", "auth_conditional"),
+            (r"\{!user\s*&&", "no_user_conditional"),
+            (r"role\s*===?\s*['\"](\w+)['\"]", "role_conditional"),
+            (r"hasPermission\s*\(\s*['\"](\w+)['\"]", "permission_conditional"),
+            (r"isAdmin\s*&&", "admin_conditional"),
+            (r"\*ngIf\s*=\s*\"(\w+)\"", "ng_if"),
+            (r"v-if\s*=\s*\"(\w+)\"", "v_if"),
+        ]
+
+        for search_dir in search_dirs:
+            for root, _dirs, files in os.walk(search_dir):
+                for fname in files:
+                    if not re.search(r"\.(tsx|jsx|ts|js|vue|html)$", fname):
+                        continue
+                    comp_path = os.path.join(root, fname)
+                    try:
+                        with open(comp_path, "r", encoding="utf-8", errors="replace") as f:
+                            comp_content = f.read()
+                    except Exception:
+                        continue
+
+                    rel_comp = os.path.relpath(comp_path, base)
+                    for fp, ftype in frontend_patterns:
+                        for fm in re.finditer(fp, comp_content):
+                            comp_line = comp_content[:fm.start()].count("\n") + 1
+                            for guard in guards:
+                                is_match = False
+                                if guard["type"] == "roles" and ftype == "role_conditional":
+                                    if guard.get("value") and fm.lastindex and guard["value"] == fm.group(1):
+                                        is_match = True
+                                elif guard["type"] == "use_guards" and ftype in (
+                                    "auth_conditional", "user_conditional"
+                                ):
+                                    if "Auth" in (guard.get("value") or ""):
+                                        is_match = True
+                                elif guard["type"] == "permission_check" and ftype == "permission_conditional":
+                                    if guard.get("value") and fm.lastindex and guard["value"] == fm.group(1):
+                                        is_match = True
+
+                                if is_match:
+                                    frontend_matches.append({
+                                        "frontend_file": rel_comp,
+                                        "frontend_line": comp_line,
+                                        "frontend_type": ftype,
+                                        "frontend_condition": fm.group(0),
+                                        "backend_guard": guard,
+                                    })
+
+        return {
+            "status": "ok",
+            "file": file_path,
+            "symbol": symbol,
+            "backend_guards": guards,
+            "frontend_matches": frontend_matches,
+            "matched_count": len(frontend_matches),
+            "unmatched_guards": len(guards) - len({m["backend_guard"]["line"] for m in frontend_matches}),
+        }

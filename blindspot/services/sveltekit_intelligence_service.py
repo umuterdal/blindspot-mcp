@@ -2565,3 +2565,543 @@ class SvelteKitIntelligenceService(BaseService):
                 })
 
         return {"status": "ok", **result}
+
+    # ── verify_schema ────────────────────────────────────────────────
+
+    def verify_schema(self, model_name: str, fields: list) -> Dict[str, Any]:
+        """Verify data model fields across Prisma schema and TypeScript types in $lib/types."""
+        base = self._get_project_path()
+        if not base:
+            return {"status": "error", "message": "Project path not set"}
+
+        result: Dict[str, Any] = {
+            "model": model_name,
+            "expected_fields": fields,
+            "prisma_fields": [],
+            "typescript_fields": [],
+            "mismatches": [],
+        }
+
+        # Scan Prisma schema
+        prisma_paths = [
+            os.path.join(base, "prisma", "schema.prisma"),
+            os.path.join(base, "src", "lib", "prisma", "schema.prisma"),
+        ]
+        for prisma_path in prisma_paths:
+            if os.path.isfile(prisma_path):
+                content = self._read_file(prisma_path) or ""
+                model_match = re.search(
+                    rf"model\s+{re.escape(model_name)}\s*\{{(.*?)\}}",
+                    content, re.DOTALL,
+                )
+                if model_match:
+                    body = model_match.group(1)
+                    for line in body.strip().split("\n"):
+                        line = line.strip()
+                        if line and not line.startswith("//") and not line.startswith("@@"):
+                            field_m = re.match(r"(\w+)\s+", line)
+                            if field_m:
+                                result["prisma_fields"].append(field_m.group(1))
+
+        # Scan TypeScript types in $lib/types
+        ts_dirs = [
+            os.path.join(base, "src", "lib", "types"),
+            os.path.join(base, "src", "lib"),
+            os.path.join(base, "src", "types"),
+        ]
+        iface_pattern = re.compile(
+            rf"(?:interface|type)\s+{re.escape(model_name)}\s*(?:extends\s+\w+\s*)?\{{(.*?)\}}",
+            re.DOTALL,
+        )
+        ts_field_pattern = re.compile(r"(\w+)\s*[?:]")
+
+        for tdir in ts_dirs:
+            if not os.path.isdir(tdir):
+                continue
+            for fpath in self._walk_files(tdir, (".ts", ".d.ts")):
+                content = self._read_file(fpath) or ""
+                for im in iface_pattern.finditer(content):
+                    body = im.group(1)
+                    for fm in ts_field_pattern.finditer(body):
+                        fname = fm.group(1)
+                        if fname not in result["typescript_fields"]:
+                            result["typescript_fields"].append(fname)
+
+        # Check mismatches
+        expected_set = set(fields)
+        prisma_set = set(result["prisma_fields"])
+        ts_set = set(result["typescript_fields"])
+
+        for field in fields:
+            if prisma_set and field not in prisma_set:
+                result["mismatches"].append({
+                    "field": field, "issue": "missing_in_prisma",
+                    "message": f"Field '{field}' not found in Prisma schema",
+                })
+            if ts_set and field not in ts_set:
+                result["mismatches"].append({
+                    "field": field, "issue": "missing_in_typescript",
+                    "message": f"Field '{field}' not found in TypeScript types",
+                })
+
+        for pf in prisma_set - expected_set:
+            result["mismatches"].append({
+                "field": pf, "issue": "extra_in_prisma",
+                "message": f"Field '{pf}' in Prisma schema but not in expected fields",
+            })
+
+        result["status"] = "ok" if not result["mismatches"] else "mismatches_found"
+        return result
+
+    # ── detect_transaction_risks ─────────────────────────────────────
+
+    def detect_transaction_risks(self, file_path: str) -> Dict[str, Any]:
+        """Detect missing transactions in +page.server.ts form actions with multiple DB writes."""
+        base = self._get_project_path()
+        if not base:
+            return {"status": "error", "message": "Project path not set"}
+
+        full_path = os.path.join(base, file_path) if not os.path.isabs(file_path) else file_path
+        if not os.path.isfile(full_path):
+            return {"status": "error", "message": f"File not found: {file_path}"}
+
+        content = self._read_file(full_path)
+        if not content:
+            return {"status": "error", "message": "Could not read file"}
+
+        risks: List[Dict[str, Any]] = []
+
+        # Find form actions (SvelteKit pattern)
+        action_pattern = re.compile(
+            r"(?:export\s+const\s+actions\s*(?::\s*Actions)?\s*=\s*\{|"
+            r"(\w+)\s*:\s*(?:async\s*)?\([^)]*\)\s*(?:=>|:\s*RequestHandler))",
+            re.MULTILINE,
+        )
+
+        # Find all async functions / action handlers
+        func_pattern = re.compile(
+            r"(?:async\s+)?(?:function\s+(\w+)|(?:const|let)\s+(\w+)\s*=\s*(?:async\s*)?\(|(\w+)\s*:\s*async\s*\()",
+        )
+        functions = list(func_pattern.finditer(content))
+
+        for idx, fm in enumerate(functions):
+            func_name = fm.group(1) or fm.group(2) or fm.group(3) or "anonymous"
+            start = fm.start()
+            end = functions[idx + 1].start() if idx + 1 < len(functions) else len(content)
+            body = content[start:end]
+
+            # Count DB write operations (prisma or drizzle)
+            prisma_writes = re.findall(
+                r"(?:prisma|db)\s*\.\s*\w+\s*\.\s*(?:create|update|delete|upsert|createMany|updateMany|deleteMany)\s*\(",
+                body,
+            )
+            drizzle_writes = re.findall(
+                r"(?:db|drizzle)\s*\.\s*(?:insert|update|delete)\s*\(",
+                body,
+            )
+            total_writes = len(prisma_writes) + len(drizzle_writes)
+
+            if total_writes >= 2:
+                has_transaction = bool(re.search(
+                    r"(?:prisma\s*\.\s*\$transaction|\.\s*transaction\s*\()",
+                    body,
+                ))
+                if not has_transaction:
+                    line_num = content[:start].count("\n") + 1
+                    risks.append({
+                        "action": func_name,
+                        "line": line_num,
+                        "write_operations": total_writes,
+                        "risk": "multiple_writes_without_transaction",
+                        "message": f"Action '{func_name}' has {total_writes} DB write operations without transaction",
+                        "suggestion": "Wrap in prisma.$transaction() or db.transaction()",
+                    })
+
+        # Check for form actions specifically in +page.server.ts
+        if "+page.server" in file_path:
+            actions_match = re.search(
+                r"export\s+const\s+actions\s*(?::\s*Actions)?\s*=\s*\{(.*)\}\s*(?:satisfies\s+Actions)?",
+                content, re.DOTALL,
+            )
+            if actions_match:
+                actions_body = actions_match.group(1)
+                # Find individual actions
+                action_names = re.findall(r"(\w+)\s*:\s*async", actions_body)
+                for aname in action_names:
+                    action_block_match = re.search(
+                        rf"{re.escape(aname)}\s*:\s*async\s*\([^)]*\)\s*=>\s*\{{(.*?)(?:\}}\s*,|\}}\s*$)",
+                        actions_body, re.DOTALL,
+                    )
+                    if action_block_match:
+                        ablock = action_block_match.group(1)
+                        writes = len(re.findall(
+                            r"(?:prisma|db)\s*\.\s*(?:\w+\s*\.\s*)?(?:create|update|delete|insert)\s*\(",
+                            ablock,
+                        ))
+                        if writes >= 2 and "$transaction" not in ablock and ".transaction" not in ablock:
+                            risks.append({
+                                "action": aname,
+                                "risk": "form_action_no_transaction",
+                                "write_operations": writes,
+                                "message": f"Form action '{aname}' has {writes} writes without transaction wrapping",
+                            })
+
+        return {"status": "ok", "file": file_path, "risks": risks, "total_risks": len(risks)}
+
+    # ── get_domain_rules ─────────────────────────────────────────────
+
+    def get_domain_rules(self, file_path: str) -> Dict[str, Any]:
+        """Check SvelteKit domain-specific rules for file types."""
+        base = self._get_project_path()
+        if not base:
+            return {"status": "error", "message": "Project path not set"}
+
+        full_path = os.path.join(base, file_path) if not os.path.isabs(file_path) else file_path
+        if not os.path.isfile(full_path):
+            return {"status": "error", "message": f"File not found: {file_path}"}
+
+        content = self._read_file(full_path)
+        if not content:
+            return {"status": "error", "message": "Could not read file"}
+
+        violations: List[Dict[str, Any]] = []
+        file_type = "unknown"
+        fname = os.path.basename(full_path)
+
+        if fname == "+page.server.ts" or fname == "+page.server.js":
+            file_type = "page_server"
+            # Rule: form actions require validation
+            actions_match = re.search(r"export\s+const\s+actions", content)
+            if actions_match:
+                action_bodies = re.findall(
+                    r"(\w+)\s*:\s*async\s*\([^)]*\)\s*=>\s*\{(.*?)\}(?:\s*,|\s*\})",
+                    content, re.DOTALL,
+                )
+                for aname, abody in action_bodies:
+                    has_validation = bool(re.search(
+                        r"(?:zod|yup|valibot|superforms|validate|parse|safeParse)\s*[.(]",
+                        abody, re.IGNORECASE,
+                    ))
+                    if not has_validation:
+                        violations.append({
+                            "rule": "action_requires_validation",
+                            "severity": "warning",
+                            "action": aname,
+                            "message": f"Form action '{aname}' lacks input validation -- use zod, superforms, or manual validation",
+                        })
+
+            # Rule: load functions require error handling
+            load_match = re.search(r"export\s+(?:const|async\s+function)\s+load", content)
+            if load_match:
+                load_body = content[load_match.start():]
+                if "error" not in load_body[:500].lower() and "throw" not in load_body[:500]:
+                    violations.append({
+                        "rule": "load_requires_error_handling",
+                        "severity": "warning",
+                        "message": "Load function lacks error handling -- use error() from @sveltejs/kit",
+                    })
+
+        elif fname == "+server.ts" or fname == "+server.js":
+            file_type = "api_server"
+            # Rule: API endpoints require error responses
+            http_methods = re.findall(
+                r"export\s+(?:async\s+)?(?:function|const)\s+(GET|POST|PUT|DELETE|PATCH)\b",
+                content,
+            )
+            for method in http_methods:
+                # Find the method body
+                method_match = re.search(
+                    rf"export\s+(?:async\s+)?(?:function|const)\s+{method}.*?(?=export\s+(?:async\s+)?(?:function|const)\s+(?:GET|POST|PUT|DELETE|PATCH)|\Z)",
+                    content, re.DOTALL,
+                )
+                if method_match:
+                    mbody = method_match.group(0)
+                    has_error_response = bool(re.search(
+                        r"(?:error\s*\(|new\s+Response\s*\(\s*(?:null|JSON\.stringify).*?[45]\d\d|json\s*\(.*?status\s*:\s*[45]\d\d)",
+                        mbody,
+                    ))
+                    if not has_error_response:
+                        violations.append({
+                            "rule": "endpoint_requires_error_response",
+                            "severity": "warning",
+                            "method": method,
+                            "message": f"{method} handler lacks error responses -- return proper HTTP error status codes",
+                        })
+
+        elif fname.startswith("+") and fname.endswith(".svelte"):
+            file_type = "page_component"
+            # Check if load data is being used without error handling in template
+            if "{#if" not in content and "data" in content:
+                has_data_access = bool(re.search(r"(?:export\s+let\s+data|\$page\.data)", content))
+                if has_data_access:
+                    violations.append({
+                        "rule": "page_data_error_handling",
+                        "severity": "info",
+                        "message": "Page accesses load data without conditional rendering -- consider handling loading/error states",
+                    })
+
+        elif fname == "hooks.server.ts" or fname == "hooks.server.js":
+            file_type = "hooks"
+            # Rule: hooks should use sequence()
+            handle_count = len(re.findall(r"export\s+(?:const|async\s+function)\s+handle\b", content))
+            has_sequence = "sequence" in content
+            if handle_count >= 1 and not has_sequence:
+                # Check if there are multiple handle-like functions that should be composed
+                handle_like = re.findall(r"(?:const|function)\s+(\w*handle\w*)\s*", content, re.IGNORECASE)
+                if len(handle_like) >= 2:
+                    violations.append({
+                        "rule": "hooks_require_sequence",
+                        "severity": "warning",
+                        "message": f"Multiple handle functions found ({', '.join(handle_like[:5])}) -- use sequence() to compose them",
+                    })
+
+        return {
+            "status": "ok",
+            "file": file_path,
+            "file_type": file_type,
+            "violations": violations,
+            "total_violations": len(violations),
+        }
+
+    # ── generate_test_skeleton ───────────────────────────────────────
+
+    def generate_test_skeleton(self, file_path: str, symbol: str) -> Dict[str, Any]:
+        """Generate Vitest/Playwright test skeleton for SvelteKit components and load functions."""
+        base = self._get_project_path()
+        if not base:
+            return {"status": "error", "message": "Project path not set"}
+
+        full_path = os.path.join(base, file_path) if not os.path.isabs(file_path) else file_path
+        if not os.path.isfile(full_path):
+            return {"status": "error", "message": f"File not found: {file_path}"}
+
+        content = self._read_file(full_path)
+        if not content:
+            return {"status": "error", "message": "Could not read file"}
+
+        result: Dict[str, Any] = {"file": file_path, "symbol": symbol, "skeleton": "", "test_type": "unknown"}
+        rel_path = os.path.relpath(full_path, base) if base else file_path
+        fname = os.path.basename(full_path)
+
+        # Extract Svelte component props
+        props = re.findall(r"export\s+let\s+(\w+)", content)
+
+        if fname.endswith(".svelte"):
+            result["test_type"] = "component"
+            props_str = ", ".join(f"{p}: undefined" for p in props[:5]) if props else ""
+
+            # Determine route for Playwright test
+            route_path = "/" + os.path.dirname(rel_path).replace("src/routes/", "").replace("src/routes", "")
+            route_path = re.sub(r"\([^)]+\)/", "", route_path)  # Remove group layouts
+            route_path = re.sub(r"\+page\.svelte$", "", route_path)
+
+            result["skeleton"] = (
+                f"// Vitest component test\n"
+                f"import {{ describe, it, expect }} from 'vitest';\n"
+                f"import {{ render, screen }} from '@testing-library/svelte';\n"
+                f"import {symbol} from '$lib/{rel_path}';\n\n"
+                f"describe('{symbol}', () => {{\n"
+                f"  it('should render successfully', () => {{\n"
+                f"    const {{ container }} = render({symbol}, {{ props: {{ {props_str} }} }});\n"
+                f"    expect(container).toBeTruthy();\n"
+                f"  }});\n"
+                f"}});\n\n"
+                f"// Playwright e2e test\n"
+                f"import {{ test, expect }} from '@playwright/test';\n\n"
+                f"test('{symbol} page', async ({{ page }}) => {{\n"
+                f"  await page.goto('{route_path}');\n"
+                f"  // TODO: Add specific page assertions\n"
+                f"  await expect(page).toHaveTitle(/.*/);\n"
+                f"}});\n"
+            )
+
+        elif fname.endswith((".ts", ".js")) and "+page.server" in fname:
+            result["test_type"] = "load_function"
+            result["skeleton"] = (
+                f"import {{ describe, it, expect, vi }} from 'vitest';\n"
+                f"import {{ load }} from './{fname}';\n\n"
+                f"describe('{symbol} load function', () => {{\n"
+                f"  it('should return expected data', async () => {{\n"
+                f"    const mockEvent = {{\n"
+                f"      params: {{}},\n"
+                f"      url: new URL('http://localhost'),\n"
+                f"      locals: {{}},\n"
+                f"      fetch: vi.fn(),\n"
+                f"      depends: vi.fn(),\n"
+                f"      parent: vi.fn().mockResolvedValue({{}}),\n"
+                f"    }};\n"
+                f"    const result = await load(mockEvent as any);\n"
+                f"    expect(result).toBeDefined();\n"
+                f"    // TODO: Assert specific returned properties\n"
+                f"  }});\n\n"
+                f"  it('should handle errors gracefully', async () => {{\n"
+                f"    // TODO: Test error scenarios\n"
+                f"  }});\n"
+                f"}});\n"
+            )
+
+        elif fname == "+server.ts" or fname == "+server.js":
+            result["test_type"] = "api_endpoint"
+            http_methods = re.findall(
+                r"export\s+(?:async\s+)?(?:function|const)\s+(GET|POST|PUT|DELETE|PATCH)",
+                content,
+            )
+            method_tests = "\n\n".join(
+                f"  it('should handle {m} requests', async () => {{\n"
+                f"    const mockEvent = {{\n"
+                f"      request: new Request('http://localhost', {{ method: '{m}' }}),\n"
+                f"      params: {{}},\n"
+                f"      locals: {{}},\n"
+                f"      url: new URL('http://localhost'),\n"
+                f"    }};\n"
+                f"    const response = await {m}(mockEvent as any);\n"
+                f"    expect(response.status).toBe(200);\n"
+                f"  }});"
+                for m in http_methods
+            )
+            imports = ", ".join(http_methods)
+            result["skeleton"] = (
+                f"import {{ describe, it, expect, vi }} from 'vitest';\n"
+                f"import {{ {imports} }} from './{fname}';\n\n"
+                f"describe('{symbol} API endpoint', () => {{\n"
+                f"{method_tests}\n"
+                f"}});\n"
+            )
+        else:
+            result["test_type"] = "unit"
+            result["skeleton"] = (
+                f"import {{ describe, it, expect }} from 'vitest';\n"
+                f"import {{ {symbol} }} from './{fname.replace('.ts', '').replace('.js', '')}';\n\n"
+                f"describe('{symbol}', () => {{\n"
+                f"  it('should work correctly', () => {{\n"
+                f"    const result = {symbol}();\n"
+                f"    expect(result).toBeDefined();\n"
+                f"  }});\n"
+                f"}});\n"
+            )
+
+        result["status"] = "ok"
+        return result
+
+    # ── match_view_guards ────────────────────────────────────────────
+
+    def match_view_guards(self, file_path: str, symbol: str) -> Dict[str, Any]:
+        """Match hooks.server.ts auth to {#if} conditions in .svelte files and +page.server.ts load auth."""
+        base = self._get_project_path()
+        if not base:
+            return {"status": "error", "message": "Project path not set"}
+
+        full_path = os.path.join(base, file_path) if not os.path.isabs(file_path) else file_path
+        if not os.path.isfile(full_path):
+            return {"status": "error", "message": f"File not found: {file_path}"}
+
+        content = self._read_file(full_path)
+        if not content:
+            return {"status": "error", "message": "Could not read file"}
+
+        result: Dict[str, Any] = {
+            "file": file_path,
+            "symbol": symbol,
+            "server_guards": [],
+            "client_guards": [],
+            "load_guards": [],
+            "unmatched": [],
+        }
+
+        rel_path = os.path.relpath(full_path, base) if base else file_path
+        fname = os.path.basename(full_path)
+
+        # Check hooks.server.ts for auth handle
+        if fname in ("hooks.server.ts", "hooks.server.js"):
+            auth_patterns = re.findall(
+                r"(?:event\.locals\.\w*(?:auth|user|session)\w*|"
+                r"getSession|validateSession|verifyToken|isAuthenticated)\s*[=(]",
+                content, re.IGNORECASE,
+            )
+            for ap in auth_patterns:
+                result["server_guards"].append({
+                    "type": "hooks_auth",
+                    "check": ap.strip()[:60],
+                    "file": rel_path,
+                })
+
+            redirect_guards = re.findall(
+                r"(?:throw\s+redirect|redirect)\s*\(\s*(\d+)\s*,\s*['\"]([^'\"]+)['\"]",
+                content,
+            )
+            for status, path in redirect_guards:
+                result["server_guards"].append({
+                    "type": "auth_redirect",
+                    "status": status,
+                    "redirect_to": path,
+                })
+
+        # Check +page.server.ts load functions for auth
+        routes_dir = self._find_routes_dir(base)
+        if routes_dir:
+            for fpath in self._walk_files(routes_dir, (".ts", ".js")):
+                if "+page.server" not in os.path.basename(fpath):
+                    continue
+                fcontent = self._read_file(fpath) or ""
+                load_auth = re.findall(
+                    r"(?:locals\.\w*(?:auth|user|session)\w*|getSession|validateSession)\s*[=(]",
+                    fcontent, re.IGNORECASE,
+                )
+                if load_auth:
+                    rel = os.path.relpath(fpath, base)
+                    for la in load_auth:
+                        result["load_guards"].append({
+                            "type": "load_auth",
+                            "check": la.strip()[:60],
+                            "file": rel,
+                        })
+
+        # Scan .svelte files for {#if} auth conditionals
+        src_dir = os.path.join(base, "src")
+        scan_base = src_dir if os.path.isdir(src_dir) else base
+
+        for fpath in self._walk_files(scan_base, (".svelte",)):
+            svelte_content = self._read_file(fpath) or ""
+            rel = os.path.relpath(fpath, base)
+
+            # Look for auth-related {#if} conditions
+            if_conditions = re.findall(
+                r"\{#if\s+([^}]*(?:auth|user|logged|session|isAuth|token|role|permission)[^}]*)\}",
+                svelte_content, re.IGNORECASE,
+            )
+            for cond in if_conditions:
+                result["client_guards"].append({
+                    "file": rel,
+                    "condition": cond.strip()[:80],
+                    "type": "svelte_if_block",
+                })
+
+            # Look for $page.data auth checks
+            page_data_auth = re.findall(
+                r"\$page\.data\.(\w*(?:auth|user|session)\w*)",
+                svelte_content, re.IGNORECASE,
+            )
+            for pda in page_data_auth:
+                result["client_guards"].append({
+                    "file": rel,
+                    "condition": f"$page.data.{pda}",
+                    "type": "page_data_auth",
+                })
+
+        # Identify unmatched guards
+        has_server = bool(result["server_guards"]) or bool(result["load_guards"])
+        has_client = bool(result["client_guards"])
+
+        if has_server and not has_client:
+            result["unmatched"].append({
+                "severity": "warning",
+                "message": "Server-side auth guards exist but no matching {#if} auth conditionals found in .svelte files",
+            })
+        if has_client and not has_server:
+            result["unmatched"].append({
+                "severity": "error",
+                "message": "Client-side auth conditionals exist but no server hooks/load auth guard found -- potential security issue",
+            })
+
+        result["status"] = "ok"
+        return result

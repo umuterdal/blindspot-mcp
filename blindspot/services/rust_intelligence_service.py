@@ -1554,3 +1554,608 @@ class RustIntelligenceService(BaseService):
         result["files_affected"] = len(result["references"])
 
         return {"status": "ok", **result}
+
+    # ── verify_schema ─────────────────────────────────────────────────
+    def verify_schema(self, entity_or_model: str, fields: list) -> Dict[str, Any]:
+        """Check Diesel schema.rs table! macro, SeaORM entity fields, SQLx FromRow structs."""
+        base = self._project_path()
+        if not base:
+            return {"status": "error", "message": "No project path configured"}
+
+        result: Dict[str, Any] = {
+            "model": entity_or_model,
+            "requested_fields": fields,
+            "diesel_columns": [],
+            "seaorm_fields": [],
+            "sqlx_fields": [],
+            "missing_fields": [],
+            "warnings": [],
+        }
+
+        found_fields: Set[str] = set()
+
+        for root, _, files in os.walk(base):
+            if "target" in root:
+                continue
+            for fname in files:
+                if not fname.endswith(".rs"):
+                    continue
+                fpath = os.path.join(root, fname)
+                try:
+                    with open(fpath, "r", encoding="utf-8", errors="replace") as f:
+                        content = f.read()
+                except Exception:
+                    continue
+
+                rel = os.path.relpath(fpath, base)
+
+                # Diesel table! macro: table! { entity_name (id) { col -> Type, ... } }
+                table_re = re.compile(
+                    r'table!\s*\{\s*' + re.escape(entity_or_model.lower())
+                    + r'\s*\([^)]*\)\s*\{([^}]*)\}',
+                    re.DOTALL,
+                )
+                table_match = table_re.search(content)
+                if table_match:
+                    body = table_match.group(1)
+                    col_re = re.compile(r'(\w+)\s*->\s*(\w+)')
+                    for cm in col_re.finditer(body):
+                        col_name, col_type = cm.group(1), cm.group(2)
+                        result["diesel_columns"].append({
+                            "file": rel, "column": col_name, "type": col_type,
+                        })
+                        found_fields.add(col_name)
+
+                # SeaORM entity: #[sea_orm(column_name = "...")] or Column enum
+                if "sea_orm" in content and entity_or_model in content:
+                    sea_field_re = re.compile(
+                        r'#\[sea_orm\s*\(.*?column_name\s*=\s*"(\w+)".*?\)\]\s*\n\s*pub\s+(\w+)',
+                    )
+                    for sm in sea_field_re.finditer(content):
+                        col_name, field_name = sm.group(1), sm.group(2)
+                        result["seaorm_fields"].append({
+                            "file": rel, "field": field_name, "column": col_name,
+                        })
+                        found_fields.add(field_name)
+
+                    # Also match plain pub fields in Model struct
+                    model_re = re.compile(
+                        r'(?:#\[derive\([^)]*Model[^)]*\)\])\s*pub\s+struct\s+'
+                        + re.escape(entity_or_model) + r'\s*\{([^}]*)\}',
+                        re.DOTALL,
+                    )
+                    model_match = model_re.search(content)
+                    if model_match:
+                        body = model_match.group(1)
+                        field_re = re.compile(r'pub\s+(\w+)\s*:\s*(\S+)')
+                        for fm in field_re.finditer(body):
+                            result["seaorm_fields"].append({
+                                "file": rel, "field": fm.group(1), "type": fm.group(2).rstrip(","),
+                            })
+                            found_fields.add(fm.group(1))
+
+                # SQLx FromRow struct
+                if "FromRow" in content and entity_or_model in content:
+                    fromrow_re = re.compile(
+                        r'#\[derive\([^)]*FromRow[^)]*\)\]\s*(?:pub\s+)?struct\s+'
+                        + re.escape(entity_or_model) + r'\s*\{([^}]*)\}',
+                        re.DOTALL,
+                    )
+                    fromrow_match = fromrow_re.search(content)
+                    if fromrow_match:
+                        body = fromrow_match.group(1)
+                        field_re = re.compile(r'(?:pub\s+)?(\w+)\s*:\s*(\S+)')
+                        for fm in field_re.finditer(body):
+                            field_name = fm.group(1)
+                            field_type = fm.group(2).rstrip(",")
+                            result["sqlx_fields"].append({
+                                "file": rel, "field": field_name, "type": field_type,
+                            })
+                            found_fields.add(field_name)
+
+        for field in fields:
+            if field not in found_fields:
+                result["missing_fields"].append(field)
+
+        if result["missing_fields"]:
+            result["warnings"].append(
+                f"Fields not found in schema/entity: {', '.join(result['missing_fields'])}"
+            )
+
+        return {"status": "ok", **result}
+
+    # ── detect_transaction_risks ──────────────────────────────────────
+    def detect_transaction_risks(self, file_path: str) -> Dict[str, Any]:
+        """Detect missing transaction wrappers around multiple queries and side effects."""
+        base = self._project_path()
+        if not base:
+            return {"status": "error", "message": "No project path configured"}
+
+        full_path = os.path.join(base, file_path)
+        if not os.path.isfile(full_path):
+            return {"status": "error", "message": f"File not found: {file_path}"}
+
+        try:
+            with open(full_path, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read()
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+
+        result: Dict[str, Any] = {
+            "file": file_path,
+            "risks": [],
+            "warnings": [],
+            "query_count": 0,
+            "has_transaction": False,
+        }
+
+        lines = content.split("\n")
+
+        # Count database query operations
+        query_patterns = [
+            r'\.execute\s*\(', r'\.fetch_one\s*\(', r'\.fetch_all\s*\(',
+            r'\.fetch_optional\s*\(', r'diesel::insert_into', r'diesel::update',
+            r'diesel::delete', r'\.load\s*::<', r'\.get_result\s*::<',
+            r'\.save\s*\(', r'\.insert\s*\(', r'\.update\s*\(',
+        ]
+        query_re = re.compile("|".join(query_patterns))
+        query_locs = [(i + 1, ln.strip()) for i, ln in enumerate(lines) if query_re.search(ln)]
+        result["query_count"] = len(query_locs)
+
+        # Check for transaction wrappers
+        has_sqlx_txn = bool(re.search(r'sqlx::Transaction|\.begin\s*\(\s*\)\.await', content))
+        has_diesel_txn = bool(re.search(r'\.transaction\s*\(\s*\|', content))
+        has_sea_txn = bool(re.search(r'TransactionTrait|\.begin\s*\(\s*\)\.await', content))
+        result["has_transaction"] = has_sqlx_txn or has_diesel_txn or has_sea_txn
+
+        # Multiple queries without transaction
+        if len(query_locs) > 1 and not result["has_transaction"]:
+            result["risks"].append({
+                "type": "multiple_queries_no_transaction",
+                "severity": "error",
+                "message": f"Found {len(query_locs)} DB operations without transaction wrapper",
+                "locations": [{"line": loc[0], "code": loc[1]} for loc in query_locs[:5]],
+            })
+
+        # Side effects inside transaction (e.g., HTTP calls, file I/O)
+        if result["has_transaction"]:
+            side_effect_re = re.compile(
+                r'(?:reqwest|hyper)::.*?\.\s*send|'
+                r'std::fs::|tokio::fs::|'
+                r'\.send\s*\(|\.publish\s*\('
+            )
+            for i, line in enumerate(lines):
+                if side_effect_re.search(line):
+                    result["risks"].append({
+                        "type": "side_effect_in_transaction",
+                        "severity": "warning",
+                        "message": "Side effect (HTTP/file/message) detected -- may cause issues on rollback",
+                        "line": i + 1,
+                        "code": line.strip(),
+                    })
+
+        # unwrap() inside transaction closure
+        if result["has_transaction"]:
+            txn_blocks = re.finditer(r'\.transaction\s*\(\s*\|[^|]*\|([^}]*)\}', content, re.DOTALL)
+            for tb in txn_blocks:
+                body = tb.group(1)
+                if re.search(r'\.unwrap\s*\(\s*\)', body):
+                    result["risks"].append({
+                        "type": "unwrap_in_transaction",
+                        "severity": "error",
+                        "message": ".unwrap() inside transaction -- use ? operator to propagate errors properly",
+                    })
+
+        if not result["risks"]:
+            result["warnings"].append("No transaction risks detected")
+
+        return {"status": "ok", **result}
+
+    # ── get_domain_rules ──────────────────────────────────────────────
+    def get_domain_rules(self, file_path: str) -> Dict[str, Any]:
+        """Check Rust domain rules: handler return types, trait interfaces, derive macros."""
+        base = self._project_path()
+        if not base:
+            return {"status": "error", "message": "No project path configured"}
+
+        full_path = os.path.join(base, file_path)
+        if not os.path.isfile(full_path):
+            return {"status": "error", "message": f"File not found: {file_path}"}
+
+        try:
+            with open(full_path, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read()
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+
+        result: Dict[str, Any] = {
+            "file": file_path,
+            "violations": [],
+            "suggestions": [],
+            "file_type": "unknown",
+        }
+
+        rel_lower = file_path.lower().replace("\\", "/")
+
+        is_handler = "handler" in rel_lower or "route" in rel_lower
+        is_service = "service" in rel_lower
+        is_model = "model" in rel_lower or "entity" in rel_lower
+        is_middleware = "middleware" in rel_lower or "layer" in rel_lower or "extractor" in rel_lower
+
+        if is_handler:
+            result["file_type"] = "handler"
+            # Handlers should return Result type
+            fn_re = re.compile(r'(?:pub\s+)?(?:async\s+)?fn\s+(\w+)\s*\([^)]*\)\s*(?:->\s*([^{]+))?')
+            for m in fn_re.finditer(content):
+                fn_name = m.group(1)
+                ret_type = m.group(2) or ""
+                ret_type = ret_type.strip()
+                if ret_type and "Result" not in ret_type and "impl " not in ret_type:
+                    if fn_name not in ("main", "new", "default"):
+                        result["violations"].append({
+                            "rule": "handler_requires_result_return",
+                            "severity": "warning",
+                            "function": fn_name,
+                            "message": f"Handler '{fn_name}' returns '{ret_type}' instead of Result -- errors may be unhandled",
+                        })
+
+        if is_service:
+            result["file_type"] = "service"
+            # Services should have a trait interface
+            structs = re.findall(r'(?:pub\s+)?struct\s+(\w+)', content)
+            traits = re.findall(r'(?:pub\s+)?trait\s+(\w+)', content)
+            impl_trait_re = re.compile(r'impl\s+(\w+)\s+for\s+(\w+)')
+            impl_traits = {m.group(2): m.group(1) for m in impl_trait_re.finditer(content)}
+
+            for struct_name in structs:
+                if struct_name not in impl_traits and struct_name not in traits:
+                    result["violations"].append({
+                        "rule": "service_requires_trait_interface",
+                        "severity": "warning",
+                        "struct": struct_name,
+                        "message": f"Service struct '{struct_name}' does not implement a trait -- define a trait for testability",
+                    })
+
+        if is_model:
+            result["file_type"] = "model"
+            # Models should derive Serialize/Deserialize
+            struct_re = re.compile(
+                r'(#\[derive\(([^)]*)\)\]\s*)?(?:pub\s+)?struct\s+(\w+)',
+            )
+            for m in struct_re.finditer(content):
+                derives = m.group(2) or ""
+                struct_name = m.group(3)
+                if "Serialize" not in derives:
+                    result["violations"].append({
+                        "rule": "model_requires_serialize",
+                        "severity": "warning",
+                        "struct": struct_name,
+                        "message": f"Model '{struct_name}' missing Serialize derive",
+                    })
+                if "Deserialize" not in derives:
+                    result["violations"].append({
+                        "rule": "model_requires_deserialize",
+                        "severity": "warning",
+                        "struct": struct_name,
+                        "message": f"Model '{struct_name}' missing Deserialize derive",
+                    })
+
+        if is_middleware:
+            result["file_type"] = "middleware"
+            # Middleware should propagate errors properly
+            fn_re = re.compile(r'(?:pub\s+)?(?:async\s+)?fn\s+(\w+)\s*\([^)]*\)\s*(?:->\s*([^{]+))?')
+            for m in fn_re.finditer(content):
+                fn_name = m.group(1)
+                ret_type = m.group(2) or ""
+                if fn_name not in ("main", "new", "default") and "Result" not in ret_type and "Response" not in ret_type:
+                    result["violations"].append({
+                        "rule": "middleware_requires_error_propagation",
+                        "severity": "warning",
+                        "function": fn_name,
+                        "message": f"Middleware function '{fn_name}' should return Result or Response for proper error propagation",
+                    })
+
+        return {"status": "ok", **result}
+
+    # ── generate_test_skeleton ────────────────────────────────────────
+    def generate_test_skeleton(self, file_path: str, symbol: str) -> Dict[str, Any]:
+        """Generate Rust #[cfg(test)] test skeleton with mock setup and assert macros."""
+        base = self._project_path()
+        if not base:
+            return {"status": "error", "message": "No project path configured"}
+
+        full_path = os.path.join(base, file_path)
+        if not os.path.isfile(full_path):
+            return {"status": "error", "message": f"File not found: {file_path}"}
+
+        try:
+            with open(full_path, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read()
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+
+        result: Dict[str, Any] = {
+            "file": file_path,
+            "symbol": symbol,
+            "test_code": "",
+            "test_type": "unit",
+            "dependencies": [],
+        }
+
+        # Extract function signatures for the symbol
+        fn_re = re.compile(
+            r'(?:pub\s+)?(?:async\s+)?fn\s+' + re.escape(symbol)
+            + r'\s*(?:<[^>]*>)?\s*\(([^)]*)\)\s*(?:->\s*([^{]+))?',
+        )
+        fn_match = fn_re.search(content)
+
+        is_async = bool(re.search(r'async\s+fn\s+' + re.escape(symbol), content))
+        is_struct = bool(re.search(r'(?:pub\s+)?struct\s+' + re.escape(symbol), content))
+        is_trait = bool(re.search(r'(?:pub\s+)?trait\s+' + re.escape(symbol), content))
+
+        params = ""
+        ret_type = ""
+        if fn_match:
+            params = fn_match.group(1).strip()
+            ret_type = (fn_match.group(2) or "").strip()
+
+        # Parse parameters for mock setup
+        param_list = []
+        if params and params != "&self" and params != "&mut self":
+            clean_params = params.replace("&self,", "").replace("&mut self,", "").replace("&self", "").strip()
+            if clean_params:
+                for p in clean_params.split(","):
+                    p = p.strip()
+                    parts = p.split(":")
+                    if len(parts) == 2:
+                        param_list.append({
+                            "name": parts[0].strip(),
+                            "type": parts[1].strip(),
+                        })
+
+        # Build mock values
+        mock_setup_lines = []
+        call_args = []
+        for p in param_list:
+            ptype = p["type"].strip()
+            pname = p["name"].strip()
+            if "&str" in ptype or "String" in ptype:
+                mock_setup_lines.append(f'        let {pname} = "test_{pname}";')
+                call_args.append(pname if "&" in ptype else f"{pname}.to_string()")
+            elif "i32" in ptype or "i64" in ptype or "u32" in ptype or "u64" in ptype or "usize" in ptype:
+                mock_setup_lines.append(f"        let {pname} = 1;")
+                call_args.append(pname)
+            elif "bool" in ptype:
+                mock_setup_lines.append(f"        let {pname} = true;")
+                call_args.append(pname)
+            else:
+                mock_setup_lines.append(f"        let {pname} = todo!(\"create mock {ptype}\");")
+                call_args.append(pname)
+
+        mock_setup = "\n".join(mock_setup_lines)
+        args_str = ", ".join(call_args)
+
+        if is_struct:
+            result["test_type"] = "struct"
+            # Get impl methods
+            impl_methods = re.findall(
+                r'(?:pub\s+)?(?:async\s+)?fn\s+(\w+)\s*\(', content
+            )
+            test_fns = ""
+            for method in impl_methods:
+                if method in ("new", "default"):
+                    continue
+                test_fns += f"""
+    #[test]
+    fn test_{method}() {{
+        let sut = {symbol}::new(/* params */);
+        // let result = sut.{method}();
+        // assert!(result.is_ok());
+    }}
+"""
+            result["test_code"] = f"""#[cfg(test)]
+mod tests {{
+    use super::*;
+
+    fn setup() -> {symbol} {{
+        todo!("create test instance of {symbol}")
+    }}
+
+    #[test]
+    fn test_new() {{
+        let instance = setup();
+        // assert basic properties
+    }}
+{test_fns}}}
+"""
+        elif is_trait:
+            result["test_type"] = "trait"
+            result["test_code"] = f"""#[cfg(test)]
+mod tests {{
+    use super::*;
+
+    struct Mock{symbol};
+
+    impl {symbol} for Mock{symbol} {{
+        // TODO: implement trait methods
+    }}
+
+    #[test]
+    fn test_mock_implements_trait() {{
+        let mock = Mock{symbol};
+        // assert trait methods work correctly
+    }}
+}}
+"""
+        elif is_async:
+            result["test_type"] = "async_function"
+            result["dependencies"].append("tokio")
+            result["test_code"] = f"""#[cfg(test)]
+mod tests {{
+    use super::*;
+
+    #[tokio::test]
+    async fn test_{symbol}_success() {{
+{mock_setup}
+        let result = {symbol}({args_str}).await;
+        assert!(result.is_ok());
+    }}
+
+    #[tokio::test]
+    async fn test_{symbol}_error_case() {{
+{mock_setup}
+        // Modify inputs to trigger error
+        let result = {symbol}({args_str}).await;
+        assert!(result.is_err());
+    }}
+
+    #[tokio::test]
+    async fn test_{symbol}_edge_cases() {{
+        // Test with empty/null/boundary values
+    }}
+}}
+"""
+        else:
+            result["test_type"] = "function"
+            assert_line = "assert!(result.is_ok());" if "Result" in ret_type else "assert!(result.is_some());" if "Option" in ret_type else "// assert_eq!(result, expected);"
+            result["test_code"] = f"""#[cfg(test)]
+mod tests {{
+    use super::*;
+
+    #[test]
+    fn test_{symbol}_success() {{
+{mock_setup}
+        let result = {symbol}({args_str});
+        {assert_line}
+    }}
+
+    #[test]
+    fn test_{symbol}_edge_cases() {{
+        // Test with boundary values
+    }}
+
+    #[test]
+    #[should_panic]
+    fn test_{symbol}_panics_on_invalid_input() {{
+        // Test panic conditions if applicable
+    }}
+}}
+"""
+
+        return {"status": "ok", **result}
+
+    # ── match_view_guards ─────────────────────────────────────────────
+    def match_view_guards(self, file_path: str, symbol: str) -> Dict[str, Any]:
+        """Match middleware/extractor auth with Tera/Askama template conditions."""
+        base = self._project_path()
+        if not base:
+            return {"status": "error", "message": "No project path configured"}
+
+        full_path = os.path.join(base, file_path)
+        if not os.path.isfile(full_path):
+            return {"status": "error", "message": f"File not found: {file_path}"}
+
+        try:
+            with open(full_path, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read()
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+
+        result: Dict[str, Any] = {
+            "file": file_path,
+            "symbol": symbol,
+            "backend_guards": [],
+            "template_conditions": [],
+            "mismatches": [],
+            "warnings": [],
+        }
+
+        # Detect extractor-based auth guards
+        extractor_patterns = [
+            (r'(?:AuthUser|AuthSession|Identity|Claims)\s*(?::\s*\w+)?', "auth_extractor"),
+            (r'#\[(?:require_auth|authenticated|authorize)\]', "auth_attribute"),
+            (r'\.wrap\s*\(\s*(?:Auth|Session|Identity)', "middleware_wrap"),
+            (r'middleware::auth|auth_middleware|require_login', "auth_middleware"),
+        ]
+        for pattern, guard_type in extractor_patterns:
+            for m in re.finditer(pattern, content):
+                line_no = content[:m.start()].count("\n") + 1
+                result["backend_guards"].append({
+                    "type": guard_type, "line": line_no,
+                    "code": m.group(0).strip(),
+                })
+
+        # Extract role/permission checks
+        role_checks: Set[str] = set()
+        role_re = re.compile(r'(?:has_role|has_permission|is_admin|role\s*==\s*)"?(\w+)"?')
+        for m in role_re.finditer(content):
+            role = m.group(1)
+            role_checks.add(role)
+            result["backend_guards"].append({
+                "type": "role_check", "role": role,
+            })
+
+        # Scan templates for matching conditions
+        template_dirs = ["templates", "src/templates", "static"]
+        template_roles: Set[str] = set()
+        for tdir_name in template_dirs:
+            tdir = os.path.join(base, tdir_name)
+            if not os.path.isdir(tdir):
+                continue
+            for root, _, files in os.walk(tdir):
+                for fname in files:
+                    if not fname.endswith((".html", ".tera", ".askama", ".html.tera")):
+                        continue
+                    tpath = os.path.join(root, fname)
+                    try:
+                        with open(tpath, "r", encoding="utf-8", errors="replace") as f:
+                            tcontent = f.read()
+                    except Exception:
+                        continue
+
+                    rel_t = os.path.relpath(tpath, base)
+
+                    # Tera: {% if user.is_authenticated %} or {% if user.role == "admin" %}
+                    tera_auth_re = re.compile(r'\{%\s*if\s+.*?(?:is_authenticated|logged_in|user)\s*%\}')
+                    for tm in tera_auth_re.finditer(tcontent):
+                        result["template_conditions"].append({
+                            "file": rel_t, "type": "tera_auth_check",
+                            "code": tm.group(0),
+                        })
+
+                    tera_role_re = re.compile(r'\{%\s*if\s+.*?(?:role|permission)\s*==\s*"(\w+)"')
+                    for tm in tera_role_re.finditer(tcontent):
+                        role = tm.group(1)
+                        template_roles.add(role)
+                        result["template_conditions"].append({
+                            "file": rel_t, "type": "tera_role_check", "role": role,
+                        })
+
+                    # Askama: {% if user.is_authenticated %}
+                    askama_re = re.compile(r'\{[{%]\s*(?:if|match)\s+.*?(?:auth|user|role|permission)')
+                    for tm in askama_re.finditer(tcontent):
+                        result["template_conditions"].append({
+                            "file": rel_t, "type": "askama_auth_check",
+                            "code": tm.group(0)[:80],
+                        })
+
+        # Find mismatches
+        for role in role_checks:
+            if role not in template_roles:
+                result["mismatches"].append({
+                    "type": "backend_role_no_template_guard",
+                    "role": role,
+                    "message": f"Backend checks role '{role}' but no matching template condition found",
+                })
+        for role in template_roles:
+            if role not in role_checks:
+                result["mismatches"].append({
+                    "type": "template_guard_no_backend_role",
+                    "role": role,
+                    "message": f"Template checks role '{role}' but no matching backend guard found",
+                })
+
+        if not result["backend_guards"]:
+            result["warnings"].append("No auth guards or middleware detected in this file")
+
+        return {"status": "ok", **result}

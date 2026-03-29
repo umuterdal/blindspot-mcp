@@ -375,6 +375,73 @@ Use framework-specific tools when available — they understand your framework's
 # Create the MCP server with lifespan manager
 mcp = FastMCP("Blindspot", instructions=_INSTRUCTIONS, lifespan=indexer_lifespan, dependencies=["pathlib"])
 
+# ----- COMPACT RESPONSE HELPER -----
+
+
+def _compact_response(tool_name: str, result, ctx=None) -> dict:
+    """Wrap tool results with compact response system.
+
+    Small results (<2KB estimated) pass through unchanged.
+    Large results are saved to .blindspot/output/session_{pid}.json
+    and a compact summary with detail_file path is returned.
+    """
+    import json as _json
+
+    # Pass through non-dict results (strings, lists)
+    if not isinstance(result, dict):
+        return result
+
+    # Estimate size — rough but fast
+    try:
+        size_estimate = len(_json.dumps(result, default=str))
+    except Exception:
+        return result
+
+    # Small results pass through (< 2KB)
+    if size_estimate < 2000:
+        return result
+
+    # Large results → save to file, return compact summary
+    try:
+        base_path = ""
+        if ctx:
+            try:
+                lc = ctx.request_context.lifespan_context
+                base_path = getattr(lc, "base_path", "") or ""
+            except Exception:
+                pass
+
+        from .services.advanced_analysis_service import AdvancedAnalysisService
+        detail_path = AdvancedAnalysisService._save_to_session_file(tool_name, result, base_path)
+
+        # Build compact summary
+        compact = {
+            "status": result.get("status", "success"),
+            "detail_file": detail_path,
+        }
+
+        # Preserve key summary fields
+        for key in ["file", "file_path", "symbol", "total", "total_issues",
+                     "summary", "risk_level", "total_files", "metrics",
+                     "total_modules", "total_components", "message"]:
+            if key in result:
+                val = result[key]
+                # Keep small values inline, truncate large ones
+                if isinstance(val, (str, int, float, bool)):
+                    compact[key] = val
+                elif isinstance(val, dict) and len(str(val)) < 500:
+                    compact[key] = val
+                elif isinstance(val, list):
+                    compact[key] = f"{len(val)} items (see detail_file)"
+
+        compact["hint"] = f"Full results saved to detail_file. Read only if you need specifics."
+        return compact
+
+    except Exception:
+        # If save fails, return original result
+        return result
+
+
 # ----- RESOURCES -----
 
 
@@ -414,7 +481,7 @@ def search_code_advanced(
 Search for code pattern with pagination. Auto-selects best search tool (ugrep/ripgrep/ag/grep).
 Supports glob file_pattern (e.g., "*.py"), regex patterns, and fuzzy matching (ugrep only).
 """
-    return SearchService(ctx).search_code(
+    return _compact_response("search_code_advanced", SearchService(ctx).search_code(
         pattern=pattern,
         case_sensitive=case_sensitive,
         context_lines=context_lines,
@@ -423,7 +490,7 @@ Supports glob file_pattern (e.g., "*.py"), regex patterns, and fuzzy matching (u
         regex=regex,
         start_index=start_index,
         max_results=max_results,
-    )
+    ), ctx)
 
 
 @mcp.tool()
@@ -447,7 +514,7 @@ def get_file_summary(file_path: str, ctx: Context) -> dict[str, Any]:
     - Import statements
     - Basic complexity metrics
     """
-    return CodeIntelligenceService(ctx).analyze_file(file_path)
+    return _compact_response("get_file_summary", CodeIntelligenceService(ctx).analyze_file(file_path), ctx)
 
 
 @mcp.tool()
@@ -474,7 +541,7 @@ def get_symbol_body(file_path: str, symbol_name: str, ctx: Context, compact: boo
     Returns:
         Dictionary with symbol info. Code field omitted in compact mode.
     """
-    return CodeIntelligenceService(ctx).get_symbol_body(file_path, symbol_name, compact=compact)
+    return _compact_response("get_symbol_body", CodeIntelligenceService(ctx).get_symbol_body(file_path, symbol_name, compact=compact), ctx)
 
 
 @mcp.tool()
@@ -587,7 +654,7 @@ def find_references(symbol: str, ctx: Context, scope: str = "all",
         scope: "all", "controllers", "models", "views", "services", "requests", "migrations"
         model_context: Filter by class/model context to avoid false positives on common names.
     """
-    return GenericIntelligenceService(ctx).find_references(symbol, scope, context_filter=model_context)
+    return _compact_response("find_references", GenericIntelligenceService(ctx).find_references(symbol, scope, context_filter=model_context), ctx)
 
 
 @mcp.tool()
@@ -602,7 +669,7 @@ def get_class_hierarchy(class_name: str, ctx: Context) -> dict[str, Any]:
     Args:
         class_name: Class name to look up (e.g., "UserController", "BaseService")
     """
-    return GenericIntelligenceService(ctx).get_class_hierarchy(class_name)
+    return _compact_response("get_class_hierarchy", GenericIntelligenceService(ctx).get_class_hierarchy(class_name), ctx)
 
 
 @mcp.tool()
@@ -617,7 +684,7 @@ def get_impact_analysis(file_path: str, ctx: Context) -> dict[str, Any]:
     Args:
         file_path: Relative path to analyze (e.g., "src/models/User.py")
     """
-    return GenericIntelligenceService(ctx).get_impact_analysis(file_path)
+    return _compact_response("get_impact_analysis", GenericIntelligenceService(ctx).get_impact_analysis(file_path), ctx)
 
 
 @mcp.tool()
@@ -637,7 +704,7 @@ def get_ripple_effect(file_path: str, symbol: str, ctx: Context,
         symbol: Symbol name (e.g., "is_active", "process_data")
         change_type: "modify" (behavior change), "rename", or "delete"
     """
-    return GenericIntelligenceService(ctx).get_ripple_effect(file_path, symbol, change_type)
+    return _compact_response("get_ripple_effect", GenericIntelligenceService(ctx).get_ripple_effect(file_path, symbol, change_type), ctx)
 
 
 @mcp.tool()
@@ -656,7 +723,7 @@ def get_project_snapshot(ctx: Context) -> dict[str, Any]:
     - hotspots: largest/most complex files
     - cross_references: class → consumer connection map
     """
-    return GenericIntelligenceService(ctx).get_project_snapshot()
+    return _compact_response("get_project_snapshot", GenericIntelligenceService(ctx).get_project_snapshot(), ctx)
 
 
 @mcp.tool()
@@ -831,7 +898,7 @@ def analyze_queries(controller: str, ctx: Context, method: str = None) -> dict[s
         controller: Controller name (e.g., "UserController" or "Admin/OrderController")
         method: Optional method name. If omitted, analyzes ALL public methods.
     """
-    return AdvancedAnalysisService(ctx).analyze_queries(controller, method)
+    return _compact_response("analyze_queries", AdvancedAnalysisService(ctx).analyze_queries(controller, method), ctx)
 
 
 @mcp.tool()
@@ -855,7 +922,7 @@ def rename_symbol(file_path: str, old_name: str, new_name: str, ctx: Context,
         dry_run: If True (default), returns planned edits without applying.
                  If False, applies all edits with syntax check + rollback.
     """
-    return AdvancedAnalysisService(ctx).rename_symbol(file_path, old_name, new_name, dry_run)
+    return _compact_response("rename_symbol", AdvancedAnalysisService(ctx).rename_symbol(file_path, old_name, new_name, dry_run), ctx)
 
 
 @mcp.tool()
@@ -875,7 +942,7 @@ def check_eager_loading(file_path: str, ctx: Context) -> dict[str, Any]:
         file_path: Relative path to controller or Blade file
                    (e.g., "app/Http/Controllers/Public/ListingController.php")
     """
-    return AdvancedAnalysisService(ctx).check_eager_loading(file_path)
+    return _compact_response("check_eager_loading", AdvancedAnalysisService(ctx).check_eager_loading(file_path), ctx)
 
 
 @mcp.tool()
@@ -913,7 +980,7 @@ def detect_cache_conflicts(ctx: Context, cache_key: str = None) -> dict[str, Any
         cache_key: Optional specific cache key pattern to check.
                    If omitted, performs full audit of all cache keys.
     """
-    return AdvancedAnalysisService(ctx).detect_cache_conflicts(cache_key)
+    return _compact_response("detect_cache_conflicts", AdvancedAnalysisService(ctx).detect_cache_conflicts(cache_key), ctx)
 
 
 @mcp.tool()
@@ -934,7 +1001,7 @@ def diff_preview(edits: list, ctx: Context) -> dict[str, Any]:
     Returns:
         Per-file diffs with addition/deletion counts and summary statistics.
     """
-    return AdvancedAnalysisService(ctx).diff_preview(edits)
+    return _compact_response("diff_preview", AdvancedAnalysisService(ctx).diff_preview(edits), ctx)
 
 
 # ----- AUDIT & CHECKLIST TOOLS -----
@@ -1031,7 +1098,7 @@ def get_context_for_edit(file_path: str, ctx: Context, symbol: str = None) -> di
         _SESSION_PIPELINE_CALLS[file_path] = set()
     _SESSION_PIPELINE_CALLS[file_path].add("context")
 
-    return GenericIntelligenceService(ctx).get_context_for_edit(file_path, symbol)
+    return _compact_response("get_context_for_edit", GenericIntelligenceService(ctx).get_context_for_edit(file_path, symbol), ctx)
 
 
 @mcp.tool()

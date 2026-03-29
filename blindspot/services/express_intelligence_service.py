@@ -1875,3 +1875,458 @@ class ExpressIntelligenceService(BaseService):
             "checks": checks,
             "total_references": sum(r.get("total", 0) for r in checks["references"]),
         }
+
+    # -----------------------------------------------------------------
+    # verify_schema
+    # -----------------------------------------------------------------
+    def verify_schema(self, entity_or_model: str, fields: list) -> Dict[str, Any]:
+        """Verify fields exist in Mongoose Schema, Sequelize define(), or TypeORM @Column."""
+        base = self.base_path
+        result: Dict[str, Any] = {
+            "status": "success",
+            "model": entity_or_model,
+            "requested_fields": fields,
+            "found_fields": [],
+            "missing_fields": [],
+            "source_file": None,
+            "warnings": [],
+        }
+
+        model_dirs = [
+            os.path.join(base, "src", "models"),
+            os.path.join(base, "models"),
+            os.path.join(base, "src", "entities"),
+            os.path.join(base, "entities"),
+        ]
+
+        model_found = False
+        all_schema_fields: set = set()
+
+        for mdir in model_dirs:
+            if not os.path.isdir(mdir):
+                continue
+            for dirpath, _, filenames in os.walk(mdir):
+                for fn in filenames:
+                    if not fn.endswith(('.js', '.ts', '.mjs')):
+                        continue
+                    fpath = os.path.join(dirpath, fn)
+                    try:
+                        with open(fpath, 'r', encoding='utf-8', errors='replace') as f:
+                            content = f.read()
+                    except Exception:
+                        continue
+
+                    # Check if file defines the requested model
+                    model_patterns = [
+                        rf'mongoose\.model\s*\(\s*["\']?{re.escape(entity_or_model)}',
+                        rf'new\s+Schema\s*\(.*?{re.escape(entity_or_model)}',
+                        rf'\.define\s*\(\s*["\']?{re.escape(entity_or_model)}',
+                        rf'class\s+{re.escape(entity_or_model)}\s+extends',
+                        rf'{re.escape(entity_or_model)}Schema\s*=',
+                    ]
+                    if not any(re.search(p, content, re.IGNORECASE) for p in model_patterns):
+                        # Also check filename
+                        base_fn = fn.replace('.ts', '').replace('.js', '').replace('.mjs', '').lower()
+                        if entity_or_model.lower() not in base_fn:
+                            continue
+
+                    model_found = True
+                    result["source_file"] = os.path.relpath(fpath, base)
+
+                    # Mongoose Schema fields: key: { type: ... } or key: Type
+                    mongoose_fields = re.findall(r'(\w+)\s*:\s*(?:\{[^}]*type\s*:|String|Number|Boolean|Date|ObjectId|Array|Buffer|Map|Schema)', content)
+                    all_schema_fields.update(mongoose_fields)
+
+                    # Sequelize define fields
+                    seq_fields = re.findall(r'(\w+)\s*:\s*\{[^}]*type\s*:\s*DataTypes\.', content)
+                    all_schema_fields.update(seq_fields)
+
+                    # TypeORM @Column
+                    typeorm_fields = re.findall(r'@Column\s*\([^)]*\)\s*\n?\s*(\w+)', content)
+                    all_schema_fields.update(typeorm_fields)
+
+                    # Plain object keys as fallback
+                    plain_keys = re.findall(r'^\s+(\w+)\s*:', content, re.MULTILINE)
+                    all_schema_fields.update(plain_keys)
+
+        if not model_found:
+            result["warnings"].append(f"Model '{entity_or_model}' not found in model directories")
+            result["missing_fields"] = list(fields)
+        else:
+            for fld in fields:
+                if fld in all_schema_fields:
+                    result["found_fields"].append(fld)
+                else:
+                    result["missing_fields"].append(fld)
+
+        return result
+
+    # -----------------------------------------------------------------
+    # detect_transaction_risks
+    # -----------------------------------------------------------------
+    def detect_transaction_risks(self, file_path: str) -> Dict[str, Any]:
+        """Detect missing transaction wrappers around multiple DB writes."""
+        base = self.base_path
+        full_path = os.path.join(base, file_path) if not os.path.isabs(file_path) else file_path
+        result: Dict[str, Any] = {
+            "status": "success",
+            "file": file_path,
+            "risks": [],
+            "suggestions": [],
+        }
+        if not os.path.isfile(full_path):
+            result["status"] = "error"
+            result["error"] = f"File not found: {file_path}"
+            return result
+
+        try:
+            with open(full_path, 'r', encoding='utf-8', errors='replace') as f:
+                content = f.read()
+        except Exception as e:
+            result["status"] = "error"
+            result["error"] = str(e)
+            return result
+
+        write_ops_re = re.compile(r'\.\s*(?:save|create|update|delete|destroy|remove|insertMany|updateMany|deleteMany|bulkCreate|bulkWrite)\s*\(')
+        transaction_re = re.compile(r'(?:\.startSession|\.startTransaction|sequelize\.transaction|\.createQueryRunner|withTransaction|session\s*:\s*\w+)')
+        cache_ops_re = re.compile(r'(?:redis\.|cache\.|\.setex\s*\(|\.set\s*\(|\.del\s*\(|ioredis|memcached)')
+
+        # Split into functions/methods
+        func_re = re.compile(
+            r'(?:async\s+)?(?:function\s+(\w+)|(?:const|let|var)\s+(\w+)\s*=\s*(?:async\s+)?\(?|(\w+)\s*(?::\s*\w+)?\s*(?:=\s*)?async\s*\(|(\w+)\s*\([^)]*\)\s*\{)',
+            re.MULTILINE
+        )
+        functions = list(func_re.finditer(content))
+
+        for i, m in enumerate(functions):
+            func_name = m.group(1) or m.group(2) or m.group(3) or m.group(4) or "anonymous"
+            start = m.start()
+            end = functions[i + 1].start() if i + 1 < len(functions) else len(content)
+            block = content[start:end]
+
+            writes = write_ops_re.findall(block)
+            has_transaction = bool(transaction_re.search(block))
+            has_cache = bool(cache_ops_re.search(block))
+
+            if len(writes) >= 2 and not has_transaction:
+                result["risks"].append({
+                    "function": func_name,
+                    "type": "missing_transaction",
+                    "write_count": len(writes),
+                    "message": f"Function '{func_name}' has {len(writes)} write operations without a transaction wrapper",
+                    "severity": "high",
+                })
+
+            if has_transaction and has_cache:
+                result["risks"].append({
+                    "function": func_name,
+                    "type": "cache_in_transaction",
+                    "message": f"Function '{func_name}' mixes cache operations with DB transaction -- risk of inconsistency on rollback",
+                    "severity": "medium",
+                })
+
+        if not result["risks"]:
+            result["suggestions"].append("No transaction risks detected")
+
+        return result
+
+    # -----------------------------------------------------------------
+    # get_domain_rules
+    # -----------------------------------------------------------------
+    def get_domain_rules(self, file_path: str) -> Dict[str, Any]:
+        """Return Express domain-layer rules for the given file."""
+        base = self.base_path
+        full_path = os.path.join(base, file_path) if not os.path.isabs(file_path) else file_path
+        result: Dict[str, Any] = {
+            "status": "success",
+            "file": file_path,
+            "file_type": "unknown",
+            "violations": [],
+            "rules_checked": [],
+        }
+        if not os.path.isfile(full_path):
+            result["status"] = "error"
+            result["error"] = f"File not found: {file_path}"
+            return result
+
+        try:
+            with open(full_path, 'r', encoding='utf-8', errors='replace') as f:
+                content = f.read()
+        except Exception as e:
+            result["status"] = "error"
+            result["error"] = str(e)
+            return result
+
+        # Classify file type
+        lower_path = file_path.lower()
+        if '/route' in lower_path or 'router' in content[:500].lower():
+            ftype = "route"
+        elif '/controller' in lower_path:
+            ftype = "controller"
+        elif '/model' in lower_path or '/entit' in lower_path:
+            ftype = "model"
+        elif '/middleware' in lower_path:
+            ftype = "middleware"
+        else:
+            ftype = "other"
+        result["file_type"] = ftype
+
+        if ftype == "route":
+            result["rules_checked"].append("Routes must use validation middleware")
+            route_methods = re.findall(r'(?:router|app)\s*\.\s*(?:get|post|put|patch|delete)\s*\(\s*["\'][^"\']+["\']\s*,\s*(\w+)\s*\)', content)
+            # Routes with body methods but no validation middleware
+            body_routes = re.finditer(r'(?:router|app)\s*\.\s*(?:post|put|patch)\s*\(\s*["\'][^"\']+["\']\s*,([^)]+)\)', content)
+            for m in body_routes:
+                handler_chain = m.group(1)
+                if not re.search(r'(?:validate|validation|check|body\s*\(|param\s*\(|joi|zod|yup|express-validator)', handler_chain, re.IGNORECASE):
+                    result["violations"].append({
+                        "rule": "missing_validation_middleware",
+                        "message": f"POST/PUT/PATCH route without validation middleware: {m.group(0).strip()[:80]}",
+                        "severity": "medium",
+                    })
+
+        elif ftype == "controller":
+            result["rules_checked"].append("Controllers must have error handling")
+            # Check for try/catch or error middleware
+            func_re = re.compile(r'(?:async\s+)?(?:function\s+(\w+)|(?:const|let)\s+(\w+)\s*=)', re.MULTILINE)
+            funcs = list(func_re.finditer(content))
+            for i, fm in enumerate(funcs):
+                fname = fm.group(1) or fm.group(2) or "anonymous"
+                start = fm.start()
+                end = funcs[i + 1].start() if i + 1 < len(funcs) else len(content)
+                block = content[start:end]
+                if 'async' in block[:50] and 'try' not in block and 'catch' not in block and 'wrapper' not in block.lower():
+                    result["violations"].append({
+                        "rule": "missing_error_handling",
+                        "message": f"Async controller '{fname}' has no try/catch error handling",
+                        "severity": "medium",
+                    })
+
+        elif ftype == "model":
+            result["rules_checked"].append("Models must include field validation")
+            if not re.search(r'(?:required\s*:\s*true|validate\s*:|validator|min\s*:|max\s*:|minlength|maxlength|enum\s*:)', content, re.IGNORECASE):
+                result["violations"].append({
+                    "rule": "missing_model_validation",
+                    "message": "Model has no field validations (required, min, max, enum, etc.)",
+                    "severity": "medium",
+                })
+
+        elif ftype == "middleware":
+            result["rules_checked"].append("Middleware must call next()")
+            # Check exported functions for next() call
+            func_blocks = re.findall(r'(?:module\.exports|export)\s*=.*?(?=module\.exports|export|$)', content, re.DOTALL)
+            if not func_blocks:
+                func_blocks = [content]
+            for block in func_blocks:
+                if re.search(r'(?:req|request)\s*,\s*(?:res|response)\s*,\s*next', block) and 'next(' not in block:
+                    result["violations"].append({
+                        "rule": "missing_next_call",
+                        "message": "Middleware accepts next parameter but never calls next()",
+                        "severity": "high",
+                    })
+
+        return result
+
+    # -----------------------------------------------------------------
+    # generate_test_skeleton
+    # -----------------------------------------------------------------
+    def generate_test_skeleton(self, file_path: str, symbol: str) -> Dict[str, Any]:
+        """Generate a Jest/Mocha test skeleton for an Express module."""
+        base = self.base_path
+        full_path = os.path.join(base, file_path) if not os.path.isabs(file_path) else file_path
+        result: Dict[str, Any] = {
+            "status": "success",
+            "file": file_path,
+            "symbol": symbol,
+            "test_skeleton": "",
+            "test_file_path": "",
+            "framework": "jest",
+        }
+        if not os.path.isfile(full_path):
+            result["status"] = "error"
+            result["error"] = f"File not found: {file_path}"
+            return result
+
+        try:
+            with open(full_path, 'r', encoding='utf-8', errors='replace') as f:
+                content = f.read()
+        except Exception as e:
+            result["status"] = "error"
+            result["error"] = str(e)
+            return result
+
+        # Detect if it uses TypeScript
+        is_ts = file_path.endswith('.ts')
+        ext = '.test.ts' if is_ts else '.test.js'
+
+        # Determine test path
+        test_path = file_path
+        for prefix in ['src/', 'lib/']:
+            if test_path.startswith(prefix):
+                test_path = test_path.replace(prefix, '__tests__/', 1)
+                break
+        else:
+            test_path = '__tests__/' + test_path
+        test_path = re.sub(r'\.(js|ts|mjs)$', ext, test_path)
+        result["test_file_path"] = test_path
+
+        # Detect imports/requires for mocking
+        imports = re.findall(r"(?:require\s*\(\s*['\"]([^'\"]+)['\"]\s*\)|from\s+['\"]([^'\"]+)['\"])", content)
+        mock_modules = [i[0] or i[1] for i in imports if not (i[0] or i[1]).startswith('.')]
+
+        # Detect exported functions
+        exported_funcs = re.findall(r'(?:module\.exports\s*=\s*\{([^}]+)\}|export\s+(?:const|function|async\s+function)\s+(\w+))', content, re.DOTALL)
+        func_names = []
+        for grp in exported_funcs:
+            if grp[0]:
+                func_names.extend(re.findall(r'(\w+)', grp[0]))
+            if grp[1]:
+                func_names.append(grp[1])
+
+        # Classify for supertest usage
+        lower_path = file_path.lower()
+        uses_supertest = '/route' in lower_path or '/controller' in lower_path or 'app' in lower_path
+
+        mock_lines = "\n".join(f"jest.mock('{mod}');" for mod in mock_modules[:5])
+        import_path = './' + os.path.relpath(
+            full_path.replace(base + '/', ''),
+            os.path.dirname(test_path)
+        ).replace('\\', '/')
+        import_path = re.sub(r'\.(js|ts|mjs)$', '', import_path)
+
+        supertest_block = ""
+        if uses_supertest:
+            supertest_block = """const request = require('supertest');
+const app = require('../app'); // adjust path as needed
+"""
+
+        skeleton = f"""const {{ {', '.join(func_names[:5]) if func_names else symbol} }} = require('{import_path}');
+{supertest_block}
+{mock_lines}
+
+describe('{symbol}', () => {{
+    beforeEach(() => {{
+        jest.clearAllMocks();
+    }});
+"""
+        if uses_supertest:
+            skeleton += f"""
+    describe('HTTP endpoints', () => {{
+        it('should respond with 200', async () => {{
+            const res = await request(app)
+                .get('/TODO')
+                .expect(200);
+            expect(res.body).toBeDefined();
+        }});
+    }});
+"""
+        else:
+            skeleton += f"""
+    describe('{symbol}', () => {{
+        it('should return expected result', async () => {{
+            // Arrange
+            // TODO: set up test data and mocks
+
+            // Act
+            const result = await {symbol}(/* args */);
+
+            // Assert
+            expect(result).toBeDefined();
+        }});
+
+        it('should handle errors gracefully', async () => {{
+            // Arrange
+            // TODO: set up error condition
+
+            // Act & Assert
+            await expect({symbol}(/* args */)).rejects.toThrow();
+        }});
+    }});
+"""
+        skeleton += "});\n"
+        result["test_skeleton"] = skeleton
+        return result
+
+    # -----------------------------------------------------------------
+    # match_view_guards
+    # -----------------------------------------------------------------
+    def match_view_guards(self, file_path: str, symbol: str) -> Dict[str, Any]:
+        """Match Express middleware auth checks to SSR template conditional renders."""
+        base = self.base_path
+        full_path = os.path.join(base, file_path) if not os.path.isabs(file_path) else file_path
+        result: Dict[str, Any] = {
+            "status": "success",
+            "file": file_path,
+            "symbol": symbol,
+            "backend_guards": [],
+            "view_guards": [],
+            "mismatches": [],
+        }
+        if not os.path.isfile(full_path):
+            result["status"] = "error"
+            result["error"] = f"File not found: {file_path}"
+            return result
+
+        try:
+            with open(full_path, 'r', encoding='utf-8', errors='replace') as f:
+                content = f.read()
+        except Exception as e:
+            result["status"] = "error"
+            result["error"] = str(e)
+            return result
+
+        # Extract middleware auth checks
+        auth_middleware_re = re.compile(r'(?:isAuthenticated|isAdmin|requireAuth|requireLogin|ensureAuth|passport\.authenticate|isLoggedIn|checkRole|requireRole|hasRole)\s*(?:\(\s*["\']?(\w+)?["\']?\s*\))?')
+        role_check_re = re.compile(r'(?:req\.user\.role\s*===?\s*["\'](\w+)["\']|req\.user\.(?:isAdmin|is_admin)|req\.session\.(?:user|isAuthenticated))')
+
+        roles_backend: set = set()
+        for m in auth_middleware_re.finditer(content):
+            guard_name = m.group(0).split('(')[0].strip()
+            role = m.group(1) if m.group(1) else None
+            result["backend_guards"].append({"type": "middleware", "guard": guard_name, "role": role})
+            if role:
+                roles_backend.add(role)
+        for m in role_check_re.finditer(content):
+            if m.group(1):
+                roles_backend.add(m.group(1))
+                result["backend_guards"].append({"type": "role_check", "role": m.group(1)})
+
+        # Scan EJS/Handlebars/Pug templates
+        view_dirs = [
+            os.path.join(base, "views"),
+            os.path.join(base, "src", "views"),
+        ]
+        roles_frontend: set = set()
+        for vdir in view_dirs:
+            if not os.path.isdir(vdir):
+                continue
+            for dirpath, _, filenames in os.walk(vdir):
+                for fn in filenames:
+                    if not fn.endswith(('.ejs', '.hbs', '.handlebars', '.pug', '.html')):
+                        continue
+                    tpath = os.path.join(dirpath, fn)
+                    try:
+                        with open(tpath, 'r', encoding='utf-8', errors='replace') as f:
+                            tcontent = f.read()
+                    except Exception:
+                        continue
+                    rel_path = os.path.relpath(tpath, base)
+                    # EJS: <% if (user.role === 'admin') %>
+                    ejs_guards = re.findall(r'<%[-=]?\s*if\s*\(\s*(?:user|currentUser|req\.user)\.(\w+)', tcontent)
+                    for g in ejs_guards:
+                        result["view_guards"].append({"file": rel_path, "type": "ejs_condition", "field": g})
+                        roles_frontend.add(g)
+                    # Handlebars: {{#if user.isAdmin}}
+                    hbs_guards = re.findall(r'\{\{#if\s+(?:user|currentUser)\.(\w+)', tcontent)
+                    for g in hbs_guards:
+                        result["view_guards"].append({"file": rel_path, "type": "handlebars_condition", "field": g})
+                        roles_frontend.add(g)
+
+        backend_only = roles_backend - roles_frontend
+        frontend_only = roles_frontend - roles_backend
+        for role in backend_only:
+            result["mismatches"].append({"role": role, "issue": "Backend auth check has no matching view condition"})
+        for role in frontend_only:
+            result["mismatches"].append({"role": role, "issue": "View condition has no matching backend auth check"})
+
+        return result

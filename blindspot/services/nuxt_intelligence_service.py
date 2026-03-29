@@ -2712,3 +2712,495 @@ class NuxtIntelligenceService(BaseService):
             if pattern.search(content):
                 rel = os.path.relpath(fpath, base)
                 result["consumers"].append({"file": rel, "relationship": "reference"})
+
+    # ── verify_schema ────────────────────────────────────────────────
+
+    def verify_schema(self, model_name: str, fields: list) -> Dict[str, Any]:
+        """Verify data model fields across Prisma/Drizzle schemas and TypeScript interfaces."""
+        base = self._get_project_path()
+        if not base:
+            return {"status": "error", "message": "Project path not set"}
+
+        result: Dict[str, Any] = {
+            "model": model_name,
+            "expected_fields": fields,
+            "prisma_fields": [],
+            "drizzle_fields": [],
+            "typescript_fields": [],
+            "mismatches": [],
+        }
+
+        # Scan Prisma schema
+        prisma_paths = [
+            os.path.join(base, "prisma", "schema.prisma"),
+            os.path.join(base, "server", "prisma", "schema.prisma"),
+        ]
+        for prisma_path in prisma_paths:
+            if os.path.isfile(prisma_path):
+                content = self._read_file(prisma_path) or ""
+                model_match = re.search(
+                    rf"model\s+{re.escape(model_name)}\s*\{{(.*?)\}}",
+                    content, re.DOTALL,
+                )
+                if model_match:
+                    body = model_match.group(1)
+                    for line in body.strip().split("\n"):
+                        line = line.strip()
+                        if line and not line.startswith("//") and not line.startswith("@@"):
+                            field_m = re.match(r"(\w+)\s+", line)
+                            if field_m:
+                                result["prisma_fields"].append(field_m.group(1))
+
+        # Scan Drizzle schema
+        drizzle_dirs = [
+            os.path.join(base, "server", "database", "schema"),
+            os.path.join(base, "server", "db", "schema"),
+            os.path.join(base, "drizzle"),
+        ]
+        table_pattern = re.compile(
+            rf"(?:export\s+const\s+{re.escape(model_name.lower())}(?:s|Table)?|"
+            rf"pgTable|mysqlTable|sqliteTable)\s*\(\s*['\"](?:{re.escape(model_name.lower())}s?)['\"]"
+            rf"\s*,\s*\{{(.*?)\}}\s*\)",
+            re.DOTALL,
+        )
+        col_pattern = re.compile(r"(\w+)\s*:\s*(?:text|varchar|integer|boolean|timestamp|serial|uuid|jsonb?|real|numeric)\s*\(")
+
+        for ddir in drizzle_dirs:
+            if not os.path.isdir(ddir):
+                continue
+            for fpath in self._walk_files(ddir, (".ts", ".js")):
+                content = self._read_file(fpath) or ""
+                tm = table_pattern.search(content)
+                if tm:
+                    body = tm.group(1)
+                    for cm in col_pattern.finditer(body):
+                        result["drizzle_fields"].append(cm.group(1))
+
+        # Scan TypeScript interfaces/types
+        ts_dirs = [
+            os.path.join(base, "types"),
+            os.path.join(base, "server", "types"),
+            os.path.join(base, "composables"),
+            os.path.join(base, "utils"),
+        ]
+        iface_pattern = re.compile(
+            rf"(?:interface|type)\s+{re.escape(model_name)}\s*(?:extends\s+\w+\s*)?\{{(.*?)\}}",
+            re.DOTALL,
+        )
+        ts_field_pattern = re.compile(r"(\w+)\s*[?:]")
+
+        for tdir in ts_dirs:
+            if not os.path.isdir(tdir):
+                continue
+            for fpath in self._walk_files(tdir, (".ts", ".d.ts")):
+                content = self._read_file(fpath) or ""
+                for im in iface_pattern.finditer(content):
+                    body = im.group(1)
+                    for fm in ts_field_pattern.finditer(body):
+                        result["typescript_fields"].append(fm.group(1))
+
+        # Check mismatches
+        expected_set = set(fields)
+        prisma_set = set(result["prisma_fields"])
+        drizzle_set = set(result["drizzle_fields"])
+        ts_set = set(result["typescript_fields"])
+
+        for field in fields:
+            if prisma_set and field not in prisma_set:
+                result["mismatches"].append({
+                    "field": field, "issue": "missing_in_prisma",
+                    "message": f"Field '{field}' not found in Prisma schema",
+                })
+            if drizzle_set and field not in drizzle_set:
+                result["mismatches"].append({
+                    "field": field, "issue": "missing_in_drizzle",
+                    "message": f"Field '{field}' not found in Drizzle schema",
+                })
+            if ts_set and field not in ts_set:
+                result["mismatches"].append({
+                    "field": field, "issue": "missing_in_typescript",
+                    "message": f"Field '{field}' not found in TypeScript interface",
+                })
+
+        result["status"] = "ok" if not result["mismatches"] else "mismatches_found"
+        return result
+
+    # ── detect_transaction_risks ─────────────────────────────────────
+
+    def detect_transaction_risks(self, file_path: str) -> Dict[str, Any]:
+        """Detect missing prisma.$transaction around multiple prisma calls in server routes."""
+        base = self._get_project_path()
+        if not base:
+            return {"status": "error", "message": "Project path not set"}
+
+        full_path = os.path.join(base, file_path) if not os.path.isabs(file_path) else file_path
+        if not os.path.isfile(full_path):
+            return {"status": "error", "message": f"File not found: {file_path}"}
+
+        content = self._read_file(full_path)
+        if not content:
+            return {"status": "error", "message": "Could not read file"}
+
+        risks: List[Dict[str, Any]] = []
+        lines = content.split("\n")
+
+        # Find function/handler boundaries
+        handler_pattern = re.compile(
+            r"(?:export\s+(?:default\s+)?)?(?:async\s+)?(?:function\s+(\w+)|const\s+(\w+)\s*=\s*(?:async\s*)?\(?.*?\)?\s*(?:=>|:\s*EventHandler))",
+            re.MULTILINE,
+        )
+        handlers = list(handler_pattern.finditer(content))
+
+        for idx, hm in enumerate(handlers):
+            handler_name = hm.group(1) or hm.group(2) or "anonymous"
+            start = hm.start()
+            end = handlers[idx + 1].start() if idx + 1 < len(handlers) else len(content)
+            body = content[start:end]
+
+            # Count prisma write operations
+            prisma_writes = re.findall(
+                r"prisma\s*\.\s*\w+\s*\.\s*(?:create|update|delete|upsert|createMany|updateMany|deleteMany)\s*\(",
+                body,
+            )
+
+            if len(prisma_writes) >= 2:
+                has_transaction = bool(re.search(
+                    r"prisma\s*\.\s*\$transaction\s*\(", body,
+                ))
+                if not has_transaction:
+                    line_num = content[:start].count("\n") + 1
+                    risks.append({
+                        "handler": handler_name,
+                        "line": line_num,
+                        "prisma_operations": len(prisma_writes),
+                        "risk": "multiple_writes_without_transaction",
+                        "message": f"Handler '{handler_name}' has {len(prisma_writes)} Prisma write operations without $transaction",
+                        "suggestion": "Wrap in prisma.$transaction([...]) or prisma.$transaction(async (tx) => { ... })",
+                    })
+
+            # Check for sequential reads that could use batch
+            prisma_reads = re.findall(
+                r"await\s+prisma\s*\.\s*(\w+)\s*\.\s*(?:findUnique|findFirst|findMany)\s*\(",
+                body,
+            )
+            if len(prisma_reads) >= 3:
+                line_num = content[:start].count("\n") + 1
+                risks.append({
+                    "handler": handler_name,
+                    "line": line_num,
+                    "risk": "sequential_reads",
+                    "reads": len(prisma_reads),
+                    "message": f"Handler '{handler_name}' has {len(prisma_reads)} sequential Prisma reads -- consider batching",
+                    "suggestion": "Use Promise.all() or prisma.$transaction() for parallel execution",
+                })
+
+        return {"status": "ok", "file": file_path, "risks": risks, "total_risks": len(risks)}
+
+    # ── get_domain_rules ─────────────────────────────────────────────
+
+    def get_domain_rules(self, file_path: str) -> Dict[str, Any]:
+        """Check Nuxt domain-specific rules for file types."""
+        base = self._get_project_path()
+        if not base:
+            return {"status": "error", "message": "Project path not set"}
+
+        full_path = os.path.join(base, file_path) if not os.path.isabs(file_path) else file_path
+        if not os.path.isfile(full_path):
+            return {"status": "error", "message": f"File not found: {file_path}"}
+
+        content = self._read_file(full_path)
+        if not content:
+            return {"status": "error", "message": "Could not read file"}
+
+        violations: List[Dict[str, Any]] = []
+        file_type = "unknown"
+        rel_path = os.path.relpath(full_path, base) if base else file_path
+
+        if re.search(r"server/(?:api|routes)/", rel_path):
+            file_type = "server_route"
+            # Rule: server routes require error handling with createError
+            handler_bodies = re.findall(
+                r"(?:export\s+default\s+)?defineEventHandler\s*\(\s*(?:async\s*)?\([^)]*\)\s*=>\s*\{(.*?)\}\s*\)",
+                content, re.DOTALL,
+            )
+            for body in handler_bodies:
+                if "createError" not in body and "throw" not in body:
+                    violations.append({
+                        "rule": "server_route_error_handling",
+                        "severity": "warning",
+                        "message": "Server route handler lacks error handling -- use createError() for proper error responses",
+                    })
+
+        elif re.search(r"composables/", rel_path):
+            file_type = "composable"
+            # Rule: composables should not make direct API calls in setup
+            if re.search(r"(?:useFetch|useAsyncData|\$fetch)\s*\(", content):
+                # Check if it's inside a function (OK) or at top level (not OK)
+                top_level_fetch = re.search(
+                    r"^(?:const|let|var)\s+\w+\s*=\s*(?:await\s+)?(?:useFetch|useAsyncData|\$fetch)\s*\(",
+                    content, re.MULTILINE,
+                )
+                if top_level_fetch:
+                    violations.append({
+                        "rule": "composable_no_direct_api",
+                        "severity": "warning",
+                        "message": "Composable has top-level API call -- wrap in a composable function to avoid setup-phase side effects",
+                    })
+
+        elif re.search(r"pages/", rel_path) and rel_path.endswith(".vue"):
+            file_type = "page"
+            # Rule: pages require definePageMeta
+            if "definePageMeta" not in content:
+                violations.append({
+                    "rule": "page_requires_meta",
+                    "severity": "info",
+                    "message": "Page component lacks definePageMeta -- consider adding layout, middleware, or title metadata",
+                })
+            # Check for missing head/SEO
+            if "useHead" not in content and "useSeoMeta" not in content and "definePageMeta" not in content:
+                violations.append({
+                    "rule": "page_requires_head",
+                    "severity": "info",
+                    "message": "Page has no useHead() or useSeoMeta() -- consider adding SEO metadata",
+                })
+
+        elif re.search(r"middleware/", rel_path):
+            file_type = "middleware"
+            # Rule: middleware must return navigateTo
+            if "navigateTo" not in content and "abortNavigation" not in content:
+                violations.append({
+                    "rule": "middleware_requires_navigation",
+                    "severity": "warning",
+                    "message": "Middleware does not use navigateTo() or abortNavigation() -- may silently pass through",
+                })
+
+        return {
+            "status": "ok",
+            "file": file_path,
+            "file_type": file_type,
+            "violations": violations,
+            "total_violations": len(violations),
+        }
+
+    # ── generate_test_skeleton ───────────────────────────────────────
+
+    def generate_test_skeleton(self, file_path: str, symbol: str) -> Dict[str, Any]:
+        """Generate a Vitest test skeleton for a Nuxt component, composable, or server route."""
+        base = self._get_project_path()
+        if not base:
+            return {"status": "error", "message": "Project path not set"}
+
+        full_path = os.path.join(base, file_path) if not os.path.isabs(file_path) else file_path
+        if not os.path.isfile(full_path):
+            return {"status": "error", "message": f"File not found: {file_path}"}
+
+        content = self._read_file(full_path)
+        if not content:
+            return {"status": "error", "message": "Could not read file"}
+
+        result: Dict[str, Any] = {"file": file_path, "symbol": symbol, "skeleton": "", "test_type": "unknown"}
+        rel_path = os.path.relpath(full_path, base) if base else file_path
+
+        # Detect component props
+        props = re.findall(r"defineProps\s*<\s*\{([^}]*)\}", content, re.DOTALL)
+        prop_names = []
+        if props:
+            prop_names = re.findall(r"(\w+)\s*[?:]", props[0])
+
+        # Detect emits
+        emits = re.findall(r"defineEmits\s*(?:<[^>]+>)?\(\s*\[([^\]]*)\]", content)
+        emit_names = []
+        if emits:
+            emit_names = re.findall(r"['\"](\w+)['\"]", emits[0])
+
+        if rel_path.endswith(".vue"):
+            result["test_type"] = "component"
+            props_str = ", ".join(f"{p}: undefined" for p in prop_names[:5]) if prop_names else ""
+            emit_tests = "\n".join(
+                f"    // expect(wrapper.emitted('{e}')).toBeTruthy();"
+                for e in emit_names[:5]
+            )
+            result["skeleton"] = (
+                f"import {{ describe, it, expect }} from 'vitest';\n"
+                f"import {{ mount }} from '@vue/test-utils';\n"
+                f"import {symbol} from '~/{rel_path}';\n\n"
+                f"describe('{symbol}', () => {{\n"
+                f"  it('should mount successfully', () => {{\n"
+                f"    const wrapper = mount({symbol}, {{\n"
+                f"      props: {{ {props_str} }},\n"
+                f"    }});\n"
+                f"    expect(wrapper.exists()).toBe(true);\n"
+                f"  }});\n\n"
+                f"  it('should render correctly', () => {{\n"
+                f"    const wrapper = mount({symbol});\n"
+                f"    // TODO: Add specific render assertions\n"
+                f"    expect(wrapper.html()).toMatchSnapshot();\n"
+                f"  }});\n"
+                + (f"\n  it('should emit events', () => {{\n"
+                   f"    const wrapper = mount({symbol});\n"
+                   f"{emit_tests}\n"
+                   f"  }});\n" if emit_names else "")
+                + f"}});\n"
+            )
+
+        elif re.search(r"composables/", rel_path):
+            result["test_type"] = "composable"
+            result["skeleton"] = (
+                f"import {{ describe, it, expect }} from 'vitest';\n"
+                f"import {{ createApp }} from 'vue';\n"
+                f"import {{ {symbol} }} from '~/{rel_path.replace('.ts', '').replace('.js', '')}';\n\n"
+                f"describe('{symbol}', () => {{\n"
+                f"  it('should return expected values', () => {{\n"
+                f"    const app = createApp({{ setup() {{ const result = {symbol}(); return {{ result }}; }} }});\n"
+                f"    // TODO: Mount app and verify composable return values\n"
+                f"  }});\n\n"
+                f"  it('should handle reactive state', () => {{\n"
+                f"    // TODO: Test reactivity\n"
+                f"  }});\n"
+                f"}});\n"
+            )
+
+        elif re.search(r"server/(?:api|routes)/", rel_path):
+            result["test_type"] = "server_route"
+            result["skeleton"] = (
+                f"import {{ describe, it, expect }} from 'vitest';\n"
+                f"import {{ setup, $fetch }} from '@nuxt/test-utils';\n\n"
+                f"describe('{symbol}', () => {{\n"
+                f"  await setup({{ server: true }});\n\n"
+                f"  it('should return valid response', async () => {{\n"
+                f"    const data = await $fetch('/api/{symbol.replace('_', '/')}');\n"
+                f"    expect(data).toBeDefined();\n"
+                f"    // TODO: Add specific response assertions\n"
+                f"  }});\n\n"
+                f"  it('should handle errors', async () => {{\n"
+                f"    // TODO: Test error scenarios\n"
+                f"    await expect($fetch('/api/{symbol.replace('_', '/')}', {{ method: 'POST' }}))\n"
+                f"      .rejects.toThrow();\n"
+                f"  }});\n"
+                f"}});\n"
+            )
+        else:
+            result["test_type"] = "utility"
+            result["skeleton"] = (
+                f"import {{ describe, it, expect }} from 'vitest';\n"
+                f"import {{ {symbol} }} from '~/{rel_path.replace('.ts', '').replace('.js', '')}';\n\n"
+                f"describe('{symbol}', () => {{\n"
+                f"  it('should work correctly', () => {{\n"
+                f"    const result = {symbol}();\n"
+                f"    expect(result).toBeDefined();\n"
+                f"  }});\n"
+                f"}});\n"
+            )
+
+        result["status"] = "ok"
+        return result
+
+    # ── match_view_guards ────────────────────────────────────────────
+
+    def match_view_guards(self, file_path: str, symbol: str) -> Dict[str, Any]:
+        """Match server middleware auth to frontend v-if/v-show conditions and definePageMeta middleware."""
+        base = self._get_project_path()
+        if not base:
+            return {"status": "error", "message": "Project path not set"}
+
+        full_path = os.path.join(base, file_path) if not os.path.isabs(file_path) else file_path
+        if not os.path.isfile(full_path):
+            return {"status": "error", "message": f"File not found: {file_path}"}
+
+        content = self._read_file(full_path)
+        if not content:
+            return {"status": "error", "message": "Could not read file"}
+
+        result: Dict[str, Any] = {
+            "file": file_path,
+            "symbol": symbol,
+            "server_guards": [],
+            "client_guards": [],
+            "page_meta_guards": [],
+            "unmatched": [],
+        }
+
+        rel_path = os.path.relpath(full_path, base) if base else file_path
+
+        # Check server middleware for auth checks
+        if re.search(r"server/middleware/", rel_path) or re.search(r"middleware/", rel_path):
+            # Server-side auth checks
+            auth_checks = re.findall(
+                r"(?:getServerSession|requireAuth|isAuthenticated|getToken|verifyToken|event\.context\.auth)\s*\(",
+                content,
+            )
+            for ac in auth_checks:
+                result["server_guards"].append({
+                    "type": "server_middleware",
+                    "check": ac.strip("("),
+                    "file": rel_path,
+                })
+
+            # Check for throw/createError on auth failure
+            error_throws = re.findall(
+                r"(?:throw\s+createError|createError)\s*\(\s*\{[^}]*(?:401|403|unauthorized|forbidden)[^}]*\}",
+                content, re.IGNORECASE,
+            )
+            for et in error_throws:
+                result["server_guards"].append({
+                    "type": "auth_error",
+                    "detail": et.strip()[:80],
+                })
+
+        # Scan Vue components for matching v-if/v-show auth conditions
+        pages_dir = os.path.join(base, "pages")
+        components_dir = os.path.join(base, "components")
+        layouts_dir = os.path.join(base, "layouts")
+
+        for scan_dir in [pages_dir, components_dir, layouts_dir]:
+            if not os.path.isdir(scan_dir):
+                continue
+            for fpath in self._walk_files(scan_dir, (".vue",)):
+                fe_content = self._read_file(fpath)
+                if not fe_content:
+                    continue
+                rel = os.path.relpath(fpath, base)
+
+                # Look for auth-related v-if / v-show directives
+                auth_directives = re.findall(
+                    r'(?:v-if|v-show)\s*=\s*"([^"]*(?:auth|user|logged|session|isAuth|token|role|permission)[^"]*)"',
+                    fe_content, re.IGNORECASE,
+                )
+                for ad in auth_directives:
+                    result["client_guards"].append({
+                        "file": rel,
+                        "directive": ad,
+                        "type": "template_conditional",
+                    })
+
+                # Look for definePageMeta middleware
+                meta_match = re.search(
+                    r"definePageMeta\s*\(\s*\{[^}]*middleware\s*:\s*\[?['\"]?(\w+)['\"]?\]?",
+                    fe_content,
+                )
+                if meta_match:
+                    mw_name = meta_match.group(1)
+                    if re.search(r"auth", mw_name, re.IGNORECASE):
+                        result["page_meta_guards"].append({
+                            "file": rel,
+                            "middleware": mw_name,
+                            "type": "page_meta_middleware",
+                        })
+
+        # Identify unmatched guards
+        has_server = bool(result["server_guards"])
+        has_client = bool(result["client_guards"]) or bool(result["page_meta_guards"])
+
+        if has_server and not has_client:
+            result["unmatched"].append({
+                "severity": "warning",
+                "message": "Server auth middleware exists but no matching client-side auth conditionals found",
+            })
+        if has_client and not has_server:
+            result["unmatched"].append({
+                "severity": "error",
+                "message": "Client-side auth checks exist but no server middleware auth guard found -- potential security issue",
+            })
+
+        result["status"] = "ok"
+        return result
