@@ -322,16 +322,17 @@ class AdvancedAnalysisService(BaseService):
 
     def analyze_queries(self, controller: str, method: str = None) -> Dict[str, Any]:
         """
-        Analyze Eloquent queries in a controller method for performance issues.
+        Analyze ORM queries in a controller for performance issues.
 
         Detects:
         - N+1 query risks (relationship access without eager loading)
         - Missing database indexes on filtered/sorted columns
-        - ->get() without pagination on list endpoints
+        - Unbounded queries without pagination on list endpoints
         - Queries inside loops
-        - Missing ->select() (fetching all columns)
+        - Missing column selection (fetching all columns)
 
-        Uses model $table property and migration schema for accurate table resolution.
+        Currently optimized for PHP/Laravel Eloquent queries.
+        For other frameworks, use framework-specific query analysis tools.
 
         Args:
             controller: Controller name (e.g., "UserController" or "Admin/OrderController")
@@ -340,6 +341,23 @@ class AdvancedAnalysisService(BaseService):
         base = self._get_project_path()
         if not base:
             return {"status": "error", "message": "Project path not set"}
+
+        # Check if controller file exists — graceful degradation for non-PHP projects
+        controller_file = self._find_controller_file(base, controller) if hasattr(self, '_find_controller_file') else None
+        if not controller_file:
+            # Try generic search
+            from ..adapters.project_structure import get_project_structure
+            structure = get_project_structure(base)
+            found = False
+            for rel_path, abs_path in structure.walk_source_files():
+                if controller.lower() in os.path.basename(rel_path).lower():
+                    found = True
+                    break
+            if not found:
+                return {
+                    "status": "not_applicable",
+                    "message": f"Controller '{controller}' not found. This tool is optimized for PHP/Laravel. For other frameworks, use framework-specific tools.",
+                }
 
         controller_file = self._find_controller_file(base, controller)
         if not controller_file:
@@ -1075,8 +1093,9 @@ class AdvancedAnalysisService(BaseService):
         """
         Detect cache key conflicts and inconsistencies.
 
-        Independently scans ALL PHP files for Cache::remember/get readers,
-        not just relying on get_cache_map's reverse_map (which only has invalidators).
+        Scans source files for cache operations and finds conflicts.
+        Currently optimized for PHP/Laravel projects with Cache:: facade.
+        For other frameworks, use framework-specific cache tools.
 
         Args:
             cache_key: Optional cache key pattern to filter results.
@@ -1084,6 +1103,13 @@ class AdvancedAnalysisService(BaseService):
         base = self._get_project_path()
         if not base:
             return {"status": "error", "message": "Project path not set"}
+
+        # Check if this is a PHP/Laravel project
+        if not os.path.isdir(os.path.join(base, "app", "Models")):
+            return {
+                "status": "not_applicable",
+                "message": "detect_cache_conflicts is optimized for PHP/Laravel projects. Use framework-specific cache tools for other frameworks.",
+            }
 
         validator = self._get_validator()
         cache_map_result = validator.get_cache_map()
@@ -1283,6 +1309,9 @@ class AdvancedAnalysisService(BaseService):
         total_deletions = 0
 
         for edit in edits:
+            if not isinstance(edit, dict):
+                errors.append({"error": f"Each edit must be a dict with file_path/search/replace, got {type(edit).__name__}"})
+                continue
             file_path = edit.get("file_path", "")
             search = edit.get("search", "")
             replace = edit.get("replace", "")
@@ -1738,7 +1767,8 @@ class AdvancedAnalysisService(BaseService):
             if any(skip in rel_root.split(os.sep) for skip in [
                 "node_modules", "vendor", ".git", "__pycache__", ".mypy_cache",
                 "dist", "build", ".next", "target", "coverage", "test_env",
-                ".blindspot",
+                ".blindspot", ".venv", "venv", "env", ".tox", ".nox",
+                "site-packages", ".eggs", "htmlcov", ".pytest_cache",
             ]):
                 continue
             for fname in files:
