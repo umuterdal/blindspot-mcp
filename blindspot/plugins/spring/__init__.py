@@ -207,7 +207,7 @@ class SpringPlugin(BlindspotPlugin):
         @mcp.tool()
         @handle_mcp_tool_errors(return_type="dict")
         @with_concurrency_limit
-        def get_cache_map(ctx: Context, entity_name: str = None) -> dict[str, Any]:
+        def get_spring_cache_map(ctx: Context, entity_name: str = None) -> dict[str, Any]:
             """
             Map all Spring Cache annotations (@Cacheable, @CacheEvict, @CachePut, @Caching).
             Builds cache_name -> {readers, writers, evictors} mapping and detects

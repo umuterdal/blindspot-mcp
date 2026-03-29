@@ -341,7 +341,7 @@ Blindspot auto-detects your framework and loads only the relevant plugin tools:
 - **Tested on real projects** — Verified on multiple real-world projects with real data
 - **Alpha** — Architecture and parsing logic complete, needs community testing on diverse projects. Your bug reports and PRs will make these production-ready!
 
-**No framework detected?** The 31 core tools still work perfectly on any project in any language. They use the deep index (tree-sitter) for symbol extraction, cross-file references, class hierarchies, and impact analysis.
+**No framework detected?** The 34 core tools still work perfectly on any project in any language. They use the deep index (tree-sitter) for symbol extraction, cross-file references, class hierarchies, and impact analysis.
 
 ---
 

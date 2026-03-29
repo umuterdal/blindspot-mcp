@@ -50,12 +50,19 @@ class FileEditService(BaseService):
     # ─── Path & IO ───────────────────────────────────────────────
 
     def _resolve_path(self, file_path: str) -> str:
-        """Resolve a relative file path to an absolute path."""
+        """Resolve a relative file path to an absolute path with security checks."""
         if self.base_path:
-            return os.path.join(self.base_path, file_path)
+            full_path = os.path.normpath(os.path.join(self.base_path, file_path))
+            # Prevent path traversal outside project
+            if not full_path.startswith(os.path.normpath(self.base_path) + os.sep) and full_path != os.path.normpath(self.base_path):
+                raise ValueError(f"Path traversal blocked: {file_path}")
+            return full_path
         index_manager = get_index_manager()
         if index_manager.project_path:
-            return os.path.join(index_manager.project_path, file_path)
+            full_path = os.path.normpath(os.path.join(index_manager.project_path, file_path))
+            if not full_path.startswith(os.path.normpath(index_manager.project_path) + os.sep):
+                raise ValueError(f"Path traversal blocked: {file_path}")
+            return full_path
         raise ValueError("Project path not set. Call set_project_path first.")
 
     def _read_file(self, full_path: str) -> str:
@@ -225,11 +232,13 @@ class FileEditService(BaseService):
         if not cmd_template:
             return None
 
+        # Safe command building - no shell=True
         cmd = cmd_template.replace("{file}", full_path)
+        cmd_parts = cmd.split()
 
         try:
             result = subprocess.run(
-                cmd, shell=True,
+                cmd_parts,
                 capture_output=True, text=True, timeout=15,
             )
             if result.returncode != 0:

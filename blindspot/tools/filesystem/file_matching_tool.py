@@ -18,6 +18,14 @@ class FileInfo:
     relative_path: str
     language: str
 
+    def __hash__(self):
+        return hash(self.relative_path)
+
+    def __eq__(self, other):
+        if not isinstance(other, FileInfo):
+            return NotImplemented
+        return self.relative_path == other.relative_path
+
 
 class FileMatchingTool:
     """

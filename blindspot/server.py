@@ -80,10 +80,10 @@ class FIFOConcurrencyLimiter:
             while self._serving_ticket != my_ticket or self._active_count >= self._max_concurrent:
                 remaining = timeout - (time.monotonic() - start)
                 if remaining <= 0:
-                    # Timeout: skip our ticket so others can proceed
-                    if self._serving_ticket == my_ticket:
-                        self._serving_ticket += 1
-                        self._condition.notify_all()
+                    # Timeout: always advance serving_ticket to prevent deadlock
+                    if self._serving_ticket <= my_ticket:
+                        self._serving_ticket = my_ticket + 1
+                    self._condition.notify_all()
                     raise TimeoutError(f"Queue timeout after {timeout}s (ticket {my_ticket})")
 
                 self._condition.wait(timeout=min(remaining, 1.0))

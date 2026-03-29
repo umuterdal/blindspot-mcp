@@ -58,11 +58,14 @@ class ValidationHelper:
 
         # Construct the full path and verify it's within the project bounds
         full_path = os.path.join(base_path, norm_path)
-        real_full_path = os.path.realpath(full_path)
-        real_base_path = os.path.realpath(base_path)
-
-        if not real_full_path.startswith(real_base_path):
-            return "Access denied. File path must be within project directory."
+        try:
+            real_file = os.path.realpath(full_path)
+            real_base = os.path.realpath(base_path)
+            common = os.path.commonpath([real_file, real_base])
+            if common != real_base:
+                return f"Path escapes project directory: {file_path}"
+        except ValueError:
+            return f"Invalid path: {file_path}"
 
         return None
 

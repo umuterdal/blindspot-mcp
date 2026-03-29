@@ -43,6 +43,31 @@ _SESSION_METRICS: Dict[str, Any] = {
     "resolved_ripple_items": 0,
     "avg_affected_per_edit": 0.0,
 }
+_SESSION_START_TIME: float = time.time()
+_SESSION_MAX_AGE: int = 3600  # 1 hour TTL
+_SESSION_MAX_ITEMS: int = 1000  # Max ripple items before cleanup
+
+
+def _check_session_cleanup():
+    """Clean up session state if too old or too large."""
+    global _SESSION_START_TIME
+    now = time.time()
+    if now - _SESSION_START_TIME > _SESSION_MAX_AGE or len(_SESSION_RIPPLE_ITEMS) > _SESSION_MAX_ITEMS:
+        _SESSION_RIPPLE_ITEMS.clear()
+        _SESSION_RESOLVED.clear()
+        _SESSION_INDEX_DIRTY.clear()
+        _SESSION_PIPELINE_CALLS.clear()
+        _SESSION_DECISIONS.clear()
+        _SESSION_FEEDBACK_OVERRIDES.clear()
+        _SESSION_METRICS["total_edits"] = 0
+        _SESSION_METRICS["files_edited"] = set()
+        _SESSION_METRICS["blocked_edits"] = 0
+        _SESSION_METRICS["total_warnings"] = 0
+        _SESSION_METRICS["warnings_by_type"] = {}
+        _SESSION_METRICS["total_ripple_items"] = 0
+        _SESSION_METRICS["resolved_ripple_items"] = 0
+        _SESSION_METRICS["avg_affected_per_edit"] = 0.0
+        _SESSION_START_TIME = now
 
 # Laravel irregular pluralization — covers common model names
 _IRREGULAR_PLURALS = {
@@ -2371,6 +2396,8 @@ class AdvancedAnalysisService(BaseService):
 
         Args: Same as apply_edit — all 5 modes supported.
         """
+        _check_session_cleanup()
+
         from .file_edit_service import FileEditService
 
         edit_svc = FileEditService(self.ctx)
