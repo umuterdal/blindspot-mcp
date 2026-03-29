@@ -238,9 +238,13 @@ class FileEditService(BaseService):
         if not cmd_template:
             return None
 
-        # Safe command building - no shell=True
+        # Safe command building - shlex.split handles quoted paths with spaces
+        import shlex
         cmd = cmd_template.replace("{file}", full_path)
-        cmd_parts = cmd.split()
+        try:
+            cmd_parts = shlex.split(cmd)
+        except ValueError:
+            cmd_parts = cmd.split()
 
         try:
             result = subprocess.run(

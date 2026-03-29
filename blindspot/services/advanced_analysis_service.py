@@ -2434,7 +2434,9 @@ class AdvancedAnalysisService(BaseService):
 
         Args: Same as apply_edit — all 5 modes supported.
         """
-        _check_session_cleanup()
+        base = self._get_project_path() or ""
+        _check_session_cleanup(base)
+        session = _get_session(base)
 
         from .file_edit_service import FileEditService
 
@@ -2443,14 +2445,26 @@ class AdvancedAnalysisService(BaseService):
 
         # Pipeline enforcement: check if get_context_for_edit was called first
         if strict_mode and strict_mode.get("enforce_pipeline"):
-            pipeline_calls = _SESSION_PIPELINE_CALLS.get(file_path, set())
+            pipeline_calls = session["pipeline_calls"].get(file_path, set())
             if "context" not in pipeline_calls:
-                _SESSION_METRICS["blocked_edits"] += 1
+                session["metrics"]["blocked_edits"] += 1
                 return {
                     "status": "blocked",
                     "message": "Pipeline enforcement: call get_context_for_edit() before smart_apply_edit on high-risk files",
                     "missing_pipeline_steps": ["get_context_for_edit"],
                 }
+
+        # Sync global aliases with project-scoped session for backward compat
+        # All reads/writes below go through these references which point to session data
+        global _SESSION_RIPPLE_ITEMS, _SESSION_RESOLVED, _SESSION_INDEX_DIRTY
+        global _SESSION_PIPELINE_CALLS, _SESSION_DECISIONS, _SESSION_FEEDBACK_OVERRIDES, _SESSION_METRICS
+        _SESSION_RIPPLE_ITEMS = session["ripple_items"]
+        _SESSION_RESOLVED = session["resolved"]
+        _SESSION_INDEX_DIRTY = session["index_dirty"]
+        _SESSION_PIPELINE_CALLS = session["pipeline_calls"]
+        _SESSION_DECISIONS = session["decisions"]
+        _SESSION_FEEDBACK_OVERRIDES = session["feedback_overrides"]
+        _SESSION_METRICS = session["metrics"]
 
         # Process human feedback overrides
         if feedback:

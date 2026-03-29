@@ -1087,11 +1087,17 @@ def get_context_for_edit(file_path: str, ctx: Context, symbol: str = None) -> di
         file_path: Relative path to the file about to be edited
         symbol: Optional method/property to focus on (triggers ripple analysis)
     """
-    # Track pipeline call for strict_mode enforcement in smart_apply_edit
-    from .services.advanced_analysis_service import _SESSION_PIPELINE_CALLS
-    if file_path not in _SESSION_PIPELINE_CALLS:
-        _SESSION_PIPELINE_CALLS[file_path] = set()
-    _SESSION_PIPELINE_CALLS[file_path].add("context")
+    # Track pipeline call in project-scoped session
+    from .services.advanced_analysis_service import _get_session
+    try:
+        lc = ctx.request_context.lifespan_context
+        base = getattr(lc, "base_path", "") or ""
+    except Exception:
+        base = ""
+    session = _get_session(base)
+    if file_path not in session["pipeline_calls"]:
+        session["pipeline_calls"][file_path] = set()
+    session["pipeline_calls"][file_path].add("context")
 
     return _compact_response("get_context_for_edit", GenericIntelligenceService(ctx).get_context_for_edit(file_path, symbol), ctx)
 
