@@ -9,7 +9,6 @@ import io
 import logging
 import os
 import time
-from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, asdict
 from pathlib import Path
@@ -101,8 +100,8 @@ class JSONIndexBuilder:
                 if file_size > MAX_FILE_SIZE:
                     logger.info("Large file (%d bytes), using lightweight mode: %s", file_size, file_path)
                     use_lightweight = True
-            except OSError:
-                pass
+            except OSError as e:
+                logger.debug("Suppressed exception in best-effort path: %s", e)
 
             with open(file_path, "rb") as raw:
                 sample = raw.read(8192)

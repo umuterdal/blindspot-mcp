@@ -402,8 +402,8 @@ def _compact_response(tool_name: str, result, ctx=None) -> dict:
             try:
                 lc = ctx.request_context.lifespan_context
                 base_path = getattr(lc, "base_path", "") or ""
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Suppressed exception in best-effort path: %s", e)
 
         from .services.advanced_analysis_service import AdvancedAnalysisService
         detail_path = AdvancedAnalysisService._save_to_session_file(tool_name, result, base_path)
@@ -1242,8 +1242,8 @@ def main(argv: list[str] | None = None):
             structure = get_project_structure(args.project_path)
             if structure.framework and structure.framework != "none":
                 frameworks_to_load.add(structure.framework)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("Suppressed exception in best-effort path: %s", e)
 
     # Register plugin tools for all detected frameworks
     # In a monorepo like frontend(Next.js) + backend(NestJS), both plugins load

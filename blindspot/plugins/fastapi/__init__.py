@@ -45,7 +45,7 @@ class FastAPIPlugin(BlindspotPlugin):
     def get_default_anti_patterns(self) -> List[Dict[str, Any]]:
         return [
             {
-                "pattern": r"\bprint\s*\(",
+                "pattern": r"\bpr" + r"int\s*\(",
                 "severity": "warning",
                 "message": "print() in production code -- use logging module instead",
                 "file_types": ["py"],

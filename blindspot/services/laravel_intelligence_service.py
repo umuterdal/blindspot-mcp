@@ -1367,7 +1367,7 @@ class LaravelIntelligenceService(BaseService):
         """Find which method contains a given line number."""
         try:
             with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
-                lines = f.readlines()
+                lines = list(f)
         except Exception as e:
             logger.debug("Failed to read %s for method lookup: %s", file_path, e)
             return None

@@ -5,4 +5,4 @@ about your entire codebase — relationships, schemas, affected files, cache key
 all without reading files into the AI's context window.
 """
 
-__version__ = "0.1.3"
+__version__ = "0.1.4"

@@ -246,8 +246,8 @@ class SymbolResolver:
                             break
                     if class_file:
                         break
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Suppressed exception in best-effort path: %s", e)
 
         # Parse extends/implements from signature or file content
         if class_file:
@@ -291,8 +291,8 @@ class SymbolResolver:
                                 if trait not in ("HasFactory", "Notifiable", "SoftDeletes"):
                                     result["mixins"].append(trait)
 
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Suppressed exception in best-effort path: %s", e)
 
         # Find who extends/implements this class
         source_files = self.structure.walk_source_files()
@@ -397,8 +397,8 @@ class SymbolResolver:
                     symbols_to_check.append(cls["name"])
                 for fn in syntax.find_function_declarations(content):
                     symbols_to_check.append(fn["name"])
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Suppressed exception in best-effort path: %s", e)
 
         if not symbols_to_check:
             return {
@@ -564,8 +564,8 @@ class SymbolResolver:
                         if cls.get("signature"):
                             cls_info["signature"] = cls["signature"][:100]
                         classes_summary.append(cls_info)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Suppressed exception in best-effort path: %s", e)
 
         snapshot["classes"] = classes_summary[:100]  # Cap at 100
 
@@ -588,8 +588,8 @@ class SymbolResolver:
                             len(s.get("methods", [])) +
                             len(s.get("classes", []))
                         )
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("Suppressed exception in best-effort path: %s", e)
 
             if line_count > 200 or symbol_count > 10:
                 hotspots.append({
@@ -613,8 +613,8 @@ class SymbolResolver:
                     imports = summary.get("imports", [])
                     if imports:
                         cross_refs[rel_path] = imports[:10]
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Suppressed exception in best-effort path: %s", e)
 
         snapshot["import_graph"] = dict(list(cross_refs.items())[:50])
 
@@ -676,12 +676,12 @@ class SymbolResolver:
                 # Read symbol code
                 try:
                     with open(full_path, "r", encoding="utf-8", errors="replace") as f:
-                        lines = f.readlines()
+                        lines = list(f)
                     start = sym_info.get("line", 1) - 1
                     end = sym_info.get("end_line", start + 20)
                     context["symbol_code"] = "".join(lines[start:end])
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("Suppressed exception in best-effort path: %s", e)
 
             # Ripple effect for this symbol
             ripple = self.get_ripple_effect(rel_path, symbol)

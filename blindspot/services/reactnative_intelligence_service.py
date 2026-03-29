@@ -159,8 +159,8 @@ class ReactNativeIntelligenceService(BaseService):
                     deps = {**data.get("dependencies", {}), **data.get("devDependencies", {})}
                     if "react-native" in deps:
                         return base
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("Suppressed exception in best-effort path: %s", e)
 
             # Monorepo: search common workspace directories
             for name in ["mobile", "app", "client", "native", "packages"]:
@@ -178,8 +178,8 @@ class ReactNativeIntelligenceService(BaseService):
                         continue
 
             return base
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("Suppressed exception in best-effort path: %s", e)
         return None
 
     def _collect_rn_files(
@@ -739,8 +739,8 @@ class ReactNativeIntelligenceService(BaseService):
                 config = json.loads(app_config)
                 if "expo" in config:
                     results["is_expo"] = True
-            except (json.JSONDecodeError, ValueError):
-                pass
+            except (json.JSONDecodeError, ValueError) as e:
+                logger.debug("Suppressed exception in best-effort path: %s", e)
 
         # Also check for expo in package.json
         pkg_json_path = os.path.join(base, "package.json")
@@ -755,8 +755,8 @@ class ReactNativeIntelligenceService(BaseService):
                 for dep_name in deps:
                     if dep_name.startswith("expo-"):
                         results["expo_modules"].append(dep_name)
-            except (json.JSONDecodeError, ValueError):
-                pass
+            except (json.JSONDecodeError, ValueError) as e:
+                logger.debug("Suppressed exception in best-effort path: %s", e)
 
         rn_files = self._collect_rn_files(base, ["src", "app", "native", "modules"])
 
@@ -1807,8 +1807,8 @@ class ReactNativeIntelligenceService(BaseService):
                     conventions["frameworks"].append("testing-library")
                 if "detox" in deps:
                     conventions["frameworks"].append("detox")
-            except (json.JSONDecodeError, ValueError):
-                pass
+            except (json.JSONDecodeError, ValueError) as e:
+                logger.debug("Suppressed exception in best-effort path: %s", e)
 
         # Check for maestro flows
         maestro_dir = os.path.join(base, ".maestro")
@@ -1895,8 +1895,8 @@ class ReactNativeIntelligenceService(BaseService):
                     conventions["architecture"] = "expo"
                     plugins = config.get("expo", {}).get("plugins", [])
                     conventions["expo_modules"] = len(plugins)
-            except (json.JSONDecodeError, ValueError):
-                pass
+            except (json.JSONDecodeError, ValueError) as e:
+                logger.debug("Suppressed exception in best-effort path: %s", e)
 
         # Count native files
         for platform in ["ios", "android"]:
@@ -2023,8 +2023,8 @@ class ReactNativeIntelligenceService(BaseService):
                             "@tanstack/react-query", "recoil"]:
                     if lib in deps:
                         snapshot["state_management"].append(lib)
-            except (json.JSONDecodeError, ValueError):
-                pass
+            except (json.JSONDecodeError, ValueError) as e:
+                logger.debug("Suppressed exception in best-effort path: %s", e)
 
         # Check Expo
         app_json = os.path.join(base, "app.json")
@@ -2035,8 +2035,8 @@ class ReactNativeIntelligenceService(BaseService):
                 if "expo" in config:
                     snapshot["is_expo"] = True
                     snapshot["expo_sdk"] = config.get("expo", {}).get("sdkVersion")
-            except (json.JSONDecodeError, ValueError):
-                pass
+            except (json.JSONDecodeError, ValueError) as e:
+                logger.debug("Suppressed exception in best-effort path: %s", e)
 
         # Directory structure
         src_path = os.path.join(base, "src")

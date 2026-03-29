@@ -137,8 +137,8 @@ class FileEditService(BaseService):
                 for old_file in existing[: len(existing) - MAX_DETAIL_FILES]:
                     try:
                         os.remove(old_file)
-                    except OSError:
-                        pass
+                    except OSError as e:
+                        logger.debug("Suppressed exception in best-effort path: %s", e)
 
             return os.path.relpath(full_path, base)
         except Exception as e:

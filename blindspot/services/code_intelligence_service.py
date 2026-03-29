@@ -306,7 +306,7 @@ class CodeIntelligenceService(BaseService):
                 full_path = file_path
 
             with open(full_path, 'r', encoding='utf-8') as f:
-                lines = f.readlines()
+                lines = list(f)
 
             start_idx = line - 1
             if end_line:

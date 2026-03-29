@@ -198,8 +198,8 @@ class NuxtIntelligenceService(BaseService):
             base = self.base_path
             if base and os.path.isdir(base):
                 return base
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("Suppressed exception in best-effort path: %s", e)
         return None
 
     def _is_nuxt_project(self, base: str) -> bool:
@@ -1965,8 +1965,8 @@ class NuxtIntelligenceService(BaseService):
                     result["conventions"].append({"type": "component_testing", "pattern": "@vue/test-utils"})
                 if "@testing-library/vue" in all_deps:
                     result["conventions"].append({"type": "component_testing", "pattern": "@testing-library/vue"})
-            except json.JSONDecodeError:
-                pass
+            except json.JSONDecodeError as e:
+                logger.debug("Suppressed exception in best-effort path: %s", e)
 
         # Count test files
         test_files = []
@@ -2293,8 +2293,8 @@ class NuxtIntelligenceService(BaseService):
                 scripts = pkg.get("scripts", {})
                 if scripts:
                     snapshot["scripts"] = scripts
-            except json.JSONDecodeError:
-                pass
+            except json.JSONDecodeError as e:
+                logger.debug("Suppressed exception in best-effort path: %s", e)
 
         return snapshot
 
@@ -2891,7 +2891,7 @@ class NuxtIntelligenceService(BaseService):
                     "risk": "sequential_reads",
                     "reads": len(prisma_reads),
                     "message": f"Handler '{handler_name}' has {len(prisma_reads)} sequential Prisma reads -- consider batching",
-                    "suggestion": "Use Promise.all() or prisma.$transaction() for parallel execution",
+                    "suggestion": "Use parallel awaits or prisma.$transaction() for parallel execution",
                 })
 
         return {"status": "ok", "file": file_path, "risks": risks, "total_risks": len(risks)}

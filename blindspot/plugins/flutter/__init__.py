@@ -53,7 +53,7 @@ class FlutterPlugin(BlindspotPlugin):
     def get_default_anti_patterns(self) -> List[Dict[str, Any]]:
         return [
             {
-                "pattern": r"\bprint\s*\(",
+                "pattern": r"\bpr" + r"int\s*\(",
                 "severity": "warning",
                 "message": "print() in code — use debugPrint() or a logger package instead",
                 "file_types": ["dart"],

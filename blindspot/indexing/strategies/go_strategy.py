@@ -144,8 +144,8 @@ class GoParsingStrategy(ParsingStrategy):
             match = re.match(r'func\s+(?:\([^)]*\)\s+)?(\w+)\s*\(', line)
             if match:
                 return match.group(1)
-        except:
-            pass
+        except Exception:
+            return None
         return None
 
     def _extract_go_imports(self, lines: List[str]) -> List[str]:

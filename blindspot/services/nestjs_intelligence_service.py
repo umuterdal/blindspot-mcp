@@ -152,8 +152,8 @@ class NestJSIntelligenceService(BaseService):
                     deps = {**data.get("dependencies", {}), **data.get("devDependencies", {})}
                     if "@nestjs/core" in deps:
                         return base
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("Suppressed exception in best-effort path: %s", e)
 
             # Monorepo: search common workspace directories
             for name in ["backend", "api", "server", "services", "packages"]:
@@ -171,8 +171,8 @@ class NestJSIntelligenceService(BaseService):
                         continue
 
             return base
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("Suppressed exception in best-effort path: %s", e)
         return None
 
     def _scan_files(self, base: str, directory: str,
@@ -666,8 +666,8 @@ class NestJSIntelligenceService(BaseService):
                         continue
                     if name not in entities:
                         entities[name] = info
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Suppressed exception in best-effort path: %s", e)
 
         return {
             "status": "ok",
@@ -1627,8 +1627,8 @@ class NestJSIntelligenceService(BaseService):
                         "version": pkg.get("version"),
                         "nest_version": pkg.get("dependencies", {}).get("@nestjs/core"),
                     }
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Suppressed exception in best-effort path: %s", e)
 
         endpoint_map = self.get_endpoint_map()
 
@@ -1795,8 +1795,8 @@ class NestJSIntelligenceService(BaseService):
                             "severity": ap["severity"],
                             "message": ap["message"],
                         })
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Suppressed exception in best-effort path: %s", e)
 
         result["total_references"] = sum(r["count"] for r in result["references"])
         result["files_affected"] = len(result["references"])
@@ -1878,8 +1878,8 @@ class NestJSIntelligenceService(BaseService):
                         if fm:
                             found_columns.add(fm.group(1))
                     source_files.append("prisma/schema.prisma")
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Suppressed exception in best-effort path: %s", e)
 
         found = [c for c in columns if c in found_columns]
         missing = [c for c in columns if c not in found_columns]
@@ -2000,8 +2000,8 @@ class NestJSIntelligenceService(BaseService):
             try:
                 with open(full_path, "r", encoding="utf-8", errors="replace") as f:
                     content = f.read()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Suppressed exception in best-effort path: %s", e)
 
         # Controllers → require guards
         if "controller" in norm:

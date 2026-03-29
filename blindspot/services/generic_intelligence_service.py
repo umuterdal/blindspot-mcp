@@ -32,8 +32,8 @@ class GenericIntelligenceService(BaseService):
             base = self.base_path
             if base and os.path.isdir(base):
                 return base
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("Suppressed exception in best-effort path: %s", e)
         return None
 
     def _get_resolver(self) -> Optional[SymbolResolver]:

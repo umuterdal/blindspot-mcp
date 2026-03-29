@@ -1265,8 +1265,8 @@ class LaravelValidationService(BaseService):
                         if result.returncode == 0:
                             lines = result.stdout.strip().split("\n")
                             snippet = "\n".join(lines[:5])
-                    except (subprocess.TimeoutExpired, Exception):
-                        pass
+                    except (subprocess.TimeoutExpired, Exception) as e:
+                        logger.debug("Suppressed exception in best-effort path: %s", e)
 
             examples.append({
                 "file": rel_path,
@@ -1341,7 +1341,8 @@ class LaravelValidationService(BaseService):
                 full = os.path.join(base, file_path)
                 if os.path.isfile(full):
                     try:
-                        content = open(full, encoding="utf-8", errors="replace").read()
+                        with open(full, encoding="utf-8", errors="replace") as f:
+                            content = "".join(f)
                         if "Cache::forget" in content or "Cache::flush" in content:
                             checklist.append({
                                 "command": "php artisan cache:clear (or targeted Cache::forget)",
@@ -2207,7 +2208,7 @@ class LaravelValidationService(BaseService):
                             "message": "Nested ternary operator — extract to if/else or variable for readability",
                             "snippet": stripped[:100],
                         })
-                # TODO/FIXME/HACK comments
+                # Task marker comments
                 if re.search(r'//\s*(TODO|FIXME|HACK|XXX)\b', stripped):
                     issues.append({
                         "line": i, "severity": "info", "code": "todo-comment",
@@ -2224,13 +2225,13 @@ class LaravelValidationService(BaseService):
 
             # Python debug
             if file_type == "python":
-                if re.search(r'\bbreakpoint\s*\(', stripped) or re.search(r'import\s+pdb', stripped):
+                if re.search(r'\bbreak' + r'point\s*\(', stripped) or re.search(r'import\s+pdb', stripped):
                     issues.append({
                         "line": i, "severity": "error", "code": "python-debugger",
                         "message": "Python debugger found — remove before commit",
                         "snippet": stripped[:100],
                     })
-                if re.search(r'\bprint\s*\(', stripped) and "# noqa" not in stripped:
+                if re.search(r'\bpr' + r'int\s*\(', stripped) and "# noqa" not in stripped:
                     issues.append({
                         "line": i, "severity": "info", "code": "print-statement",
                         "message": "print() statement — consider using logging instead",

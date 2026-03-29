@@ -155,8 +155,8 @@ class RailsIntelligenceService(BaseService):
             base = self.base_path
             if base and os.path.isdir(base):
                 return base
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("Suppressed exception in best-effort path: %s", e)
         return None
 
     def _scan_files(self, base: str, directory: str, extensions: tuple = (".rb",)) -> List[dict]:
@@ -1819,8 +1819,8 @@ class RailsIntelligenceService(BaseService):
                     if g["name"] == "rails":
                         snapshot["rails_version"] = g.get("version")
                         break
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Suppressed exception in best-effort path: %s", e)
 
         # Ruby version
         ruby_version_file = os.path.join(base, ".ruby-version")
@@ -1828,8 +1828,8 @@ class RailsIntelligenceService(BaseService):
             try:
                 with open(ruby_version_file, "r") as f:
                     snapshot["ruby_version"] = f.read().strip()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Suppressed exception in best-effort path: %s", e)
 
         return {
             "status": "success",
@@ -2005,8 +2005,8 @@ class RailsIntelligenceService(BaseService):
                         schema_fields.update(col_names)
                         result["schema_fields"] = list(schema_fields)
                         break
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Suppressed exception in best-effort path: %s", e)
 
         # 2. Scan db/migrate/ for create_table and add_column
         migrate_dir = os.path.join(base, "db", "migrate")

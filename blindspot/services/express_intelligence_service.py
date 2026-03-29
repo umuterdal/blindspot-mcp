@@ -156,8 +156,8 @@ class ExpressIntelligenceService(BaseService):
             base = self.base_path
             if base and os.path.isdir(base):
                 return base
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("Suppressed exception in best-effort path: %s", e)
         return None
 
     def _scan_files(self, base: str, directory: str, extensions: tuple = (".js", ".ts", ".mjs")) -> List[dict]:
@@ -202,8 +202,8 @@ class ExpressIntelligenceService(BaseService):
                     with open(fpath, "r", encoding="utf-8", errors="replace") as f:
                         content = f.read()
                     all_files.append({"path": fpath, "rel_path": fname, "content": content})
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("Suppressed exception in best-effort path: %s", e)
         return all_files
 
     # ── 1. get_model_schema ───────────────────────────────────────────
@@ -1729,8 +1729,8 @@ class ExpressIntelligenceService(BaseService):
                     "dev": list(pkg.get("devDependencies", {}).keys()),
                 }
                 snapshot["scripts"] = pkg.get("scripts", {})
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Suppressed exception in best-effort path: %s", e)
 
         # .env variables (names only, not values)
         env_path = os.path.join(base, ".env")
@@ -1745,8 +1745,8 @@ class ExpressIntelligenceService(BaseService):
                                 var_name = line.split("=")[0].strip()
                                 if var_name and var_name not in snapshot["env_vars"]:
                                     snapshot["env_vars"].append(var_name)
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("Suppressed exception in best-effort path: %s", e)
 
         return {
             "status": "success",

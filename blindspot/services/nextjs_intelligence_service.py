@@ -220,8 +220,8 @@ class NextjsIntelligenceService(BaseService):
                         return sub
 
             return base
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("Suppressed exception in best-effort path: %s", e)
         return None
 
     def _find_src_root(self, base: str) -> str:
@@ -1951,8 +1951,8 @@ class NextjsIntelligenceService(BaseService):
                         "swr": deps.get("swr"),
                     }
                     conventions["installed_state_libs"] = {k: v for k, v in state_libs.items() if v}
-                except json.JSONDecodeError:
-                    pass
+                except json.JSONDecodeError as e:
+                    logger.debug("Suppressed exception in best-effort path: %s", e)
 
         return conventions
 
@@ -2124,8 +2124,8 @@ class NextjsIntelligenceService(BaseService):
                         elif lib in deps:
                             ui_libs[lib] = deps[lib]
                     conventions["ui_libraries"] = ui_libs
-                except json.JSONDecodeError:
-                    pass
+                except json.JSONDecodeError as e:
+                    logger.debug("Suppressed exception in best-effort path: %s", e)
 
         return conventions
 
@@ -2200,8 +2200,8 @@ class NextjsIntelligenceService(BaseService):
                     scripts = pkg.get("scripts", {})
                     test_scripts = {k: v for k, v in scripts.items() if "test" in k.lower()}
                     conventions["test_scripts"] = test_scripts
-                except json.JSONDecodeError:
-                    pass
+                except json.JSONDecodeError as e:
+                    logger.debug("Suppressed exception in best-effort path: %s", e)
 
         # Determine naming convention (.test vs .spec)
         test_total = sum(v for k, v in test_patterns.items() if ".test." in k)
@@ -2382,8 +2382,8 @@ class NextjsIntelligenceService(BaseService):
                     snapshot["key_dependencies"] = key_deps
                     snapshot["total_dependencies"] = len(deps)
                     snapshot["total_dev_dependencies"] = len(dev_deps)
-                except json.JSONDecodeError:
-                    pass
+                except json.JSONDecodeError as e:
+                    logger.debug("Suppressed exception in best-effort path: %s", e)
 
         # tsconfig.json
         tsconfig_path = os.path.join(base, "tsconfig.json")
@@ -2401,8 +2401,8 @@ class NextjsIntelligenceService(BaseService):
                     paths = tc.get("compilerOptions", {}).get("paths", {})
                     if paths:
                         snapshot["path_aliases"] = list(paths.keys())
-                except (json.JSONDecodeError, Exception):
-                    pass
+                except (json.JSONDecodeError, Exception) as e:
+                    logger.debug("Suppressed exception in best-effort path: %s", e)
         else:
             snapshot["has_typescript"] = False
 
@@ -3090,8 +3090,8 @@ class NextjsIntelligenceService(BaseService):
             try:
                 with open(full_path, "r", encoding="utf-8", errors="replace") as f:
                     content = f.read()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Suppressed exception in best-effort path: %s", e)
 
         # API routes → require error handling + auth check
         is_api = "/api/" in norm or "route.ts" in norm or "route.js" in norm

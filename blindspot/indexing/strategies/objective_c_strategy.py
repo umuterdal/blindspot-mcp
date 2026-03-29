@@ -133,8 +133,8 @@ class ObjectiveCParsingStrategy(ParsingStrategy):
             match = re.search(r'[+-]\s*\([^)]*\)\s*(\w+)', line)
             if match:
                 return match.group(1)
-        except:
-            pass
+        except Exception:
+            return None
         return None
 
     def _extract_objc_called_functions(self, line: str) -> List[str]:

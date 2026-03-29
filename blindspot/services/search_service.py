@@ -10,7 +10,6 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from .base_service import BaseService
 from ..utils import FileFilter, ResponseFormatter, ValidationHelper
-from ..search.base import is_safe_regex_pattern
 
 
 class SearchService(BaseService):

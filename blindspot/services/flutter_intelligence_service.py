@@ -128,8 +128,8 @@ class FlutterIntelligenceService(BaseService):
             base = self.base_path
             if base and os.path.isdir(base):
                 return base
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("Suppressed exception in best-effort path: %s", e)
         return None
 
     def _collect_dart_files(self, base: str, subdirs: Optional[List[str]] = None) -> List[Tuple[str, str]]:

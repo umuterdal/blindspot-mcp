@@ -140,8 +140,8 @@ class PhoenixIntelligenceService(BaseService):
             base = self.base_path
             if base and os.path.isdir(base):
                 return base
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("Suppressed exception in best-effort path: %s", e)
         return None
 
     def _scan_files(self, base: str, directory: str,
@@ -227,8 +227,8 @@ class PhoenixIntelligenceService(BaseService):
                 m = re.search(r"app:\s*:(\w+)", content)
                 if m:
                     return m.group(1)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Suppressed exception in best-effort path: %s", e)
         return None
 
     def _get_adaptive_scan_dirs(self, base: str) -> Dict[str, str]:
@@ -1574,8 +1574,8 @@ class PhoenixIntelligenceService(BaseService):
                     "version": version_m.group(1) if version_m else None,
                     "elixir": elixir_m.group(1) if elixir_m else None,
                 }
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Suppressed exception in best-effort path: %s", e)
 
         route_map = self.get_route_map()
 
@@ -1736,8 +1736,8 @@ class PhoenixIntelligenceService(BaseService):
                             "severity": ap["severity"],
                             "message": ap["message"],
                         })
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Suppressed exception in best-effort path: %s", e)
 
         result["total_references"] = sum(r["count"] for r in result["references"])
         result["files_affected"] = len(result["references"])

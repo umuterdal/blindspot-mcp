@@ -42,8 +42,8 @@ class SpringIntelligenceService(BaseService):
             base = self.base_path
             if base and os.path.isdir(base):
                 return base
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("Suppressed exception in best-effort path: %s", e)
         return None
 
     def _find_source_roots(self, base: str) -> List[str]:
@@ -2818,8 +2818,8 @@ class SpringIntelligenceService(BaseService):
                 snapshot["dependencies"] = [
                     {"group": g, "artifact": a} for g, a in deps
                 ][:30]
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Suppressed exception in best-effort path: %s", e)
         elif os.path.isfile(os.path.join(base, 'build.gradle')) or os.path.isfile(os.path.join(base, 'build.gradle.kts')):
             snapshot["build_tool"] = "gradle"
             gradle_file = os.path.join(base, 'build.gradle')
@@ -2833,8 +2833,8 @@ class SpringIntelligenceService(BaseService):
                     gradle_content
                 )
                 snapshot["dependencies"] = [{"dependency": d.strip().strip("'\"()")} for d in deps][:30]
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Suppressed exception in best-effort path: %s", e)
 
         return {
             "status": "success",
@@ -3117,8 +3117,8 @@ class SpringIntelligenceService(BaseService):
                                     "type": "migration",
                                     "file": os.path.relpath(mpath, base),
                                 })
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            logger.debug("Suppressed exception in best-effort path: %s", e)
 
             result["warnings"].append(
                 "Changing an entity field may require: migration, DTO update, repository query update"

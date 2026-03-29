@@ -98,8 +98,8 @@ class DjangoIntelligenceService(BaseService):
             base = self.base_path
             if base and os.path.isdir(base):
                 return base
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("Suppressed exception in best-effort path: %s", e)
         return None
 
     # ── Helper: discover Django apps ───────────────────────────────────
@@ -3400,8 +3400,8 @@ class DjangoIntelligenceService(BaseService):
             try:
                 with open(full_path, "r", encoding="utf-8", errors="replace") as f:
                     content = f.read()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Suppressed exception in best-effort path: %s", e)
 
         # Views → require permission checks
         if "views" in norm or "viewsets" in norm:

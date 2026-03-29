@@ -17,7 +17,6 @@ import json
 import logging
 import os
 import re
-from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from .base_service import BaseService
@@ -155,8 +154,8 @@ class SvelteKitIntelligenceService(BaseService):
             base = self.base_path
             if base and os.path.isdir(base):
                 return base
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("Suppressed exception in best-effort path: %s", e)
         return None
 
     def _walk_files(
@@ -1911,8 +1910,8 @@ class SvelteKitIntelligenceService(BaseService):
                     result["testing_library"] = any(
                         k.startswith("@testing-library") for k in all_deps
                     )
-                except json.JSONDecodeError:
-                    pass
+                except json.JSONDecodeError as e:
+                    logger.debug("Suppressed exception in best-effort path: %s", e)
 
         # Count test files
         tests_dir = os.path.join(base, "tests")
@@ -2171,8 +2170,8 @@ class SvelteKitIntelligenceService(BaseService):
                     snapshot["key_dependencies"] = key_deps
                     snapshot["total_dependencies"] = len(deps)
                     snapshot["total_dev_dependencies"] = len(dev_deps)
-                except json.JSONDecodeError:
-                    pass
+                except json.JSONDecodeError as e:
+                    logger.debug("Suppressed exception in best-effort path: %s", e)
 
         # svelte.config.js
         for config_name in ["svelte.config.js", "svelte.config.ts"]:

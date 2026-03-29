@@ -130,8 +130,8 @@ class GoIntelligenceService(BaseService):
             base = self.base_path
             if base and os.path.isdir(base):
                 return base
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("Suppressed exception in best-effort path: %s", e)
         return None
 
     def _scan_files(self, base: str, directory: str, extensions: tuple = (".go",)) -> List[dict]:
@@ -1558,8 +1558,8 @@ class GoIntelligenceService(BaseService):
                 snapshot["dependencies"]["require"] = [
                     {"module": mod, "version": ver} for mod, ver in requires
                 ]
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Suppressed exception in best-effort path: %s", e)
 
         return {
             "status": "success",
@@ -1591,8 +1591,8 @@ class GoIntelligenceService(BaseService):
                 mod_match = re.search(r"module\s+(\S+)", gomod)
                 if mod_match:
                     module_name = mod_match.group(1)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Suppressed exception in best-effort path: %s", e)
 
         # Build dependency graph
         graph: Dict[str, Dict[str, Any]] = {}
@@ -1789,8 +1789,8 @@ class GoIntelligenceService(BaseService):
                     checks["suggestions"].append(
                         f"Tests for '{symbol_name}' exist in {test_file} -- update tests after changes"
                     )
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Suppressed exception in best-effort path: %s", e)
         else:
             checks["suggestions"].append(
                 f"No test file found at {test_file} -- consider adding tests"

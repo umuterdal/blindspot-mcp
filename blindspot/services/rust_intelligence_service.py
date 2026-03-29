@@ -132,8 +132,8 @@ class RustIntelligenceService(BaseService):
             base = self.base_path
             if base and os.path.isdir(base):
                 return base
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("Suppressed exception in best-effort path: %s", e)
         return None
 
     def _scan_files(self, base: str, directory: str,
@@ -1373,8 +1373,8 @@ class RustIntelligenceService(BaseService):
                         if dm:
                             deps.append(dm.group(1))
                 cargo_info["dependencies"] = deps[:30]
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Suppressed exception in best-effort path: %s", e)
 
         # Workspace members
         workspace_members = []
@@ -1547,8 +1547,8 @@ class RustIntelligenceService(BaseService):
                             "severity": ap["severity"],
                             "message": ap["message"],
                         })
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Suppressed exception in best-effort path: %s", e)
 
         result["total_references"] = sum(r["count"] for r in result["references"])
         result["files_affected"] = len(result["references"])

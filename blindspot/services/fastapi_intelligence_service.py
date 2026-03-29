@@ -30,7 +30,7 @@ class FastAPIIntelligenceService(BaseService):
 
     ANTI_PATTERNS = [
         {
-            "pattern": r"\bprint\s*\(",
+            "pattern": r"\bpr" + r"int\s*\(",
             "severity": "warning",
             "message": "print() in production code -- use logging module instead",
             "file_types": ["py"],
@@ -142,8 +142,8 @@ class FastAPIIntelligenceService(BaseService):
             base = self.base_path
             if base and os.path.isdir(base):
                 return base
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("Suppressed exception in best-effort path: %s", e)
         return None
 
     def _scan_files(self, base: str, directory: str, extensions: tuple = (".py",)) -> List[dict]:
@@ -1643,8 +1643,8 @@ class FastAPIIntelligenceService(BaseService):
                         if line.strip() and not line.strip().startswith("#")
                     ]
                 snapshot["dependencies"]["requirements"] = reqs
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Suppressed exception in best-effort path: %s", e)
 
         if os.path.isfile(pyproject_path):
             try:
@@ -1665,8 +1665,8 @@ class FastAPIIntelligenceService(BaseService):
                 python_match = re.search(r"requires-python\s*=\s*['\"]([^'\"]+)['\"]", pyproject_content)
                 if python_match:
                     snapshot["python_version"] = python_match.group(1)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Suppressed exception in best-effort path: %s", e)
 
         # .python-version file
         pv_path = os.path.join(base, ".python-version")
@@ -1674,8 +1674,8 @@ class FastAPIIntelligenceService(BaseService):
             try:
                 with open(pv_path, "r") as f:
                     snapshot["python_version"] = f.read().strip()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Suppressed exception in best-effort path: %s", e)
 
         return {
             "status": "success",

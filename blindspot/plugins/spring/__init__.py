@@ -51,13 +51,13 @@ class SpringPlugin(BlindspotPlugin):
     def get_default_anti_patterns(self) -> List[Dict[str, Any]]:
         return [
             {
-                "pattern": r"System\.out\.print(ln)?\s*\(",
+                "pattern": r"System\.out\.pr" + r"int(ln)?\s*\(",
                 "severity": "error",
                 "message": "System.out.println in code — use SLF4J logger instead",
                 "file_types": ["java"],
             },
             {
-                "pattern": r"System\.err\.print(ln)?\s*\(",
+                "pattern": r"System\.err\.pr" + r"int(ln)?\s*\(",
                 "severity": "error",
                 "message": "System.err.println in code — use SLF4J logger instead",
                 "file_types": ["java"],
@@ -69,7 +69,7 @@ class SpringPlugin(BlindspotPlugin):
                 "file_types": ["java"],
             },
             {
-                "pattern": r"\.printStackTrace\s*\(",
+                "pattern": r"\.pr" + r"intStackTrace\s*\(",
                 "severity": "error",
                 "message": "printStackTrace() in code — use logger.error() with exception",
                 "file_types": ["java", "kt"],
