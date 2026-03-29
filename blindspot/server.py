@@ -257,8 +257,123 @@ async def indexer_lifespan(_server: FastMCP) -> AsyncIterator[BlindspotContext]:
             context.file_watcher_service.stop_monitoring()
 
 
+_INSTRUCTIONS = """
+# Blindspot MCP — The External Brain for AI Coding Agents
+
+This MCP gives you deep understanding of any codebase across 16 frameworks.
+Use it to write correct code that doesn't break other parts of the system.
+
+## CRITICAL: Think First, Then Use Tools
+
+MCP tools give you DATA — not DECISIONS. You must THINK about each result before acting.
+
+**WRONG approach** (mechanical):
+  Tool says fix_required at L221 → blindly add the missing field → move on
+
+**RIGHT approach** (thoughtful):
+  Tool says fix_required at L221 in handlePayment() →
+  Read the function with get_symbol_body to understand WHY it exists →
+  Understand the business flow →
+  THEN decide what the correct fix is
+
+**Rules:**
+1. For every HIGH priority item: read the enclosing function with `get_symbol_body` BEFORE fixing it.
+   Do NOT fix based on the one-line snippet alone — understand the full function context.
+2. For every MEDIUM item: think about whether the redundancy is intentional (defense-in-depth)
+   or actually redundant. Not every check_redundancy should be removed.
+3. Never apply MCP suggestions mechanically. The tool tells you WHERE to look and WHAT might
+   be wrong — but the correct FIX requires understanding the business logic.
+4. When writing new code, think about it the same way you would without MCP. Use MCP to VERIFY
+   your work, not to REPLACE your thinking.
+
+## MANDATORY Edit Workflow
+
+When editing important files (models, controllers, services, handlers, routes), follow this workflow:
+
+1. **Before editing**: Call `get_context_for_edit(file, symbol)` to understand the code
+   - Returns: symbol code, class hierarchy, ripple effect, impact summary — ALL in one call
+   - This replaces reading 5-10 files manually
+2. **Make the edit**: Call `smart_apply_edit(file, search, replace)` — NOT apply_edit
+   - Syntax check + auto-rollback on error
+   - Automatic ripple effect analysis on changed symbols
+   - Returns: risk level, affected files, coverage tracking
+3. **Read the response carefully**:
+   - `ripple_warnings` → affected files with priority (HIGH/MEDIUM/LOW)
+   - `ripple_coverage` → what % of references are resolved
+   - `scope_direction` → narrowing (fewer results) or widening (more results)
+   - `test_suggestions` → test commands to run
+4. **Fix affected files based on priority**:
+   - **HIGH (fix_required)** → Code WILL break. Read the full function first with `get_symbol_body`.
+   - **MEDIUM (check_redundancy / review_logic)** → May need review. Think about the business logic.
+   - **LOW (no_action)** → Auto-inherits change. Skip.
+5. **After all fixes**: Check `ripple_coverage.coverage_percent` — aim for 100%.
+   Run the `test_suggestions` commands. Call `post_edit_checklist(file)` for required steps.
+
+## When to Use Which Tool
+
+### Understanding Code (before editing)
+- `get_project_snapshot()` → First call in new session, understand full codebase
+- `get_context_for_edit(file, symbol)` → Everything needed before editing a file
+- `get_symbol_body(file, symbol)` → Read a specific function/class WITHOUT opening the file
+- `get_symbol_body(file, symbol, compact=True)` → Metadata only (90% fewer tokens)
+- `get_file_summary(file)` → File structure: classes, functions, imports, line count
+- `get_class_hierarchy(class)` → Inheritance chain: extends, implements, extended_by
+- `find_references(symbol)` → Who uses this symbol? With usage types (import, call, extends)
+
+### Checking Impact (before or after editing)
+- `get_ripple_effect(file, symbol)` → "If I change X, what breaks?" with risk level
+- `get_impact_analysis(file)` → File-level: all symbols and their cross-file references
+- `full_audit(focus)` → Project-wide audit: security, performance, quality, dead_code
+- `check_eager_loading(file)` → N+1 query risks
+- `analyze_queries(controller, method)` → Query performance issues
+
+### Making Edits
+- `smart_apply_edit(file, search, replace)` → PRIMARY edit tool (syntax check + ripple + tracking)
+- `apply_edit(file, search, replace)` → Simple edit (config, templates, or fixing flagged files)
+- `apply_edit_multi(file_edits)` → Fix multiple files at once
+- `rename_symbol(file, old, new, dry_run=True)` → Cross-file rename (always dry_run first)
+- `diff_preview(edits)` → Preview changes without applying
+
+### After Editing
+- `post_edit_checklist(file)` → Required steps: syntax check, type check, tests, cache clear
+- `auto_anti_pattern_check(file)` → Quick check for rule violations
+- `detect_anti_patterns(file)` → Full anti-pattern scan with custom rules from .blindspot.yaml
+
+### Search & Discovery
+- `search_code_advanced(pattern)` → Full-text search with regex, pagination
+- `find_files(pattern)` → Find files by glob pattern
+- `get_rebuild_status()` → Check if deep index is built and ready
+
+## Compact Response System
+
+All MCP tools return **compact summaries** to save your context window.
+Large results are saved to `.blindspot/output/` as detail files.
+
+**What you see in context:** counts, risk levels, file names, priorities — enough to make decisions.
+**What's in detail files:** full code snippets, detailed rationale, complete issue lists.
+
+**When to read detail files:**
+- You need the actual code snippet from an affected file
+- The compact summary isn't enough to make a decision
+- You need the full list of issues from full_audit
+
+**How:** Read the file at the path shown in `detail_file` field of any response.
+**When NOT to read:** If the compact summary gives you enough info to proceed, don't waste context.
+
+## Framework-Specific Tools
+
+Framework tools are auto-loaded based on your project type. You'll see additional tools for:
+- **Next.js**: get_component_tree, get_api_routes, get_prisma_schema, get_state_management
+- **NestJS**: get_nestjs_module_map, get_nestjs_endpoint_map, get_nestjs_guard_map
+- **Django**: get_django_relationships, get_django_url_map, get_django_migration_schema
+- **Laravel**: get_laravel_relationships, get_route_map, get_blade_dependencies
+- **And 12 more frameworks** — each with specialized intelligence tools
+
+Use framework-specific tools when available — they understand your framework's patterns deeply.
+"""
+
 # Create the MCP server with lifespan manager
-mcp = FastMCP("Blindspot", lifespan=indexer_lifespan, dependencies=["pathlib"])
+mcp = FastMCP("Blindspot", instructions=_INSTRUCTIONS, lifespan=indexer_lifespan, dependencies=["pathlib"])
 
 # ----- RESOURCES -----
 
