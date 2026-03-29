@@ -4,7 +4,10 @@ Instead of hardcoding "app/Models/" or ".php", all path resolution goes through
 this adapter which reads from .blindspot.yaml config + sensible defaults.
 """
 
+import logging
 import os
+
+logger = logging.getLogger(__name__)
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set
 
@@ -254,8 +257,8 @@ def _detect_framework(project_path: str, language: Optional[str]) -> Optional[st
                     return "sveltekit"
                 if "express" in deps:
                     return "express"
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Failed to parse package.json for framework detection: %s", e)
     elif language == "python":
         # Check for Django first, then FastAPI/Flask
         for root, dirs, files in os.walk(project_path):
@@ -274,8 +277,8 @@ def _detect_framework(project_path: str, language: Optional[str]) -> Optional[st
                         return "fastapi"
                     if "flask" in content:
                         return "fastapi"  # Flask shares FastAPI plugin
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("Failed to read %s for framework detection: %s", req_path, e)
     elif language == "ruby":
         if os.path.exists(os.path.join(project_path, "config", "routes.rb")):
             return "rails"
@@ -288,8 +291,8 @@ def _detect_framework(project_path: str, language: Optional[str]) -> Optional[st
                     content = f.read()
                 if "gin-gonic" in content or "echo" in content or "go-chi" in content:
                     return "go"
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Failed to read go.mod: %s", e)
     elif language == "rust":
         cargo = os.path.join(project_path, "Cargo.toml")
         if os.path.isfile(cargo):
@@ -298,8 +301,8 @@ def _detect_framework(project_path: str, language: Optional[str]) -> Optional[st
                     content = f.read()
                 if "actix" in content or "axum" in content or "rocket" in content:
                     return "rust"
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Failed to read Cargo.toml: %s", e)
     elif language == "java":
         # Spring Boot detection
         pom = os.path.join(project_path, "pom.xml")
@@ -311,8 +314,8 @@ def _detect_framework(project_path: str, language: Optional[str]) -> Optional[st
                         content = f.read()
                     if "spring-boot" in content:
                         return "spring"
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("Failed to read %s: %s", build_file, e)
     elif language == "kotlin":
         gradle_kts = os.path.join(project_path, "build.gradle.kts")
         if os.path.isfile(gradle_kts):
@@ -321,8 +324,8 @@ def _detect_framework(project_path: str, language: Optional[str]) -> Optional[st
                     content = f.read()
                 if "spring-boot" in content:
                     return "spring"
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Failed to read build.gradle.kts: %s", e)
     elif language == "csharp":
         # ASP.NET Core detection
         import glob as glob_mod
@@ -333,8 +336,8 @@ def _detect_framework(project_path: str, language: Optional[str]) -> Optional[st
                     content = f.read()
                 if "Microsoft.AspNetCore" in content or "Microsoft.NET.Sdk.Web" in content:
                     return "aspnet"
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Failed to read %s: %s", csproj, e)
     elif language == "dart":
         pubspec = os.path.join(project_path, "pubspec.yaml")
         if os.path.isfile(pubspec):
@@ -343,8 +346,8 @@ def _detect_framework(project_path: str, language: Optional[str]) -> Optional[st
                     content = f.read()
                 if "flutter:" in content:
                     return "flutter"
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Failed to read pubspec.yaml: %s", e)
 
     # Check for React Native (separate from Next.js)
     if language in ("javascript", "typescript"):
@@ -357,8 +360,8 @@ def _detect_framework(project_path: str, language: Optional[str]) -> Optional[st
                 deps = {**pkg.get("dependencies", {}), **pkg.get("devDependencies", {})}
                 if "react-native" in deps and "next" not in deps:
                     return "reactnative"
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Failed to parse package.json for React Native detection: %s", e)
 
     return "none"
 
@@ -396,8 +399,8 @@ def detect_workspaces(project_path: str) -> List[Dict[str, str]]:
                     for match in glob.glob(full_pattern):
                         if os.path.isdir(match):
                             workspace_dirs.append(match)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("Failed to parse package.json workspaces: %s", e)
 
     # Check pnpm-workspace.yaml
     pnpm_ws = os.path.join(project_path, "pnpm-workspace.yaml")
@@ -413,8 +416,8 @@ def detect_workspaces(project_path: str) -> List[Dict[str, str]]:
                     for match in glob.glob(full_pattern):
                         if os.path.isdir(match):
                             workspace_dirs.append(match)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("Failed to parse pnpm-workspace.yaml: %s", e)
 
     # Fallback: check common subdirectory names
     if not workspace_dirs:

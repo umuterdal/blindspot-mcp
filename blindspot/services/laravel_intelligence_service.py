@@ -45,8 +45,8 @@ class LaravelIntelligenceService(BaseService):
             base = self.base_path
             if base and os.path.isdir(base):
                 return base
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("Failed to resolve project path: %s", e)
         return None
 
     # ── find_references ────────────────────────────────────────────────
@@ -99,7 +99,8 @@ class LaravelIntelligenceService(BaseService):
                     try:
                         with open(fpath, 'r', encoding='utf-8', errors='replace') as f:
                             content = f.read()
-                    except Exception:
+                    except Exception as e:
+                        logger.debug("Failed to read %s: %s", fpath, e)
                         continue
 
                     if symbol not in content:
@@ -181,10 +182,10 @@ class LaravelIntelligenceService(BaseService):
                                     if m and (snake in m.group(1) or lower in m.group(1)):
                                         table_name = m.group(1)
                                         break
-                            except Exception:
-                                pass
-        except Exception:
-            pass
+                            except Exception as e:
+                                logger.debug("Failed to read migration file: %s", e)
+        except Exception as e:
+            logger.debug("Failed to resolve table name from migrations: %s", e)
 
         # Build compiled patterns for each variable name
         var_patterns = []
@@ -411,7 +412,8 @@ class LaravelIntelligenceService(BaseService):
             try:
                 with open(fpath, 'r', encoding='utf-8', errors='replace') as f:
                     content = f.read()
-            except Exception:
+            except Exception as e:
+                logger.debug("Failed to read model file %s: %s", fpath, e)
                 continue
 
             relationships = []
@@ -477,7 +479,8 @@ class LaravelIntelligenceService(BaseService):
             try:
                 with open(fpath, 'r', encoding='utf-8', errors='replace') as f:
                     content = f.read()
-            except Exception:
+            except Exception as e:
+                logger.debug("Failed to read route file %s: %s", fpath, e)
                 continue
 
             self._parse_routes_recursive(content, routes, path_prefix="", name_prefix="", middleware=[])
@@ -675,7 +678,8 @@ class LaravelIntelligenceService(BaseService):
                 try:
                     with open(fpath, 'r', encoding='utf-8', errors='replace') as f:
                         content = f.read()
-                except Exception:
+                except Exception as e:
+                    logger.debug("Failed to read %s: %s", fpath, e)
                     continue
 
                 rel_path = os.path.relpath(fpath, base)
@@ -977,7 +981,8 @@ class LaravelIntelligenceService(BaseService):
                     try:
                         with open(fpath, 'r', encoding='utf-8', errors='replace') as f:
                             ctrl_content = f.read()
-                    except Exception:
+                    except Exception as e:
+                        logger.debug("Failed to read controller %s: %s", fpath, e)
                         continue
 
                     if view_name in ctrl_content:
@@ -1081,7 +1086,8 @@ class LaravelIntelligenceService(BaseService):
                     try:
                         with open(fpath, 'r', encoding='utf-8', errors='replace') as f:
                             fcontent = f.read()
-                    except Exception:
+                    except Exception as e:
+                        logger.debug("Failed to read %s for impact analysis: %s", fpath, e)
                         continue
 
                     matched_symbols = [s for s in symbols if s in fcontent]
@@ -1330,7 +1336,8 @@ class LaravelIntelligenceService(BaseService):
                 try:
                     with open(fpath, 'r', encoding='utf-8', errors='replace') as f:
                         content = f.read()
-                except Exception:
+                except Exception as e:
+                    logger.debug("Failed to read blade template %s: %s", fpath, e)
                     continue
 
                 if symbol not in content:
@@ -1361,7 +1368,8 @@ class LaravelIntelligenceService(BaseService):
         try:
             with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
                 lines = f.readlines()
-        except Exception:
+        except Exception as e:
+            logger.debug("Failed to read %s for method lookup: %s", file_path, e)
             return None
 
         for i in range(min(line_num - 1, len(lines) - 1), -1, -1):
@@ -1390,7 +1398,8 @@ class LaravelIntelligenceService(BaseService):
                     try:
                         with open(fpath, 'r', encoding='utf-8', errors='replace') as f:
                             content = f.read()
-                    except Exception:
+                    except Exception as e:
+                        logger.debug("Failed to read %s: %s", fpath, e)
                         continue
 
                     # Find Cache::remember/forget calls with keys containing the model name
@@ -1431,8 +1440,8 @@ class LaravelIntelligenceService(BaseService):
                 m = re.search(r"\$table\s*=\s*['\"](\w+)['\"]", content)
                 if m:
                     return m.group(1)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Failed to read model %s for table name: %s", model_path, e)
 
         # Laravel pluralization rules (simplified but covers common cases)
         snake = re.sub(r'(?<!^)(?=[A-Z])', '_', class_name).lower()
@@ -1467,7 +1476,8 @@ class LaravelIntelligenceService(BaseService):
             try:
                 with open(fpath, 'r', encoding='utf-8', errors='replace') as f:
                     content = f.read()
-            except Exception:
+            except Exception as e:
+                logger.debug("Failed to read migration %s: %s", fpath, e)
                 continue
 
             if column_name not in content:
@@ -1574,7 +1584,8 @@ class LaravelIntelligenceService(BaseService):
             try:
                 with open(fpath, 'r', encoding='utf-8', errors='replace') as f:
                     content = f.read()
-            except Exception:
+            except Exception as e:
+                logger.debug("Failed to read migration %s: %s", fpath, e)
                 continue
 
             # Find Schema::create blocks
@@ -1858,8 +1869,8 @@ class LaravelIntelligenceService(BaseService):
                         r"Route::(get|post|put|patch|delete|any|match|resource|apiResource)\s*\(",
                         content
                     ))
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("Failed to read route file %s: %s", rf_path, e)
 
         # Remaining routes not captured by prefix filters
         counted = sum(all_prefixes.values())
@@ -1943,7 +1954,8 @@ class LaravelIntelligenceService(BaseService):
             try:
                 with open(fpath, 'r', encoding='utf-8', errors='replace') as f:
                     content = f.read()
-            except Exception:
+            except Exception as e:
+                logger.debug("Failed to read model %s: %s", fpath, e)
                 continue
 
             # Relationships (compact: just name→type)
@@ -1990,7 +2002,8 @@ class LaravelIntelligenceService(BaseService):
                 try:
                     with open(fpath, 'r', encoding='utf-8', errors='replace') as f:
                         content = f.read()
-                except Exception:
+                except Exception as e:
+                    logger.debug("Failed to read controller %s: %s", fpath, e)
                     continue
 
                 # Methods
@@ -2039,7 +2052,8 @@ class LaravelIntelligenceService(BaseService):
                 try:
                     with open(fpath, 'r', encoding='utf-8', errors='replace') as f:
                         content = f.read()
-                except Exception:
+                except Exception as e:
+                    logger.debug("Failed to read service %s: %s", fpath, e)
                     continue
 
                 methods = re.findall(r'public\s+(?:static\s+)?function\s+(\w+)\s*\(', content)
@@ -2073,8 +2087,8 @@ class LaravelIntelligenceService(BaseService):
                             "file": os.path.relpath(fpath, base),
                             "lines": lines,
                         })
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("Failed to count lines in %s: %s", fpath, e)
 
         # Sort large files descending
         summary["large_files"].sort(key=lambda x: -x["lines"])
@@ -2105,8 +2119,8 @@ class LaravelIntelligenceService(BaseService):
                                 "lines": lines,
                                 "methods": methods,
                             })
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.debug("Failed to analyze %s for hotspots: %s", fpath, e)
 
         hotspots.sort(key=lambda x: -x["lines"])
         return hotspots[:15]
@@ -2355,8 +2369,8 @@ class LaravelIntelligenceService(BaseService):
                     rules_body = self._extract_method_body(fr_content, 'rules')
                     if rules_body:
                         fr_info["rules"] = rules_body
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("Failed to read form request for flow map: %s", e)
             flow["request_validation"] = fr_info
         elif 'validate(' in method_body:
             flow["request_validation"] = "inline_validation"
@@ -2540,7 +2554,8 @@ class LaravelIntelligenceService(BaseService):
             try:
                 with open(fpath, "r", encoding="utf-8", errors="replace") as f:
                     content = f.read()
-            except Exception:
+            except Exception as e:
+                logger.debug("Failed to read migration %s: %s", fpath, e)
                 continue
 
             # Only look at blocks that reference our table
@@ -2673,8 +2688,8 @@ class LaravelIntelligenceService(BaseService):
             try:
                 with open(full_path, "r", encoding="utf-8", errors="replace") as f:
                     content = f.read()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Failed to read %s for conventions: %s", full_path, e)
 
         # Controllers handling public pages → SEO
         if "controllers" in norm:
@@ -2934,7 +2949,8 @@ class LaravelIntelligenceService(BaseService):
                     try:
                         with open(blade_path, "r", encoding="utf-8", errors="replace") as f:
                             blade_content = f.read()
-                    except Exception:
+                    except Exception as e:
+                        logger.debug("Failed to read blade template %s: %s", blade_path, e)
                         continue
 
                     rel_blade = os.path.relpath(blade_path, base)

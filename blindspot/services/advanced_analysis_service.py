@@ -172,7 +172,8 @@ class AdvancedAnalysisService(BaseService):
                     entries = json.load(f)
                 if not isinstance(entries, list):
                     entries = []
-            except Exception:
+            except Exception as e:
+                logger.debug("Failed to load session file %s: %s", detail_path, e)
                 entries = []
 
         entries.append(save_copy)
@@ -214,7 +215,8 @@ class AdvancedAnalysisService(BaseService):
             detail_path = AdvancedAnalysisService._save_to_session_file(
                 "smart_apply_edit", result, base_path
             )
-        except Exception:
+        except Exception as e:
+            logger.debug("Failed to save session file for smart_apply_edit: %s", e)
             detail_path = None
 
         status = result.get("status", "success")
@@ -294,8 +296,8 @@ class AdvancedAnalysisService(BaseService):
             base = self.base_path
             if base and os.path.isdir(base):
                 return base
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("Failed to resolve project path: %s", e)
         return None
 
     def _get_intel(self) -> LaravelIntelligenceService:
@@ -315,7 +317,8 @@ class AdvancedAnalysisService(BaseService):
         try:
             with open(full_path, "r", encoding="utf-8", errors="replace") as f:
                 return f.read()
-        except Exception:
+        except Exception as e:
+            logger.debug("Failed to read file %s: %s", full_path, e)
             return None
 
     # ── analyze_queries ──────────────────────────────────────────────
@@ -398,8 +401,8 @@ class AdvancedAnalysisService(BaseService):
                             r.get("name", ""): r.get("type", "")
                             for r in rels
                         }
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Failed to get model relationships: %s", e)
 
         for method_name, method_body, start_line in methods_to_check:
             method_lines = method_body.split("\n")
@@ -738,8 +741,8 @@ class AdvancedAnalysisService(BaseService):
                         ctrl_content = self._read_file(os.path.join(base, ctrl_file))
                         if ctrl_content:
                             imported_models = self._find_imported_models(ctrl_content)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Failed to resolve blade dependencies: %s", e)
 
         # Build relationship map with types
         all_relationships: Dict[str, Dict[str, str]] = {}
@@ -754,8 +757,8 @@ class AdvancedAnalysisService(BaseService):
                             r.get("name", ""): r.get("type", "")
                             for r in rels
                         }
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Failed to get relationships for %s: %s", model_name, e)
 
         # Find all with() and withCount() calls
         eager_loaded: Set[str] = set()
@@ -1153,7 +1156,8 @@ class AdvancedAnalysisService(BaseService):
                     fpath = os.path.join(root, fname)
                     try:
                         fcontent = open(fpath, "r", encoding="utf-8", errors="replace").read()
-                    except Exception:
+                    except Exception as e:
+                        logger.debug("Failed to read %s for cache scan: %s", fpath, e)
                         continue
 
                     rel = os.path.relpath(fpath, base)
@@ -1451,8 +1455,8 @@ class AdvancedAnalysisService(BaseService):
                         "end_line": sym_result.get("end_line"),
                         "signature": sym_result.get("signature", ""),
                     }
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Failed to get symbol body for %s: %s", symbol, e)
 
             # Ripple effect
             try:
@@ -1553,8 +1557,8 @@ class AdvancedAnalysisService(BaseService):
                         ripple_data["affected_files_code"] = affected_code
 
                     context["ripple_effect"] = ripple_data
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Failed to compute ripple effect for %s: %s", symbol, e)
 
         # ── Model-specific context ──
         if is_model:
@@ -1571,8 +1575,8 @@ class AdvancedAnalysisService(BaseService):
                         context["relationships"] = model_info.get("relationships", [])
                         context["fillable"] = model_info.get("fillable", [])
                         context["traits"] = model_info.get("traits", [])
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("Failed to get relationships for model %s: %s", model_name, e)
 
                 # Scopes — extract from model file directly since
                 # get_laravel_relationships doesn't return scopes
@@ -1611,8 +1615,8 @@ class AdvancedAnalysisService(BaseService):
                                 for c in cols if c.get("name") and not c.get("dropped")
                             ]
                             context["indexes"] = idxs
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("Failed to get migration schema for %s: %s", model_name, e)
 
                 # Cache keys this model invalidates
                 try:
@@ -1622,16 +1626,16 @@ class AdvancedAnalysisService(BaseService):
                         context["cache_invalidates"] = [
                             k.get("key") for k in fwd.get("invalidates", [])
                         ] if isinstance(fwd, dict) else []
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("Failed to get cache map for %s: %s", model_name, e)
 
                 # Who uses this model (controllers)
                 try:
                     refs = intel.find_references(model_name, scope="controllers")
                     files = [r.get("file") for r in refs.get("references", [])]
                     context["used_by_controllers"] = files[:10]
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("Failed to find controller references for %s: %s", model_name, e)
 
         # ── Controller-specific context ──
         elif is_controller:
@@ -1651,8 +1655,8 @@ class AdvancedAnalysisService(BaseService):
                                 context["middleware"] = f.get("middleware", [])
                                 context["validation"] = f.get("validation", {})
                                 context["views_rendered"] = f.get("views", [])
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("Failed to get flow map for controller: %s", e)
 
             # Imported models with their relationships
             content_str = content_str if 'content_str' in dir() else self._read_file(full_path)
@@ -1668,8 +1672,8 @@ class AdvancedAnalysisService(BaseService):
                                 "relationships": [r["name"] for r in mi.get("relationships", [])],
                                 "scopes": [s["name"] if isinstance(s, dict) else s for s in mi.get("scopes", [])],
                             }
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.debug("Failed to get relationships for model %s: %s", m, e)
                 if models_context:
                     context["imported_models"] = models_context
 
@@ -1684,8 +1688,8 @@ class AdvancedAnalysisService(BaseService):
                     context["called_by"] = [
                         r.get("file") for r in refs.get("references", [])
                     ][:10]
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("Failed to find references for service %s: %s", svc_name, e)
 
         # ── Blade-specific context ──
         elif is_blade:
@@ -1697,8 +1701,8 @@ class AdvancedAnalysisService(BaseService):
                     context["components_used"] = deps.get("components", [])
                     context["sections"] = deps.get("sections", [])
                     context["alpine_components"] = deps.get("alpine_components", [])
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Failed to get blade dependencies for %s: %s", file_path, e)
 
             # View data flow — what variables are passed
             try:
@@ -1706,8 +1710,8 @@ class AdvancedAnalysisService(BaseService):
                 if vdf.get("status") == "success":
                     context["passed_variables"] = vdf.get("controller_data", [])
                     context["potentially_undefined"] = vdf.get("potentially_undefined", [])
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Failed to get view data flow for %s: %s", file_path, e)
 
         # ── Class hierarchy (all PHP files) ──
         if file_path.endswith(".php") and not is_blade:
@@ -1721,8 +1725,8 @@ class AdvancedAnalysisService(BaseService):
                             context["extends"] = hierarchy.get("extends")
                             context["implements"] = hierarchy.get("implements", [])
                             context["uses_traits"] = hierarchy.get("traits", [])
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.debug("Failed to get class hierarchy: %s", e)
 
         return context
 
@@ -1793,7 +1797,8 @@ class AdvancedAnalysisService(BaseService):
             try:
                 with open(full_path, "r", encoding="utf-8", errors="replace") as f:
                     content = f.read()
-            except Exception:
+            except Exception as e:
+                logger.debug("Failed to read %s for audit: %s", full_path, e)
                 continue
 
             syntax = get_language_syntax(language)
@@ -1848,7 +1853,8 @@ class AdvancedAnalysisService(BaseService):
                 "detail_file": detail_path,
                 "hint": "Full issue list saved to detail_file. Read it for specifics.",
             }
-        except Exception:
+        except Exception as e:
+            logger.debug("Failed to save audit detail file: %s", e)
             return full_result
 
     def _audit_security(
@@ -2159,7 +2165,8 @@ class AdvancedAnalysisService(BaseService):
                     "fix": "Run build_deep_index to enable dead code detection",
                 })
                 return
-        except Exception:
+        except Exception as e:
+            logger.debug("Failed to access index for dead code detection: %s", e)
             return
 
         intel = self._get_generic_intel()
@@ -2209,7 +2216,8 @@ class AdvancedAnalysisService(BaseService):
                                 "message": f"'{base_name}' has no external references — potentially dead code",
                                 "fix": f"Verify '{base_name}' is needed; remove if unused",
                             })
-                    except Exception:
+                    except Exception as e:
+                        logger.debug("Failed to check references for %s: %s", base_name, e)
                         continue
 
     # ── post_edit_checklist ──────────────────────────────────────────
@@ -2735,8 +2743,8 @@ class AdvancedAnalysisService(BaseService):
 
                 ripple_warnings.append(warning_entry)
 
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Failed to compute ripple effect for symbol: %s", e)
 
         # Derive symbol name and total affected for summaries
         symbol_name = changed_symbols[0] if changed_symbols else "unknown"

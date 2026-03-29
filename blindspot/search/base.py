@@ -6,11 +6,9 @@ concrete implementations for different search tools like ugrep, ripgrep, etc.
 """
 import os
 import re
-import shutil
-import subprocess
 import sys
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
+from typing import Dict, List, Optional, Tuple, TYPE_CHECKING
 
 from ..indexing.qualified_names import normalize_file_path
 

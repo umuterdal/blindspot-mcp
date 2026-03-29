@@ -30,8 +30,8 @@ class LaravelValidationService(BaseService):
             base = self.base_path
             if base and os.path.isdir(base):
                 return base
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("Failed to resolve project path: %s", e)
         return None
 
     def _get_intel(self) -> LaravelIntelligenceService:
@@ -79,7 +79,8 @@ class LaravelValidationService(BaseService):
         for fpath in model_files:
             try:
                 content = fpath.read_text(encoding="utf-8", errors="replace")
-            except Exception:
+            except Exception as e:
+                logger.debug("Failed to read model %s: %s", fpath, e)
                 continue
 
             name = fpath.stem  # e.g. "Category"
@@ -284,7 +285,8 @@ class LaravelValidationService(BaseService):
             try:
                 with open(ctrl_full_path, 'r', encoding='utf-8', errors='replace') as f:
                     ctrl_content = f.read()
-            except Exception:
+            except Exception as e:
+                logger.debug("Failed to read controller %s: %s", ctrl_full_path, e)
                 continue
 
             # Extract the specific method body
@@ -577,7 +579,8 @@ class LaravelValidationService(BaseService):
                 try:
                     with open(fpath, 'r', encoding='utf-8', errors='replace') as f:
                         content = f.read()
-                except Exception:
+                except Exception as e:
+                    logger.debug("Failed to read %s: %s", fpath, e)
                     continue
 
                 # Check if any search pattern matches
@@ -774,7 +777,8 @@ class LaravelValidationService(BaseService):
         try:
             with open(app_file, 'r', encoding='utf-8', errors='replace') as f:
                 content = f.read()
-        except Exception:
+        except Exception as e:
+            logger.debug("Failed to read bootstrap app file: %s", e)
             return aliases
 
         # Find $middleware->alias([...]) block
@@ -804,7 +808,8 @@ class LaravelValidationService(BaseService):
         try:
             with open(provider_file, 'r', encoding='utf-8', errors='replace') as f:
                 content = f.read()
-        except Exception:
+        except Exception as e:
+            logger.debug("Failed to read route service provider: %s", e)
             return limiters
 
         # Find RateLimiter::for('name', function ($request) { ... })
@@ -1039,7 +1044,8 @@ class LaravelValidationService(BaseService):
                 try:
                     with open(fpath, 'r', encoding='utf-8', errors='replace') as f:
                         content = f.read()
-                except Exception:
+                except Exception as e:
+                    logger.debug("Failed to read controller %s: %s", fpath, e)
                     continue
 
                 if form_request_class not in content:
@@ -1342,8 +1348,8 @@ class LaravelValidationService(BaseService):
                                 "reason": "Model has cache invalidation in booted() — verify cache keys",
                                 "priority": "recommended",
                             })
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.debug("Failed to read %s for cache check: %s", full, e)
 
         # CSS/Tailwind changes
         if ".blade.php" in file_path or "resources/css/" in file_path or "tailwind.config" in file_path:
@@ -1531,7 +1537,8 @@ class LaravelValidationService(BaseService):
                 try:
                     with open(full_ctrl_path, "r", encoding="utf-8", errors="replace") as f:
                         ctrl_content = f.read()
-                except Exception:
+                except Exception as e:
+                    logger.debug("Failed to read controller %s: %s", full_ctrl_path, e)
                     ctrl_content = ""
 
                 if ctrl_method_name and ctrl_content:
@@ -1637,8 +1644,8 @@ class LaravelValidationService(BaseService):
                                                 ):
                                                     if rm.group(1) not in required_fields:
                                                         required_fields.append(rm.group(1))
-                                            except Exception:
-                                                pass
+                                            except Exception as e:
+                                                logger.debug("Failed to parse form request: %s", e)
                                             break
 
         # Check middleware for auth requirement
@@ -1719,8 +1726,8 @@ class LaravelValidationService(BaseService):
                         route_names[prefix] = []
                     if len(route_names[prefix]) < 5:
                         route_names[prefix].append(name)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Failed to parse route names: %s", e)
         result["route_names"] = route_names
 
         # Controller naming
@@ -1769,7 +1776,8 @@ class LaravelValidationService(BaseService):
                     try:
                         with open(fpath, "r", encoding="utf-8", errors="replace") as f:
                             content = f.read()
-                    except Exception:
+                    except Exception as e:
+                        logger.debug("Failed to read form request %s: %s", fpath, e)
                         continue
 
                     class_name = fname.replace(".php", "")
@@ -1790,7 +1798,8 @@ class LaravelValidationService(BaseService):
                                     if class_name in ccontent:
                                         used_by = os.path.relpath(cpath, base)
                                         break
-                                except Exception:
+                                except Exception as e:
+                                    logger.debug("Failed to read controller %s: %s", cpath, e)
                                     continue
                             if used_by:
                                 break
@@ -1833,7 +1842,8 @@ class LaravelValidationService(BaseService):
                 try:
                     with open(fpath, "r", encoding="utf-8", errors="replace") as f:
                         content = f.read()
-                except Exception:
+                except Exception as e:
+                    logger.debug("Failed to read %s for cache analysis: %s", fpath, e)
                     continue
 
                 for m in re.finditer(
@@ -1879,7 +1889,8 @@ class LaravelValidationService(BaseService):
                 try:
                     with open(fpath, "r", encoding="utf-8", errors="replace") as f:
                         content = f.read()
-                except Exception:
+                except Exception as e:
+                    logger.debug("Failed to read component %s: %s", fpath, e)
                     continue
 
                 comp_name = fname.replace(".blade.php", "")
@@ -1911,7 +1922,8 @@ class LaravelValidationService(BaseService):
                                 vcontent = vf.read()
                             if tag_pattern in vcontent:
                                 usage_count += 1
-                        except Exception:
+                        except Exception as e:
+                            logger.debug("Failed to read view %s: %s", vpath, e)
                             continue
 
                 components.append({
@@ -1941,7 +1953,8 @@ class LaravelValidationService(BaseService):
                     try:
                         with open(fpath, "r", encoding="utf-8", errors="replace") as f:
                             content = f.read()
-                    except Exception:
+                    except Exception as e:
+                        logger.debug("Failed to read %s: %s", fpath, e)
                         continue
 
                     rel_file = os.path.relpath(fpath, base)

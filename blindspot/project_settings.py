@@ -7,9 +7,12 @@ for the Blindspot MCP server.
 
 import hashlib
 import json
+import logging
 import os
 import tempfile
 from datetime import datetime
+
+logger = logging.getLogger(__name__)
 
 from .constants import CONFIG_FILE, INDEX_FILE, SETTINGS_DIR
 from .search.ag import AgStrategy
@@ -40,8 +43,8 @@ def _get_available_strategies() -> list[SearchStrategy]:
             strategy = strategy_class()
             if strategy.is_available():
                 available.append(strategy)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("Search strategy %s unavailable: %s", strategy_class.__name__, e)
     return available
 
 
@@ -99,8 +102,9 @@ class ProjectSettings:
                 os.makedirs(temp_base_dir, exist_ok=True)
             else:
                 pass
-        except Exception:
+        except Exception as e:
             # If unable to create temporary directory, use .blindspot_index in project directory if available
+            logger.debug("Failed to create temp directory: %s", e)
             if base_path and os.path.exists(base_path):
                 temp_base_dir = os.path.join(base_path, ".blindspot_index")
 
@@ -122,8 +126,9 @@ class ProjectSettings:
                 self.settings_path = os.path.join(temp_base_dir, "default")
 
             self.ensure_settings_dir()
-        except Exception:
+        except Exception as e:
             # If error occurs, use .blindspot_index in project or home directory as fallback
+            logger.debug("Failed to set up settings path: %s", e)
             if base_path and os.path.exists(base_path):
                 fallback_dir = os.path.join(
                     base_path,
@@ -176,8 +181,9 @@ class ProjectSettings:
                 self.settings_path = fallback_dir
                 if not os.path.exists(fallback_dir):
                     os.makedirs(fallback_dir, exist_ok=True)
-        except Exception:
+        except Exception as e:
             # If unable to create settings directory, use .blindspot_index in project or home directory
+            logger.debug("Failed to ensure settings directory: %s", e)
             if self.base_path and os.path.exists(self.base_path):
                 fallback_dir = os.path.join(
                     self.base_path,
@@ -204,8 +210,9 @@ class ProjectSettings:
             # Ensure directory exists
             os.makedirs(os.path.dirname(path), exist_ok=True)
             return path
-        except Exception:
+        except Exception as e:
             # If error occurs, use file in project or home directory as fallback
+            logger.debug("Failed to get config path: %s", e)
             if self.base_path and os.path.exists(self.base_path):
                 return os.path.join(self.base_path, CONFIG_FILE)
             else:
@@ -233,7 +240,8 @@ class ProjectSettings:
                 json.dump(config, f, indent=2, ensure_ascii=False)
 
             return config
-        except Exception:
+        except Exception as e:
+            logger.warning("Failed to save config: %s", e)
             return config
 
     def load_config(self):
@@ -259,7 +267,8 @@ class ProjectSettings:
             else:
                 pass
             return {}
-        except Exception:
+        except Exception as e:
+            logger.debug("Failed to load config: %s", e)
             return {}
 
     def save_index(self, index_data):
@@ -296,8 +305,9 @@ class ProjectSettings:
             with open(index_path, "w", encoding="utf-8") as f:
                 f.write(json_data)
 
-        except Exception:
+        except Exception as e:
             # Try saving to project or home directory
+            logger.warning("Failed to save index: %s", e)
             try:
                 if self.base_path and os.path.exists(self.base_path):
                     fallback_path = os.path.join(self.base_path, INDEX_FILE)
@@ -314,8 +324,8 @@ class ProjectSettings:
 
                 with open(fallback_path, "w", encoding="utf-8") as f:
                     f.write(json_data)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("Failed to save index to fallback path: %s", e)
 
     def load_index(self):
         """Load code index from JSON format
@@ -338,7 +348,8 @@ class ProjectSettings:
                 except (json.JSONDecodeError, UnicodeDecodeError):
                     # If file is corrupted, return None
                     return None
-                except Exception:
+                except Exception as e:
+                    logger.debug("Failed to load index: %s", e)
                     return None
             else:
                 # Try loading from project or home directory
@@ -351,10 +362,11 @@ class ProjectSettings:
                     with open(fallback_path, encoding="utf-8") as f:
                         index_data = json.load(f)
                     return index_data
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("Failed to load index from fallback: %s", e)
             return None
-        except Exception:
+        except Exception as e:
+            logger.debug("Failed to load index: %s", e)
             return None
 
     def cleanup_legacy_files(self) -> None:
@@ -370,10 +382,10 @@ class ProjectSettings:
                 if os.path.exists(legacy_file):
                     try:
                         os.remove(legacy_file)
-                    except Exception:
-                        pass
-        except Exception:
-            pass
+                    except Exception as e:
+                        logger.debug("Failed to remove legacy file %s: %s", legacy_file, e)
+        except Exception as e:
+            logger.debug("Failed to cleanup legacy files: %s", e)
 
     def clear(self):
         """Clear config and index files"""
@@ -391,13 +403,13 @@ class ProjectSettings:
                     try:
                         if os.path.isfile(file_path):
                             os.unlink(file_path)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.debug("Failed to delete %s: %s", file_path, e)
 
             else:
                 pass
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("Failed to clear settings: %s", e)
 
     def get_stats(self):
         """Get statistics for the settings directory

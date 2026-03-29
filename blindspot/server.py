@@ -10,7 +10,6 @@ to domain-specific services for business logic.
 
 # Standard library imports
 import argparse
-import inspect
 import logging
 import os
 import signal
