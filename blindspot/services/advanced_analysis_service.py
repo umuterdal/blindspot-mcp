@@ -74,6 +74,129 @@ _SAFE_RELATIONSHIP_TYPES = {"belongsTo", "morphTo"}
 class AdvancedAnalysisService(BaseService):
     """Advanced analysis tools combining multiple intelligence methods."""
 
+    # ── Compact Response System ──────────────────────────────────────
+
+    @staticmethod
+    def _save_to_session_file(tool_name: str, result: Dict[str, Any], project_path: str = "") -> str:
+        """Save full result to session file, return the path.
+
+        Appends to .blindspot/output/session_{pid}.json keeping the last 30 entries.
+        This allows AI agents to read full details only when needed,
+        keeping context window usage minimal.
+        """
+        detail_dir = os.path.join(project_path, ".blindspot", "output") if project_path else "/tmp/blindspot-output"
+        os.makedirs(detail_dir, exist_ok=True)
+        detail_path = os.path.join(detail_dir, f"session_{os.getpid()}.json")
+
+        save_copy = {k: v for k, v in result.items() if k not in ("edited_content", "_project_path")}
+        save_copy.pop("diff", None)
+        save_copy["_tool"] = tool_name
+        save_copy["_timestamp"] = time.strftime("%Y-%m-%d %H:%M:%S")
+
+        entries = []
+        if os.path.isfile(detail_path):
+            try:
+                with open(detail_path, "r", encoding="utf-8") as f:
+                    entries = json.load(f)
+                if not isinstance(entries, list):
+                    entries = []
+            except Exception:
+                entries = []
+
+        entries.append(save_copy)
+        entries = entries[-30:]
+
+        with open(detail_path, "w", encoding="utf-8") as f:
+            json.dump(entries, f, indent=2, default=str)
+
+        return detail_path
+
+    @staticmethod
+    def _compact_smart_response(result: Dict[str, Any]) -> Dict[str, Any]:
+        """Save full response to file, return minimal summary to context.
+
+        AI agent can read the full details file if needed — saves context window.
+        HIGH priority items include code snippets, MEDIUM/LOW are summarized.
+        """
+        base_path = result.get("_project_path", "")
+        try:
+            detail_path = AdvancedAnalysisService._save_to_session_file(
+                "smart_apply_edit", result, base_path
+            )
+        except Exception:
+            detail_path = None
+
+        status = result.get("status", "success")
+        summary: Dict[str, Any] = {
+            "status": status,
+            "file": result.get("file", result.get("file_path", "")),
+            "detail_file": detail_path,
+        }
+
+        # Critical warnings only
+        critical_warnings = [
+            w for w in result.get("warnings", [])
+            if w.get("severity") in ("CRITICAL", "HIGH")
+        ]
+        if critical_warnings:
+            summary["warnings"] = [
+                {"type": w.get("type", ""), "severity": w["severity"], "message": str(w.get("message", ""))[:120]}
+                for w in critical_warnings
+            ]
+
+        # Ripple — HIGH: full details, MEDIUM/LOW: compact
+        ripple_summary = []
+        for rw in result.get("ripple_warnings", []):
+            for af in rw.get("affected_files_with_code", rw.get("affected_files", [])):
+                if isinstance(af, dict):
+                    if af.get("priority") == "HIGH" and len(ripple_summary) < 3:
+                        ripple_summary.append({
+                            "file": af.get("file", ""),
+                            "priority": "HIGH",
+                            "lines": [
+                                {"line": ln.get("line"), "code": str(ln.get("code", ""))[:120],
+                                 "action": ln.get("action", "")}
+                                for ln in af.get("lines", [])[:5]
+                            ] if isinstance(af.get("lines"), list) else [],
+                        })
+                    else:
+                        ripple_summary.append({
+                            "file": af.get("file", ""),
+                            "priority": af.get("priority", "LOW"),
+                            "action_count": len(af.get("lines", [])) if isinstance(af.get("lines"), list) else af.get("lines", 0),
+                        })
+        if ripple_summary:
+            summary["affected_files"] = ripple_summary
+
+        # Scope direction
+        if "scope_direction" in result:
+            summary["scope_direction"] = result["scope_direction"]
+
+        # Coverage
+        if "ripple_coverage" in result:
+            summary["coverage_percent"] = result["ripple_coverage"].get("coverage_percent", 0)
+
+        # Edit summary — one line
+        if "edit_summary" in result:
+            es = result["edit_summary"]
+            summary["edit_summary"] = (
+                f"{es.get('total_affected_files', 0)} affected, "
+                f"risk: {es.get('remaining_risk', 'low')}"
+            )
+
+        # Test suggestions — just first one
+        tests = result.get("test_suggestions", [])
+        if tests:
+            summary["suggested_tests_count"] = len(tests)
+            summary["hint"] = f"Run: {tests[0]}" if tests else None
+
+        # Session metrics
+        if "session_metrics" in result:
+            sm = result["session_metrics"]
+            summary["session"] = f"{sm.get('total_edits', 0)} edits, {sm.get('total_warnings', 0)} warnings"
+
+        return summary
+
     def _get_project_path(self) -> Optional[str]:
         """Get the project base path from MCP context."""
         try:
@@ -1582,7 +1705,7 @@ class AdvancedAnalysisService(BaseService):
                 "info": sum(1 for i in issues if i.get("severity") == "info"),
             }
 
-        return {
+        full_result = {
             "status": "success",
             "focus": focus,
             "files_scanned": len(source_files),
@@ -1590,6 +1713,25 @@ class AdvancedAnalysisService(BaseService):
             "summary": summary,
             "total_issues": len(all_issues),
         }
+
+        # Save full results to detail file, return compact summary
+        if len(all_issues) > 20:
+            try:
+                base = self._get_project_path() or ""
+                detail_path = self._save_to_session_file("full_audit", full_result, base)
+                return {
+                    "status": "success",
+                    "focus": focus,
+                    "files_scanned": len(source_files),
+                    "summary": summary,
+                    "total_issues": len(all_issues),
+                    "detail_file": detail_path,
+                    "hint": "Full issue list saved to detail_file. Read it for specifics.",
+                }
+            except Exception:
+                pass
+
+        return full_result
 
     def _audit_security(
         self, file_path: str, lines: List[str], syntax: LanguageSyntax,
@@ -2465,7 +2607,9 @@ class AdvancedAnalysisService(BaseService):
             "total_warnings": _SESSION_METRICS["total_warnings"],
         }
 
-        return result
+        # Save full response and return compact summary
+        result["_project_path"] = base or ""
+        return self._compact_smart_response(result)
 
     @staticmethod
     def _classify_ripple_item(
