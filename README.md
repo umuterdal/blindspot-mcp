@@ -2,7 +2,7 @@
 
 > **See what your LLM can't see.** Early release — Laravel production-tested, 15 more framework plugins in alpha.
 
-**v0.1.0** — [Report bugs](https://github.com/umuterdal/blindspot-mcp/issues) | [Contribute](https://github.com/umuterdal/blindspot-mcp/pulls)
+**v0.1.3** — [Report bugs](https://github.com/umuterdal/blindspot-mcp/issues) | [Contribute](https://github.com/umuterdal/blindspot-mcp/pulls)
 
 [![PyPI version](https://img.shields.io/pypi/v/blindspot-mcp.svg)](https://pypi.org/project/blindspot-mcp/)
 [![PyPI downloads](https://img.shields.io/pypi/dm/blindspot-mcp.svg)](https://pypi.org/project/blindspot-mcp/)
@@ -345,7 +345,7 @@ Blindspot auto-detects your framework and loads only the relevant plugin tools:
 
 ---
 
-## Core Tools (31 — Always Available)
+## Core Tools (34 — Always Available)
 
 These tools work on **every project**, regardless of language or framework:
 
@@ -387,6 +387,61 @@ These tools work on **every project**, regardless of language or framework:
 | `find_files` | Find files matching glob patterns using the in-memory index. |
 | `build_deep_index` | Build the full symbol index (tree-sitter + SQLite). Run once per session. |
 | `refresh_index` | Rebuild file index after git operations or when things seem stale. |
+| `get_rebuild_status` | Check if deep index is built and ready. Shows file count, symbol count, languages. |
+| `full_audit` | Comprehensive project audit: security (hardcoded secrets, XSS, SQL injection), performance (N+1, unbounded queries), quality (debug statements, TODOs), dead code. |
+| `post_edit_checklist` | Language-aware post-edit steps: syntax check, type check, tests, cache clear — per language (PHP, JS/TS, Python, Go, Rust, Ruby, Java). |
+
+---
+
+## Smart Edit Pipeline
+
+Blindspot doesn't just find problems — it provides a complete safe-edit workflow with session tracking:
+
+```
+1. get_context_for_edit(file, symbol)     ← Understand the code + track pipeline
+2. smart_apply_edit(file, search, replace) ← Edit + syntax check + ripple analysis
+     ↓
+   Returns:
+   - ripple_warnings: affected files with priority (HIGH/MEDIUM/LOW)
+   - ripple_coverage: % of references resolved
+   - scope_direction: narrowing/widening/modified
+   - test_suggestions: language-appropriate test commands
+   - fix_suggestions: auto-generated fixes for HIGH items
+   - edit_summary: changed symbols, priority counts, remaining risk
+   - session_metrics: cumulative stats across all edits
+     ↓
+3. Fix HIGH priority files (get_symbol_body → understand → fix)
+4. Pass resolved_items=[ids] in next smart_apply_edit call
+5. Check coverage_percent → aim for 100%
+6. post_edit_checklist(file) → required post-edit steps
+```
+
+**Session tracking across multiple edits:**
+- Ripple items tracked with lifecycle states: `open` → `resolved` → `reopened`
+- Re-edit warnings when the same file is edited multiple times
+- Pipeline enforcement: blocks edits on high-risk files without prior `get_context_for_edit`
+- Feedback overrides: correct ripple classifications that the AI got wrong
+- Decision memory: full edit history for the session
+
+**Compact response system:**
+- Small results (<2KB) returned inline
+- Large results saved to `.blindspot/output/session_{pid}.json`
+- Only summary + `detail_file` path returned to context
+- AI reads full details only when needed — saves 80-95% context window
+
+---
+
+## Framework-Specific Features (Per Plugin)
+
+Each of the 16 framework plugins includes specialized tools plus these 5 universal methods:
+
+| Method | What It Does |
+|--------|-------------|
+| `verify_schema` | Verify fields exist in schema/model before editing (migrations, Prisma, JPA, GORM, Ecto, etc.) |
+| `detect_transaction_risks` | Find missing transactions around multiple DB writes, cache-in-transaction risks |
+| `get_domain_rules` | Directory-aware rules: controllers need auth, models need validation, services need error handling |
+| `generate_test_skeleton` | Generate framework-appropriate test boilerplate (Jest, pytest, JUnit, Go test, RSpec, ExUnit, etc.) |
+| `match_view_guards` | Cross-reference backend auth guards with frontend template/component conditions |
 
 ---
 
@@ -545,7 +600,7 @@ Options:
 **Key design decisions:**
 
 - **Local only** — Your code never leaves your machine. Everything runs in-process.
-- **Framework-aware loading** — Only the detected framework's plugin loads. A Next.js project gets ~45 tools, not 237.
+- **Framework-aware loading** — Only the detected framework's plugin loads. A Next.js project gets ~45 tools, not 240.
 - **Deep index + file scanning** — Tree-sitter for structured symbol data, regex for cross-file references. Best of both worlds.
 - **Compact responses** — Every tool is designed to return the minimum data needed. Large diffs get summarized. Symbol bodies can be fetched in compact mode (~90% fewer tokens).
 
@@ -710,14 +765,16 @@ Supported monorepo tools: npm workspaces, yarn workspaces, pnpm workspaces, Turb
 
 ```
 Total Python files:     112
-Total lines of code:    62,500+
+Total lines of code:    73,000+
 Framework plugins:      16
-Total MCP tools:        237 (31 core + ~13 per plugin)
+Total MCP tools:        240 (34 core + ~13 per plugin)
 Supported languages:    12 (PHP, TypeScript, JavaScript, Python, Java,
                             Kotlin, Go, Rust, Ruby, C#, Dart, Elixir)
 Tree-sitter parsers:    12
 Syntax check support:   PHP, JavaScript, TypeScript, Python, Go, Rust
 Monorepo support:       Automatic workspace detection
+Session tracking:       Ripple lifecycle, pipeline enforcement, coverage metrics
+Compact responses:      Large results auto-saved to .blindspot/output/
 ```
 
 ---
