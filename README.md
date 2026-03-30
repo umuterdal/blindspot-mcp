@@ -348,7 +348,7 @@ Blindspot auto-detects your framework and loads only the relevant plugin tools:
 - **Tested on real projects** — Verified on multiple real-world projects with real data
 - **Alpha** — Architecture and parsing logic complete, needs community testing on diverse projects. Your bug reports and PRs will make these production-ready!
 
-**No framework detected?** Built-in toolset yine çalışır. Blindspot v0.1.5 ile birlikte server tarafında **84 built-in MCP tool** bulunur; framework plugin'leri proje yapısına göre buna eklenir.
+**No framework detected?** The built-in toolset still works. In Blindspot v0.1.5, the server ships with **84 built-in MCP tools**, and framework plugins are loaded based on detected project structure.
 
 ---
 
@@ -359,15 +359,15 @@ These tools work on **every project**, regardless of language or framework:
 ### Project Bootstrap & Runtime
 | Tool | What It Does |
 |------|-------------|
-| `set_project_path` | MCP oturumu için proje kökünü ayarlar. CLI'da `--project-path` vermediysen ilk çağrılması gereken tooldur. |
-| `get_settings_info` | Aktif proje ayarlarını ve konfigürasyon durumunu döndürür. |
-| `get_policy_status` | Etkin fail-closed policy profilini (`policy_hash` dahil) döndürür. |
-| `get_change_risk` | Bir dosya/sembol değişikliğinin risk seviyesini hızlı özetler. |
-| `create_temp_directory` / `check_temp_directory` | Index/safety için kullanılan temp dizinin oluşturulması ve sağlık kontrolü. |
-| `get_file_watcher_status` / `configure_file_watcher` | File watcher durumunu ve davranışını yönetir (debounce, exclude pattern, observer type). |
-| `refresh_search_tools` | Ortamdaki arama araçlarını (`rg`, `ugrep`, `ag`, `grep`) yeniden keşfeder. |
-| `clear_settings` | Cache + ayarları temizler (yerel geliştirme / reset senaryoları). |
-| `list_audit_backups` | Güvenlik/audit backup kayıtlarını listeler. |
+| `set_project_path` | Sets the MCP session project root. If `--project-path` is not provided via CLI, this should be called first. |
+| `get_settings_info` | Returns active project settings and configuration status. |
+| `get_policy_status` | Returns the effective fail-closed policy profile (including `policy_hash`). |
+| `get_change_risk` | Quickly summarizes risk level for a file/symbol change. |
+| `create_temp_directory` / `check_temp_directory` | Creates and validates the temp directory used by index/safety runtime components. |
+| `get_file_watcher_status` / `configure_file_watcher` | Manages file watcher status and behavior (debounce, exclude patterns, observer type). |
+| `refresh_search_tools` | Re-detects available code search tools (`rg`, `ugrep`, `ag`, `grep`) in the environment. |
+| `clear_settings` | Clears cached settings/state (useful for local reset scenarios). |
+| `list_audit_backups` | Lists registered safety/audit backup records. |
 
 ### Editing & Safety
 | Tool | What It Does |
@@ -755,7 +755,7 @@ Options:
 **Key design decisions:**
 
 - **Local only** — Your code never leaves your machine. Everything runs in-process.
-- **Framework-aware loading** — Detected framework plugin'leri otomatik yüklenir. Built-in toolset 84 tooldur; plugin bazlı ekstra araçlar yalnızca ilgili projede aktif olur.
+- **Framework-aware loading** — Detected framework plugins load automatically. The built-in toolset is 84 tools; plugin-specific extras are only active for relevant projects.
 - **Deep index + file scanning** — Tree-sitter for structured symbol data, regex for cross-file references. Best of both worlds.
 - **Compact responses** — Every tool is designed to return the minimum data needed. Large diffs get summarized. Symbol bodies can be fetched in compact mode (~90% fewer tokens).
 
