@@ -297,6 +297,112 @@ class SafetyOrchestrationTests(unittest.TestCase):
         self.assertEqual(result["status"], "success")
         self.assertIn("execution_profile", result)
         self.assertIn("targeted_tests", result)
+        self.assertIn("diff_aware_quality_matrix_pre_write", result)
+        self.assertIn("diff_aware_quality_matrix_post_write", result)
+        self.assertIn("universal_completion_gate", result)
+        self.assertIn("auto_fix_loop", result)
+
+    def test_diff_aware_quality_matrix_blocks_missing_tool(self):
+        self._write_config(
+            "language_adapters:\n"
+            "  hard_block_missing_tools: true\n"
+            "  languages:\n"
+            "    python:\n"
+            "      syntax_command: \"missing_tool_123 --version\"\n"
+            "      static_command: \"missing_tool_123 --version\"\n"
+            "      format_command: \"missing_tool_123 --version\"\n"
+            "      test_command: \"missing_tool_123 --version\"\n"
+        )
+        os.makedirs(os.path.join(self.tmp.name, "src"), exist_ok=True)
+        with open(os.path.join(self.tmp.name, "src", "main.py"), "w", encoding="utf-8") as f:
+            f.write("x = 1\n")
+
+        result = self.svc.run_diff_aware_quality_matrix(
+            target_files=["src/main.py"],
+            enforce=True,
+            stage="write",
+        )
+        self.assertEqual(result["status"], "blocked")
+        self.assertGreaterEqual(len(result.get("blocking_checks", [])), 1)
+        reasons = [item.get("reason") for item in result.get("checks", {}).values()]
+        self.assertIn("missing_tool", reasons)
+
+    def test_universal_completion_gate_blocks_high_risk_ripple(self):
+        os.makedirs(os.path.join(self.tmp.name, "src", "auth"), exist_ok=True)
+        with open(os.path.join(self.tmp.name, "src", "auth", "service.py"), "w", encoding="utf-8") as f:
+            f.write("def validate_token(token):\n    return bool(token)\n")
+
+        result = self.svc.run_universal_completion_gate(
+            target_files=["src/auth/service.py"],
+            quality_matrix={
+                "summary": {
+                    "syntax_pass": True,
+                    "static_pass": True,
+                    "tests_pass": True,
+                    "format_pass": True,
+                }
+            },
+            targeted_tests={"suite_status": "pass", "status": "success"},
+            symbol="validate_token",
+            enforce=True,
+        )
+        self.assertEqual(result["status"], "blocked")
+        self.assertIn("high_risk_ripple_zero", result.get("blocking_checks", []))
+
+    def test_auto_fix_loop_recovers_from_debug_line_failure(self):
+        os.makedirs(os.path.join(self.tmp.name, "src"), exist_ok=True)
+        os.makedirs(os.path.join(self.tmp.name, "tests"), exist_ok=True)
+        os.makedirs(os.path.join(self.tmp.name, "tools"), exist_ok=True)
+
+        with open(os.path.join(self.tmp.name, "tools", "no_print.py"), "w", encoding="utf-8") as f:
+            f.write(
+                "import pathlib\n"
+                "import sys\n\n"
+                "for file_path in sys.argv[1:]:\n"
+                "    if 'print(' in pathlib.Path(file_path).read_text(encoding='utf-8'):\n"
+                "        raise SystemExit(1)\n"
+            )
+
+        with open(os.path.join(self.tmp.name, "src", "main.py"), "w", encoding="utf-8") as f:
+            f.write("x = 1\n")
+        with open(os.path.join(self.tmp.name, "tests", "test_main.py"), "w", encoding="utf-8") as f:
+            f.write(
+                "import unittest\n\n"
+                "class MainTest(unittest.TestCase):\n"
+                "    def test_ok(self):\n"
+                "        self.assertEqual(2, 2)\n"
+            )
+        with open(os.path.join(self.tmp.name, "tests", "__init__.py"), "w", encoding="utf-8") as f:
+            f.write("")
+
+        self._write_config(
+            "language_adapters:\n"
+            "  hard_block_missing_tools: true\n"
+            "  default_matrix_always: true\n"
+            "  require_format_checks: false\n"
+            "  languages:\n"
+            "    python:\n"
+            "      syntax_command: \"python3 -m py_compile {files}\"\n"
+            "      static_command: \"python3 tools/no_print.py {files}\"\n"
+            "      format_command: \"python3 -m py_compile {files}\"\n"
+            "      test_command: \"python3 -m unittest -v\"\n"
+            "auto_fix_loop:\n"
+            "  enabled: true\n"
+            "  max_attempts: 2\n"
+        )
+
+        result = self.svc.safe_implement(
+            feature_spec="insert temporary debug line and update value",
+            target_file="src/main.py",
+            search="x = 1",
+            replace="print('debug')\nx = 2",
+            confidence_score=0.99,
+            execution_profile="strict_path",
+        )
+        self.assertEqual(result["status"], "success")
+        auto_fix = result.get("auto_fix_loop", {})
+        self.assertEqual(auto_fix.get("status"), "success")
+        self.assertGreaterEqual(len(auto_fix.get("attempts", [])), 1)
 
 
 if __name__ == "__main__":

@@ -1320,6 +1320,54 @@ def run_mutation_property_fuzz_suite(
 @mcp.tool()
 @handle_mcp_tool_errors(return_type="dict")
 @with_concurrency_limit
+def run_diff_aware_quality_matrix(
+    ctx: Context,
+    target_files: list = None,
+    enforce: bool = True,
+    stage: str = "write",
+) -> dict[str, Any]:
+    """Diff-aware quality matrix by language (syntax/static/format/tests)."""
+    return _compact_response(
+        "run_diff_aware_quality_matrix",
+        SafetyOrchestrationService(ctx).run_diff_aware_quality_matrix(
+            target_files=target_files,
+            enforce=enforce,
+            stage=stage,
+        ),
+        ctx,
+    )
+
+
+@mcp.tool()
+@handle_mcp_tool_errors(return_type="dict")
+@with_concurrency_limit
+def run_universal_completion_gate(
+    target_files: list,
+    quality_matrix: dict,
+    targeted_tests: dict,
+    ctx: Context,
+    symbol: str = None,
+    edit_result: dict = None,
+    enforce: bool = True,
+) -> dict[str, Any]:
+    """Universal completion gate: syntax+static+tests+high-risk ripple=0."""
+    return _compact_response(
+        "run_universal_completion_gate",
+        SafetyOrchestrationService(ctx).run_universal_completion_gate(
+            target_files=target_files or [],
+            quality_matrix=quality_matrix or {},
+            targeted_tests=targeted_tests or {},
+            symbol=symbol,
+            edit_result=edit_result or {},
+            enforce=enforce,
+        ),
+        ctx,
+    )
+
+
+@mcp.tool()
+@handle_mcp_tool_errors(return_type="dict")
+@with_concurrency_limit
 def record_incident_rule(
     name: str,
     pattern: str,

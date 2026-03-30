@@ -477,6 +477,7 @@ class SymbolResolver:
 
         total_files = len(external_refs)
         total_usages = sum(r["count"] for r in external_refs)
+        weighted = self._compute_weighted_risk(external_refs, change_type=change_type)
 
         # Build summary
         result = {
@@ -489,7 +490,11 @@ class SymbolResolver:
                 "total_files_affected": total_files,
                 "total_usages": total_usages,
                 "categories_affected": list(categorized.keys()),
-                "risk_level": self._assess_risk(total_files),
+                "risk_level": weighted["risk_level"],
+                "risk_score": weighted["risk_score"],
+                "weighted_model": "ripple-v2",
+                "high_risk_impact_count": len(weighted["high_risk_impacts"]),
+                "high_risk_impacts": weighted["high_risk_impacts"][:15],
             },
         }
 
@@ -712,6 +717,97 @@ class SymbolResolver:
         return context
 
     # ── Helpers ───────────────────────────────────────────────────
+
+    @staticmethod
+    def _category_weight(category: str) -> float:
+        category = (category or "other").lower()
+        weights = {
+            "routes": 1.6,
+            "controllers": 1.4,
+            "middleware": 1.5,
+            "models": 1.35,
+            "services": 1.25,
+            "views": 1.1,
+            "tests": 0.7,
+            "migrations": 1.55,
+        }
+        return float(weights.get(category, 1.0))
+
+    @staticmethod
+    def _usage_weight(usage_type: str) -> float:
+        usage_type = (usage_type or "reference").lower()
+        weights = {
+            "extends_or_implements": 1.5,
+            "instantiation": 1.3,
+            "static_call": 1.25,
+            "method_call": 1.2,
+            "import": 0.85,
+            "type_hint": 0.95,
+            "reference": 1.0,
+        }
+        return float(weights.get(usage_type, 1.0))
+
+    @staticmethod
+    def _change_type_weight(change_type: str) -> float:
+        t = (change_type or "modify").lower()
+        if t == "rename":
+            return 1.15
+        if t == "delete":
+            return 1.35
+        return 1.0
+
+    def _compute_weighted_risk(self, refs: List[Dict[str, Any]], change_type: str = "modify") -> Dict[str, Any]:
+        """Compute a weighted risk score across category + usage + change type."""
+        score = 0.0
+        high_risk_impacts: List[Dict[str, Any]] = []
+        ctype_weight = self._change_type_weight(change_type)
+
+        for ref in refs:
+            category = ref.get("category", "other")
+            cat_weight = self._category_weight(category)
+            usages = ref.get("usages", []) if isinstance(ref.get("usages", []), list) else []
+
+            usage_score = 0.0
+            for usage in usages:
+                if isinstance(usage, dict):
+                    usage_score += self._usage_weight(str(usage.get("type", "reference")))
+
+            count = int(ref.get("count", 0))
+            base_score = 1.0 + min(10, max(0, count)) * 0.35 + usage_score * 0.2
+            file_score = base_score * cat_weight * ctype_weight
+
+            file_path = str(ref.get("file", "")).lower()
+            if any(k in file_path for k in ("auth", "payment", "webhook")):
+                file_score *= 1.4
+
+            file_score = round(file_score, 3)
+            score += file_score
+            if file_score >= 6.0:
+                high_risk_impacts.append(
+                    {
+                        "file": ref.get("file", ""),
+                        "category": category,
+                        "score": file_score,
+                        "count": count,
+                    }
+                )
+
+        score = round(score, 2)
+        if score >= 30.0:
+            level = "critical"
+        elif score >= 16.0:
+            level = "high"
+        elif score >= 7.0:
+            level = "medium"
+        else:
+            level = "low"
+
+        high_risk_impacts.sort(key=lambda item: item.get("score", 0.0), reverse=True)
+        return {
+            "risk_level": level,
+            "risk_score": score,
+            "high_risk_impacts": high_risk_impacts,
+        }
 
     @staticmethod
     def _assess_risk(affected_files: int) -> str:

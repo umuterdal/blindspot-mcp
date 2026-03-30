@@ -12,6 +12,8 @@
 ### What's New in v0.1.5
 
 - Fail-closed safety orchestration (`safe_implement`, `safe_refactor`, `safe_optimize`, `safe_migrate`, `safe_fix`)
+- Language adapter matrix (`run_diff_aware_quality_matrix`) with per-language syntax/static/format/test gates
+- Universal completion gate (`run_universal_completion_gate`) and bounded auto-fix loop for post-write verification
 - Governance and release controls (policy approvals, break-glass, rollout, backup/DR, release readiness)
 - Mandatory release evidence reporting (`conformance_matrix`, `gate_evidence_pack`, `kpi_report`, `open_risk_register`)
 - CI safety release gate workflow and expanded test coverage for safety/governance and Laravel route validation
@@ -348,11 +350,11 @@ Blindspot auto-detects your framework and loads only the relevant plugin tools:
 - **Tested on real projects** — Verified on multiple real-world projects with real data
 - **Alpha** — Architecture and parsing logic complete, needs community testing on diverse projects. Your bug reports and PRs will make these production-ready!
 
-**No framework detected?** The built-in toolset still works. In Blindspot v0.1.5, the server ships with **84 built-in MCP tools**, and framework plugins are loaded based on detected project structure.
+**No framework detected?** The built-in toolset still works. In Blindspot v0.1.5, the server ships with **86 built-in MCP tools**, and framework plugins are loaded based on detected project structure.
 
 ---
 
-## Core Tools (84 Built-In) + Safety Orchestration
+## Core Tools (86 Built-In) + Safety Orchestration
 
 These tools work on **every project**, regardless of language or framework:
 
@@ -387,6 +389,8 @@ These tools work on **every project**, regardless of language or framework:
 | `list_patch_primitives` | Lists allowed write primitives used by fail-closed autopilot edits. |
 | `run_policy_evaluation` | Fail-closed gate for write/merge/deploy with risk + assumption checks. |
 | `run_mutation_property_fuzz_suite` | Runs mutation/property/fuzz verification gates and blocks writes when enforced. |
+| `run_diff_aware_quality_matrix` | Diff-aware language matrix for syntax/static/format/tests with fail-closed enforcement. |
+| `run_universal_completion_gate` | Final gate: syntax clean + static clean + related tests + high-risk ripple=0. |
 | `safe_implement` | Main autopilot command: compile + prechecks + transactional edit + audited gates. |
 | `safe_refactor` / `safe_optimize` / `safe_migrate` / `safe_fix` | Same audited fail-closed pipeline for each change type. |
 | `record_incident_rule` / `list_incident_rules` | Incident memory rules to auto-block known bad patterns from prior failures. |
@@ -458,7 +462,7 @@ At release close, collect exactly these 4 reports:
 Below is the exact built-in tool inventory currently registered in `blindspot/server.py`:
 
 ```text
-set_project_path, search_code_advanced, find_files, get_file_summary, get_symbol_body, refresh_index, build_deep_index, get_settings_info, create_temp_directory, check_temp_directory, clear_settings, refresh_search_tools, get_file_watcher_status, configure_file_watcher, find_references, get_class_hierarchy, get_impact_analysis, get_ripple_effect, get_project_snapshot, detect_anti_patterns, apply_edit, get_edit_region, apply_edit_multi, analyze_queries, rename_symbol, check_eager_loading, auto_anti_pattern_check, detect_cache_conflicts, diff_preview, full_audit, post_edit_checklist, get_rebuild_status, get_context_for_edit, smart_apply_edit, get_policy_status, compile_spec, goal_to_patch, get_runtime_manifest, list_patch_primitives, run_mutation_property_fuzz_suite, record_incident_rule, list_incident_rules, get_assumption_ledger, resolve_assumption, run_policy_evaluation, get_change_risk, verify_schema, detect_transaction_risks, get_domain_rules, generate_test_skeleton, match_view_guards, safe_implement, safe_refactor, safe_optimize, safe_migrate, safe_fix, replay_session, conformance_matrix, gate_evidence_pack, kpi_report, open_risk_register, get_scope_inventory, upsert_scope_owner, get_kpi_protocol, set_kpi_protocol, request_policy_change, approve_policy_change, list_policy_changes, rotate_signing_key, list_key_rotations, run_benchmark_harness, list_benchmark_runs, request_break_glass, approve_break_glass, get_break_glass_request, create_audit_backup, list_audit_backups, restore_audit_backup, run_dr_drill, create_rollout_plan, execute_rollout_stage, get_rollout_status, run_security_quality_suite, release_readiness_report
+set_project_path, search_code_advanced, find_files, get_file_summary, get_symbol_body, refresh_index, build_deep_index, get_settings_info, create_temp_directory, check_temp_directory, clear_settings, refresh_search_tools, get_file_watcher_status, configure_file_watcher, find_references, get_class_hierarchy, get_impact_analysis, get_ripple_effect, get_project_snapshot, detect_anti_patterns, apply_edit, get_edit_region, apply_edit_multi, analyze_queries, rename_symbol, check_eager_loading, auto_anti_pattern_check, detect_cache_conflicts, diff_preview, full_audit, post_edit_checklist, get_rebuild_status, get_context_for_edit, smart_apply_edit, get_policy_status, compile_spec, goal_to_patch, get_runtime_manifest, list_patch_primitives, run_mutation_property_fuzz_suite, run_diff_aware_quality_matrix, run_universal_completion_gate, record_incident_rule, list_incident_rules, get_assumption_ledger, resolve_assumption, run_policy_evaluation, get_change_risk, verify_schema, detect_transaction_risks, get_domain_rules, generate_test_skeleton, match_view_guards, safe_implement, safe_refactor, safe_optimize, safe_migrate, safe_fix, replay_session, conformance_matrix, gate_evidence_pack, kpi_report, open_risk_register, get_scope_inventory, upsert_scope_owner, get_kpi_protocol, set_kpi_protocol, request_policy_change, approve_policy_change, list_policy_changes, rotate_signing_key, list_key_rotations, run_benchmark_harness, list_benchmark_runs, request_break_glass, approve_break_glass, get_break_glass_request, create_audit_backup, list_audit_backups, restore_audit_backup, run_dr_drill, create_rollout_plan, execute_rollout_stage, get_rollout_status, run_security_quality_suite, release_readiness_report
 ```
 
 ---
@@ -488,6 +492,9 @@ Strict profile additionally enforces:
 - deterministic runtime pin check before write/merge/deploy
 - incident-memory auto-block for known failure signatures
 - mutation/property/fuzz gate pass before transactional edit
+- diff-aware language matrix pass before write and after write (`run_diff_aware_quality_matrix`)
+- universal completion gate must pass before merge (`run_universal_completion_gate`)
+- bounded post-write auto-fix loop for recoverable anti-pattern/debug artifacts
 
 High-speed profile (`execution.profile=fast_path`) adds:
 - parallel prechecks with warm cache reuse
@@ -633,6 +640,23 @@ policy:
     per_run: 8
     per_day: 250
 
+# Language adapter matrix (required checks per changed language)
+language_adapters:
+  hard_block_missing_tools: true
+  default_matrix_always: true
+  require_format_checks: false
+  languages:
+    python:
+      syntax_command: "python3 -m py_compile {files}"
+      static_command: "python3 -m py_compile {files}"
+      format_command: "python3 -m py_compile {files}"
+      test_command: "python3 -m unittest -v"
+
+# Bounded auto-fix loop for post-write cleanup
+auto_fix_loop:
+  enabled: true
+  max_attempts: 2
+
 # KPI measurement protocol
 kpi_protocol:
   sample_size_min: 500
@@ -670,6 +694,16 @@ The v0.1.5 safety pipeline reads the following keys:
 | `quality_gates.targeted_tests_enabled` | `bool` | Enables impacted test selection in fast path. |
 | `quality_gates.targeted_test_command` | `string` | Command template; `{tests}` is substituted with impacted test modules. |
 | `quality_gates.max_targeted_tests` | `int` | Upper bound for targeted tests per run. |
+| `language_adapters.hard_block_missing_tools` | `bool` | If `true`, missing checker binaries block required matrix checks (fail-closed). |
+| `language_adapters.default_matrix_always` | `bool` | If `true`, quality matrix planning is always active for supported changed languages. |
+| `language_adapters.require_format_checks` | `bool` | If `true`, format checks become required in the matrix. |
+| `language_adapters.languages.<lang>.parser` | `string` | Declares parser strategy label for that language profile. |
+| `language_adapters.languages.<lang>.syntax_command` | `string` | Syntax command template (`{file}`, `{files}`, `{paths}`). |
+| `language_adapters.languages.<lang>.static_command` | `string` | Static analysis command template. |
+| `language_adapters.languages.<lang>.format_command` | `string` | Format check command template. |
+| `language_adapters.languages.<lang>.test_command` | `string` | Test command template. |
+| `auto_fix_loop.enabled` | `bool` | Enables bounded post-write auto-fix attempts before rollback. |
+| `auto_fix_loop.max_attempts` | `int` | Maximum number of auto-fix attempts (0-5). |
 | `deterministic_runtime.require_pinned` | `bool` | Enforces runtime pin checks (fail-closed on mismatch). |
 | `deterministic_runtime.container_required` | `bool` | Requires runtime image digest for containerized execution. |
 | `deterministic_runtime.pins.python_major` | `int` | Required Python major version. |
@@ -755,7 +789,7 @@ Options:
 **Key design decisions:**
 
 - **Local only** — Your code never leaves your machine. Everything runs in-process.
-- **Framework-aware loading** — Detected framework plugins load automatically. The built-in toolset is 84 tools; plugin-specific extras are only active for relevant projects.
+- **Framework-aware loading** — Detected framework plugins load automatically. The built-in toolset is 86 tools; plugin-specific extras are only active for relevant projects.
 - **Deep index + file scanning** — Tree-sitter for structured symbol data, regex for cross-file references. Best of both worlds.
 - **Compact responses** — Every tool is designed to return the minimum data needed. Large diffs get summarized. Symbol bodies can be fetched in compact mode (~90% fewer tokens).
 
@@ -961,7 +995,7 @@ Supported monorepo tools: npm workspaces, yarn workspaces, pnpm workspaces, Turb
 Tracked Python files:   123 (blindspot + tests + scripts)
 Tracked LOC:            ~79,700
 Framework plugins:      16
-Built-in MCP tools:     84 (server-registered)
+Built-in MCP tools:     86 (server-registered)
 Plugin tools:           Auto-loaded by detected framework(s)
 Supported languages:    12 (PHP, TypeScript, JavaScript, Python, Java,
                             Kotlin, Go, Rust, Ruby, C#, Dart, Elixir)

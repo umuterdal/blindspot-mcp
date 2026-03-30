@@ -24,6 +24,7 @@ from typing import Any, Dict, List, Optional
 from .advanced_analysis_service import AdvancedAnalysisService
 from .base_service import BaseService
 from .generic_intelligence_service import GenericIntelligenceService
+from ..adapters import LanguageExecutionAdapter
 from ..adapters.project_structure import get_project_structure
 from ..config import get_config
 from ..safety import SafetyAuditStore, SafetyGovernanceStore
@@ -44,6 +45,7 @@ class SafetyOrchestrationService(BaseService):
     DEFAULT_PRECHECK_PARALLELISM = 4
     DEFAULT_WARM_CACHE_TTL_SECONDS = 300
     DEFAULT_SPECULATIVE_VARIANTS = 3
+    DEFAULT_AUTO_FIX_ATTEMPTS = 2
     PATCH_PRIMITIVES = (
         "search_replace",
         "batch_edits",
@@ -167,6 +169,23 @@ class SafetyOrchestrationService(BaseService):
             "targeted_tests_enabled": bool(quality.get("targeted_tests_enabled", True)),
             "targeted_test_command": str(quality.get("targeted_test_command", default_targeted)).strip(),
             "max_targeted_tests": max(1, self._safe_int(quality.get("max_targeted_tests"), 12)),
+        }
+
+    def _language_adapter_config(self) -> Dict[str, Any]:
+        raw = self._safety_config()
+        adapter = raw.get("language_adapters", {}) if isinstance(raw.get("language_adapters", {}), dict) else {}
+        return {
+            "hard_block_missing_tools": bool(adapter.get("hard_block_missing_tools", True)),
+            "default_matrix_always": bool(adapter.get("default_matrix_always", True)),
+            "require_format_checks": bool(adapter.get("require_format_checks", False)),
+        }
+
+    def _auto_fix_config(self) -> Dict[str, Any]:
+        raw = self._safety_config()
+        cfg = raw.get("auto_fix_loop", {}) if isinstance(raw.get("auto_fix_loop", {}), dict) else {}
+        return {
+            "enabled": bool(cfg.get("enabled", True)),
+            "max_attempts": max(0, min(5, self._safe_int(cfg.get("max_attempts"), self.DEFAULT_AUTO_FIX_ATTEMPTS))),
         }
 
     def _execution_config(
@@ -377,6 +396,387 @@ class SafetyOrchestrationService(BaseService):
             "checks": checks,
             "blocking_checks": blocking,
             "enforced": bool(enforce),
+        }
+
+    @staticmethod
+    def _command_executable(command: str) -> Optional[str]:
+        cmd = (command or "").strip()
+        if not cmd:
+            return None
+        try:
+            parts = shlex.split(cmd)
+        except ValueError:
+            parts = cmd.split()
+        if not parts:
+            return None
+        for part in parts:
+            if "=" in part and not part.startswith(("/", "./", "../")) and part.count("=") == 1:
+                continue
+            return part
+        return parts[0]
+
+    def _run_gate_command(self, command: str, timeout_seconds: int) -> Dict[str, Any]:
+        proc = subprocess.run(
+            command,
+            shell=True,
+            cwd=self.base_path,
+            capture_output=True,
+            text=True,
+            timeout=max(5, int(timeout_seconds)),
+        )
+        return {
+            "status": "pass" if proc.returncode == 0 else "fail",
+            "exit_code": proc.returncode,
+            "stdout": (proc.stdout or "")[-1200:],
+            "stderr": (proc.stderr or "")[-1200:],
+        }
+
+    @staticmethod
+    def _summary_gate_pass(checks: Dict[str, Any], check_type: str) -> bool:
+        scoped = [
+            c for c in checks.values()
+            if str(c.get("check_type", "")) == check_type and bool(c.get("required", True))
+        ]
+        if not scoped:
+            return True
+        return all(c.get("status") in {"pass", "skipped"} for c in scoped)
+
+    def run_diff_aware_quality_matrix(
+        self,
+        target_files: Optional[List[str]],
+        enforce: bool = True,
+        stage: str = "write",
+    ) -> Dict[str, Any]:
+        if not self.base_path:
+            return {"status": "error", "message": "Project path not set"}
+
+        adapter = LanguageExecutionAdapter(self.base_path)
+        planned = adapter.build_quality_matrix(target_files or [])
+        if planned.get("status") != "success":
+            return planned
+
+        checks: Dict[str, Any] = {}
+        blocking_checks: List[str] = []
+        timeout_seconds = int(self._quality_gate_config().get("timeout_seconds", 120))
+        hard_cfg = planned.get("config", {}) if isinstance(planned.get("config", {}), dict) else {}
+        hard_block_missing = bool(hard_cfg.get("hard_block_missing_tools", True))
+
+        for entry in planned.get("checks", []):
+            if not isinstance(entry, dict):
+                continue
+            check_id = str(entry.get("check_id", "unknown"))
+            required = bool(entry.get("required", True))
+            command = str(entry.get("command", "")).strip()
+            base_item = {
+                "language": entry.get("language", "unknown"),
+                "parser": entry.get("parser", "unknown"),
+                "check_type": entry.get("check_type", "unknown"),
+                "required": required,
+                "command": command,
+                "files": entry.get("files", []),
+            }
+
+            if not command:
+                item = {
+                    **base_item,
+                    "status": "blocked" if (enforce and required) else "skipped",
+                    "reason": "missing_command",
+                }
+                checks[check_id] = item
+                if item["status"] == "blocked":
+                    blocking_checks.append(check_id)
+                continue
+
+            executable = self._command_executable(command)
+            if not executable or shutil.which(executable) is None:
+                missing_status = "blocked" if (enforce and required and hard_block_missing) else "skipped"
+                item = {
+                    **base_item,
+                    "status": missing_status,
+                    "reason": "missing_tool",
+                    "executable": executable or "",
+                }
+                checks[check_id] = item
+                if missing_status == "blocked":
+                    blocking_checks.append(check_id)
+                continue
+
+            try:
+                result = self._run_gate_command(command, timeout_seconds=timeout_seconds)
+            except subprocess.TimeoutExpired:
+                result = {
+                    "status": "fail",
+                    "exit_code": 124,
+                    "stdout": "",
+                    "stderr": f"timeout_after_{timeout_seconds}s",
+                }
+            if (
+                entry.get("check_type") == "tests"
+                and result.get("status") == "fail"
+                and "ran 0 tests" in f"{result.get('stdout', '')}\n{result.get('stderr', '')}".lower()
+            ):
+                result["status"] = "skipped"
+                result["reason"] = "no_tests_detected"
+
+            item = {**base_item, **result, "executable": executable}
+            checks[check_id] = item
+            if enforce and required and item.get("status") not in {"pass", "skipped"}:
+                blocking_checks.append(check_id)
+
+        syntax_pass = self._summary_gate_pass(checks, "syntax")
+        static_pass = self._summary_gate_pass(checks, "static")
+        format_pass = self._summary_gate_pass(checks, "format")
+        tests_pass = self._summary_gate_pass(checks, "tests")
+
+        if not checks:
+            matrix_status = "skipped"
+        elif blocking_checks:
+            matrix_status = "fail"
+        else:
+            matrix_status = "pass"
+
+        return {
+            "status": "blocked" if (enforce and blocking_checks) else "success",
+            "stage": stage,
+            "matrix_status": matrix_status,
+            "languages": planned.get("languages", []),
+            "config": planned.get("config", {}),
+            "checks": checks,
+            "blocking_checks": blocking_checks,
+            "summary": {
+                "syntax_pass": syntax_pass,
+                "static_pass": static_pass,
+                "format_pass": format_pass,
+                "tests_pass": tests_pass,
+            },
+            "enforced": bool(enforce),
+        }
+
+    def _count_high_risk_impacts(
+        self,
+        target_files: List[str],
+        symbol: Optional[str],
+        edit_result: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        high_items: List[Dict[str, Any]] = []
+        if isinstance(edit_result, dict):
+            for warning in edit_result.get("ripple_warnings", []) or []:
+                level = str(warning.get("risk_level", "low")).lower()
+                if level in {"high", "critical"}:
+                    high_items.append(
+                        {
+                            "source": "edit_ripple_warning",
+                            "symbol": warning.get("symbol", ""),
+                            "risk_level": level,
+                            "files_affected": int(warning.get("total_files_affected", 0)),
+                        }
+                    )
+
+        for idx, rel_file in enumerate(target_files):
+            requested_symbol = symbol if idx == 0 else None
+            risk = self.get_change_risk(rel_file, requested_symbol)
+            if risk.get("status") != "success":
+                continue
+            risk_level = str(risk.get("risk_level", "low")).lower()
+            if risk_level in {"high", "critical"}:
+                summary = risk.get("summary", {}) if isinstance(risk.get("summary", {}), dict) else {}
+                high_items.append(
+                    {
+                        "source": "change_risk",
+                        "file": rel_file,
+                        "symbol": risk.get("symbol", ""),
+                        "risk_level": risk_level,
+                        "risk_score": summary.get("risk_score", 0.0),
+                        "total_files_affected": summary.get("total_files_affected", 0),
+                    }
+                )
+
+        return {
+            "high_risk_count": len(high_items),
+            "high_risk_items": high_items[:20],
+        }
+
+    def run_universal_completion_gate(
+        self,
+        target_files: List[str],
+        quality_matrix: Dict[str, Any],
+        targeted_tests: Dict[str, Any],
+        symbol: Optional[str] = None,
+        edit_result: Optional[Dict[str, Any]] = None,
+        enforce: bool = True,
+    ) -> Dict[str, Any]:
+        summary = quality_matrix.get("summary", {}) if isinstance(quality_matrix.get("summary", {}), dict) else {}
+        syntax_clean = bool(summary.get("syntax_pass", False))
+        static_clean = bool(summary.get("static_pass", False))
+
+        targeted_suite = str(targeted_tests.get("suite_status", "skipped")).lower()
+        targeted_ok = targeted_suite in {"pass", "skipped"}
+        tests_clean = bool(summary.get("tests_pass", False)) and targeted_ok
+
+        high_risk = self._count_high_risk_impacts(
+            target_files=target_files,
+            symbol=symbol,
+            edit_result=edit_result,
+        )
+        high_risk_count = int(high_risk.get("high_risk_count", 0))
+
+        checks = {
+            "syntax_clean": syntax_clean,
+            "static_clean": static_clean,
+            "related_tests_passed": tests_clean,
+            "high_risk_ripple_zero": high_risk_count == 0,
+        }
+        blocking_checks = [name for name, ok in checks.items() if not ok]
+        gate_status = "pass" if not blocking_checks else "fail"
+
+        return {
+            "status": "blocked" if (enforce and blocking_checks) else "success",
+            "gate_status": gate_status,
+            "checks": checks,
+            "blocking_checks": blocking_checks,
+            "high_risk": high_risk,
+            "quality_summary": summary,
+            "targeted_tests": {
+                "suite_status": targeted_suite,
+                "status": targeted_tests.get("status", "unknown"),
+            },
+            "enforced": bool(enforce),
+        }
+
+    @staticmethod
+    def _strip_debug_lines(file_content: str, file_path: str) -> str:
+        ext = Path(file_path).suffix.lower()
+        patterns: List[str] = []
+        if ext in {".py"}:
+            patterns = [r"^\s*print\(", r"^\s*breakpoint\(", r"^\s*import\s+pdb\b", r"^\s*pdb\.set_trace\("]
+        elif ext in {".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"}:
+            patterns = [r"console\.(log|warn|error)\(", r"^\s*debugger;?\s*$"]
+        elif ext in {".php"}:
+            patterns = [r"\bdd\(", r"\bdump\(", r"\bvar_dump\(", r"\bprint_r\("]
+        elif ext in {".go"}:
+            patterns = [r"\bfmt\.Print(ln|f)\(", r"\blog\.Println\("]
+        elif ext in {".rs"}:
+            patterns = [r"\bprintln!\(", r"\bdbg!\(", r"\beprintln!\("]
+
+        if not patterns:
+            return file_content
+
+        regexes = [re.compile(p) for p in patterns]
+        output_lines: List[str] = []
+        for line in file_content.splitlines(keepends=True):
+            stripped = line.strip()
+            if any(rx.search(stripped) for rx in regexes):
+                continue
+            output_lines.append(line)
+        return "".join(output_lines)
+
+    def _apply_debug_cleanup(self, target_files: List[str]) -> Dict[str, Any]:
+        changed_files: List[str] = []
+        for rel in target_files:
+            resolved = self._resolve_target_path(self.base_path, rel)
+            if not resolved or not resolved.exists() or not resolved.is_file():
+                continue
+            try:
+                content = resolved.read_text(encoding="utf-8")
+            except UnicodeDecodeError:
+                content = resolved.read_text(encoding="latin-1")
+            cleaned = self._strip_debug_lines(content, rel)
+            if cleaned == content:
+                continue
+            resolved.write_text(cleaned, encoding="utf-8")
+            changed_files.append(rel)
+        return {"status": "success", "changed_files": changed_files, "changed_count": len(changed_files)}
+
+    def _run_auto_fix_loop(
+        self,
+        run_id: str,
+        target_files: List[str],
+        symbol: Optional[str],
+        quality_matrix: Dict[str, Any],
+        targeted_tests: Dict[str, Any],
+        edit_result: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        cfg = self._auto_fix_config()
+        if not cfg.get("enabled", True):
+            return {
+                "status": "skipped",
+                "message": "auto_fix_loop.disabled",
+                "attempts": [],
+                "quality_matrix": quality_matrix,
+                "targeted_tests": targeted_tests,
+                "completion_gate": {},
+            }
+
+        max_attempts = int(cfg.get("max_attempts", self.DEFAULT_AUTO_FIX_ATTEMPTS))
+        attempts: List[Dict[str, Any]] = []
+        latest_matrix = quality_matrix
+        latest_targeted = targeted_tests
+        latest_gate = self.run_universal_completion_gate(
+            target_files=target_files,
+            quality_matrix=latest_matrix,
+            targeted_tests=latest_targeted,
+            symbol=symbol,
+            edit_result=edit_result,
+            enforce=True,
+        )
+        if latest_gate.get("status") == "success":
+            return {
+                "status": "success",
+                "attempts": attempts,
+                "quality_matrix": latest_matrix,
+                "targeted_tests": latest_targeted,
+                "completion_gate": latest_gate,
+            }
+
+        for index in range(max_attempts):
+            cleanup = self._apply_debug_cleanup(target_files)
+            latest_matrix = self.run_diff_aware_quality_matrix(
+                target_files=target_files,
+                enforce=True,
+                stage=f"autofix_{index + 1}",
+            )
+            latest_targeted = self.run_targeted_tests(
+                target_files=target_files,
+                enforce=True,
+                timeout_seconds=int(self._quality_gate_config().get("timeout_seconds", 120)),
+                max_tests=int(self._quality_gate_config().get("max_targeted_tests", 12)),
+            )
+            latest_gate = self.run_universal_completion_gate(
+                target_files=target_files,
+                quality_matrix=latest_matrix,
+                targeted_tests=latest_targeted,
+                symbol=symbol,
+                edit_result=edit_result,
+                enforce=True,
+            )
+            attempt = {
+                "attempt": index + 1,
+                "cleanup": cleanup,
+                "quality_matrix_status": latest_matrix.get("status"),
+                "targeted_tests_status": latest_targeted.get("status"),
+                "completion_gate_status": latest_gate.get("status"),
+                "blocking_checks": latest_gate.get("blocking_checks", []),
+            }
+            attempts.append(attempt)
+            self.audit_store.add_event(run_id, f"auto_fix_attempt_{index + 1}", latest_gate.get("status", "unknown"), attempt)
+
+            if latest_gate.get("status") == "success":
+                return {
+                    "status": "success",
+                    "attempts": attempts,
+                    "quality_matrix": latest_matrix,
+                    "targeted_tests": latest_targeted,
+                    "completion_gate": latest_gate,
+                }
+            if cleanup.get("changed_count", 0) == 0:
+                break
+
+        return {
+            "status": "blocked",
+            "attempts": attempts,
+            "quality_matrix": latest_matrix,
+            "targeted_tests": latest_targeted,
+            "completion_gate": latest_gate,
         }
 
     def record_incident_rule(
@@ -2104,6 +2504,26 @@ class SafetyOrchestrationService(BaseService):
                 "quality_gate": quality_suite,
             }
 
+        pre_write_quality_matrix = self.run_diff_aware_quality_matrix(
+            target_files=effective_target_files,
+            enforce=True,
+            stage="pre_write",
+        )
+        self.audit_store.add_event(
+            run_id,
+            "diff_aware_quality_matrix_pre_write",
+            pre_write_quality_matrix.get("status", "unknown"),
+            pre_write_quality_matrix,
+        )
+        if pre_write_quality_matrix.get("status") == "blocked":
+            self.audit_store.set_run_status(run_id, "blocked")
+            return {
+                "status": "blocked",
+                "run_id": run_id,
+                "message": "Diff-aware quality matrix blocked write stage",
+                "diff_aware_quality_matrix_pre_write": pre_write_quality_matrix,
+            }
+
         prechecks: Dict[str, Any] = {}
         if effective_target_files:
             parallel_prechecks = self._run_prechecks_parallel(
@@ -2204,6 +2624,87 @@ class SafetyOrchestrationService(BaseService):
                     "rollback": rollback_result,
                 }
             quality_suite = post_quality_suite
+
+        post_write_targeted_tests = self.run_targeted_tests(
+            target_files=effective_target_files,
+            enforce=True,
+            timeout_seconds=int(quality_cfg.get("timeout_seconds", 120)),
+            max_tests=int(quality_cfg.get("max_targeted_tests", 12)),
+        )
+        self.audit_store.add_event(
+            run_id,
+            "targeted_tests_post_write",
+            post_write_targeted_tests.get("status", "unknown"),
+            post_write_targeted_tests,
+        )
+
+        post_write_quality_matrix = self.run_diff_aware_quality_matrix(
+            target_files=effective_target_files,
+            enforce=True,
+            stage="post_write",
+        )
+        self.audit_store.add_event(
+            run_id,
+            "diff_aware_quality_matrix_post_write",
+            post_write_quality_matrix.get("status", "unknown"),
+            post_write_quality_matrix,
+        )
+
+        completion_gate = self.run_universal_completion_gate(
+            target_files=effective_target_files,
+            quality_matrix=post_write_quality_matrix,
+            targeted_tests=post_write_targeted_tests,
+            symbol=symbol,
+            edit_result=edit_result if isinstance(edit_result, dict) else {},
+            enforce=True,
+        )
+        self.audit_store.add_event(
+            run_id,
+            "universal_completion_gate",
+            completion_gate.get("status", "unknown"),
+            completion_gate,
+        )
+
+        auto_fix_result = {
+            "status": "skipped",
+            "attempts": [],
+            "completion_gate": completion_gate,
+            "quality_matrix": post_write_quality_matrix,
+            "targeted_tests": post_write_targeted_tests,
+        }
+        if completion_gate.get("status") == "blocked":
+            auto_fix_result = self._run_auto_fix_loop(
+                run_id=run_id,
+                target_files=effective_target_files,
+                symbol=symbol,
+                quality_matrix=post_write_quality_matrix,
+                targeted_tests=post_write_targeted_tests,
+                edit_result=edit_result if isinstance(edit_result, dict) else {},
+            )
+            self.audit_store.add_event(
+                run_id,
+                "auto_fix_loop",
+                auto_fix_result.get("status", "unknown"),
+                auto_fix_result,
+            )
+            if auto_fix_result.get("status") == "success":
+                post_write_quality_matrix = auto_fix_result.get("quality_matrix", post_write_quality_matrix)
+                post_write_targeted_tests = auto_fix_result.get("targeted_tests", post_write_targeted_tests)
+                completion_gate = auto_fix_result.get("completion_gate", completion_gate)
+            else:
+                rollback_result = self._rollback_snapshot(snapshot)
+                self.audit_store.add_event(run_id, "rollback", rollback_result.get("status", "unknown"), rollback_result)
+                self.audit_store.set_run_status(run_id, "blocked")
+                return {
+                    "status": "blocked",
+                    "run_id": run_id,
+                    "message": "Universal completion gate blocked merge",
+                    "universal_completion_gate": completion_gate,
+                    "diff_aware_quality_matrix_post_write": post_write_quality_matrix,
+                    "targeted_tests_post_write": post_write_targeted_tests,
+                    "auto_fix_loop": auto_fix_result,
+                    "rollback": rollback_result,
+                }
 
         budget_check = self._stage_budget_block(
             run_id=run_id,
@@ -2344,8 +2845,13 @@ class SafetyOrchestrationService(BaseService):
             "execution_profile": execution_cfg,
             "patch_primitive": detected_primitive,
             "targeted_tests": targeted_tests,
+            "targeted_tests_post_write": post_write_targeted_tests,
             "prechecks": prechecks,
             "quality_gate": quality_suite,
+            "diff_aware_quality_matrix_pre_write": pre_write_quality_matrix,
+            "diff_aware_quality_matrix_post_write": post_write_quality_matrix,
+            "universal_completion_gate": completion_gate,
+            "auto_fix_loop": auto_fix_result,
             "edit_result": edit_result,
             "policy_write": policy_write,
             "policy_merge": policy_merge,

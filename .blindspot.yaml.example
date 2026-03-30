@@ -89,6 +89,24 @@ quality_gates:
   targeted_test_command: "python3 -m unittest -v {tests}"
   max_targeted_tests: 12
 
+# Language adapter execution matrix (diff-aware)
+language_adapters:
+  hard_block_missing_tools: true
+  default_matrix_always: true
+  require_format_checks: false
+  languages:
+    python:
+      parser: tree_sitter
+      syntax_command: "python3 -m py_compile {files}"
+      static_command: "python3 -m py_compile {files}"
+      format_command: "python3 -m py_compile {files}"
+      test_command: "python3 -m unittest -v"
+
+# Auto-fix loop (bounded retries)
+auto_fix_loop:
+  enabled: true
+  max_attempts: 2
+
 # Deterministic runtime policy (pin mismatch => fail-closed block)
 deterministic_runtime:
   require_pinned: true
