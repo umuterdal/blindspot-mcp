@@ -496,6 +496,10 @@ Strict profile additionally enforces:
 - universal completion gate must pass before merge (`run_universal_completion_gate`)
 - bounded post-write auto-fix loop for recoverable anti-pattern/debug artifacts
 
+Default language matrix behavior:
+- PHP uses `tests: false` by default in diff-aware matrix checks.
+- PHP still keeps required syntax/static gates: `php -l` plus Laravel smoke (`php artisan view:cache` and `php artisan route:list`) when `artisan` is present.
+
 High-speed profile (`execution.profile=fast_path`) adds:
 - parallel prechecks with warm cache reuse
 - speculative patch candidate scoring/selection before apply
@@ -651,6 +655,12 @@ language_adapters:
       static_command: "python3 -m py_compile {files}"
       format_command: "python3 -m py_compile {files}"
       test_command: "python3 -m unittest -v"
+    php:
+      syntax_command: "php -l {file}"
+      static_command: "sh -lc \"if [ -f artisan ]; then php artisan view:cache >/dev/null && php artisan route:list >/dev/null; else php -l {file} >/dev/null; fi\""
+      test_command: "vendor/bin/phpunit --colors=never"
+      required_checks:
+        tests: false
 
 # Bounded auto-fix loop for post-write cleanup
 auto_fix_loop:
@@ -702,6 +712,7 @@ The v0.1.5 safety pipeline reads the following keys:
 | `language_adapters.languages.<lang>.static_command` | `string` | Static analysis command template. |
 | `language_adapters.languages.<lang>.format_command` | `string` | Format check command template. |
 | `language_adapters.languages.<lang>.test_command` | `string` | Test command template. |
+| `language_adapters.languages.<lang>.required_checks.<check>` | `bool` | Per-language required flags for `syntax`, `static`, `format`, `tests`. |
 | `auto_fix_loop.enabled` | `bool` | Enables bounded post-write auto-fix attempts before rollback. |
 | `auto_fix_loop.max_attempts` | `int` | Maximum number of auto-fix attempts (0-5). |
 | `deterministic_runtime.require_pinned` | `bool` | Enforces runtime pin checks (fail-closed on mismatch). |

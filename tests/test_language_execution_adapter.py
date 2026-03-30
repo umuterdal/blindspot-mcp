@@ -49,6 +49,28 @@ class LanguageExecutionAdapterTests(unittest.TestCase):
         adapter = LanguageExecutionAdapter(self.tmp.name)
         self.assertEqual(adapter.detect_language("resources/views/home.blade.php"), "php")
 
+    def test_php_defaults_disable_required_test_gate(self):
+        adapter = LanguageExecutionAdapter(self.tmp.name)
+        result = adapter.build_quality_matrix(["app/Http/Controllers/PricingController.php"])
+        checks = {c.get("check_id"): c for c in result.get("checks", [])}
+        self.assertIn("php:tests", checks)
+        self.assertFalse(bool(checks["php:tests"].get("required", True)))
+        self.assertIn("view:cache", checks["php:static"].get("command", ""))
+        self.assertIn("route:list", checks["php:static"].get("command", ""))
+
+    def test_php_required_checks_can_be_overridden(self):
+        self._write_config(
+            "language_adapters:\n"
+            "  languages:\n"
+            "    php:\n"
+            "      required_checks:\n"
+            "        tests: true\n"
+        )
+        adapter = LanguageExecutionAdapter(self.tmp.name)
+        result = adapter.build_quality_matrix(["src/main.php"])
+        checks = {c.get("check_id"): c for c in result.get("checks", [])}
+        self.assertTrue(bool(checks["php:tests"].get("required", False)))
+
 
 if __name__ == "__main__":
     unittest.main()

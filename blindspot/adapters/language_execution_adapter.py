@@ -39,7 +39,11 @@ DEFAULT_EXECUTION_PROFILES: Dict[str, LanguageExecutionProfile] = {
         language="php",
         parser="tree_sitter",
         syntax_command="php -l {file}",
-        static_command="php -l {file}",
+        static_command=(
+            "sh -lc \"if [ -f artisan ]; then "
+            "php artisan view:cache >/dev/null && php artisan route:list >/dev/null; "
+            "else php -l {file} >/dev/null; fi\""
+        ),
         format_command="php -l {file}",
         test_command="vendor/bin/phpunit --colors=never",
     ),
@@ -91,6 +95,17 @@ DEFAULT_EXECUTION_PROFILES: Dict[str, LanguageExecutionProfile] = {
         format_command="ruby -c {file}",
         test_command="bundle exec rspec",
     ),
+}
+
+DEFAULT_REQUIRED_CHECKS: Dict[str, Dict[str, bool]] = {
+    "python": {"syntax": True, "static": True, "format": False, "tests": True},
+    "php": {"syntax": True, "static": True, "format": False, "tests": False},
+    "javascript": {"syntax": True, "static": True, "format": False, "tests": True},
+    "typescript": {"syntax": True, "static": True, "format": False, "tests": True},
+    "go": {"syntax": True, "static": True, "format": False, "tests": True},
+    "rust": {"syntax": True, "static": True, "format": False, "tests": True},
+    "java": {"syntax": True, "static": True, "format": False, "tests": True},
+    "ruby": {"syntax": True, "static": True, "format": False, "tests": True},
 }
 
 
@@ -147,6 +162,24 @@ class LanguageExecutionAdapter:
             test_command=str(overrides.get("test_command", profile.test_command)),
         )
 
+    def _required_checks_for_language(self, language: str) -> Dict[str, bool]:
+        base = dict(
+            DEFAULT_REQUIRED_CHECKS.get(
+                language,
+                {"syntax": True, "static": True, "format": False, "tests": True},
+            )
+        )
+        overrides = self._adapter_config().get("languages", {}).get(language, {})
+        if not isinstance(overrides, dict):
+            return base
+        required_cfg = overrides.get("required_checks", {})
+        if not isinstance(required_cfg, dict):
+            return base
+        for key in ("syntax", "static", "format", "tests"):
+            if key in required_cfg:
+                base[key] = bool(required_cfg[key])
+        return base
+
     @staticmethod
     def _render_command(template: str, files: List[str], language: str) -> str:
         normalized_files = [str(p).replace("\\", "/") for p in files]
@@ -189,11 +222,15 @@ class LanguageExecutionAdapter:
         checks: List[Dict[str, Any]] = []
         for language, files in sorted(grouped.items()):
             profile = self._profile_for_language(language)
+            required = self._required_checks_for_language(language)
+            # Global format policy can force format checks to required.
+            if bool(cfg["require_format_checks"]):
+                required["format"] = True
             entries = [
-                ("syntax", profile.syntax_command, True),
-                ("static", profile.static_command, True),
-                ("format", profile.format_command, bool(cfg["require_format_checks"])),
-                ("tests", profile.test_command, True),
+                ("syntax", profile.syntax_command, bool(required.get("syntax", True))),
+                ("static", profile.static_command, bool(required.get("static", True))),
+                ("format", profile.format_command, bool(required.get("format", False))),
+                ("tests", profile.test_command, bool(required.get("tests", True))),
             ]
             for check_type, template, required in entries:
                 command = self._render_command(template, files, language)

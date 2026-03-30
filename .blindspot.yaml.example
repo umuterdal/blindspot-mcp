@@ -101,6 +101,17 @@ language_adapters:
       static_command: "python3 -m py_compile {files}"
       format_command: "python3 -m py_compile {files}"
       test_command: "python3 -m unittest -v"
+    php:
+      parser: tree_sitter
+      syntax_command: "php -l {file}"
+      static_command: "sh -lc \"if [ -f artisan ]; then php artisan view:cache >/dev/null && php artisan route:list >/dev/null; else php -l {file} >/dev/null; fi\""
+      format_command: "php -l {file}"
+      test_command: "vendor/bin/phpunit --colors=never"
+      required_checks:
+        syntax: true
+        static: true
+        format: false
+        tests: false
 
 # Auto-fix loop (bounded retries)
 auto_fix_loop:

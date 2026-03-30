@@ -327,6 +327,31 @@ class SafetyOrchestrationTests(unittest.TestCase):
         reasons = [item.get("reason") for item in result.get("checks", {}).values()]
         self.assertIn("missing_tool", reasons)
 
+    def test_diff_aware_quality_matrix_php_missing_phpunit_does_not_block(self):
+        self._write_config(
+            "language_adapters:\n"
+            "  hard_block_missing_tools: true\n"
+            "  languages:\n"
+            "    php:\n"
+            "      syntax_command: \"true\"\n"
+            "      static_command: \"true\"\n"
+            "      format_command: \"true\"\n"
+            "      test_command: \"missing_tool_123 --version\"\n"
+        )
+        os.makedirs(os.path.join(self.tmp.name, "app"), exist_ok=True)
+        with open(os.path.join(self.tmp.name, "app", "PricingController.php"), "w", encoding="utf-8") as f:
+            f.write("<?php\nclass PricingController {}\n")
+
+        result = self.svc.run_diff_aware_quality_matrix(
+            target_files=["app/PricingController.php"],
+            enforce=True,
+            stage="write",
+        )
+        self.assertEqual(result["status"], "success")
+        checks = result.get("checks", {})
+        self.assertIn("php:tests", checks)
+        self.assertFalse(bool(checks["php:tests"].get("required", True)))
+
     def test_universal_completion_gate_blocks_high_risk_ripple(self):
         os.makedirs(os.path.join(self.tmp.name, "src", "auth"), exist_ok=True)
         with open(os.path.join(self.tmp.name, "src", "auth", "service.py"), "w", encoding="utf-8") as f:
