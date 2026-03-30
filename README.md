@@ -2,12 +2,19 @@
 
 > **See what your LLM can't see.** Early release — Laravel production-tested, 15 more framework plugins in alpha.
 
-**v0.1.3** — [Report bugs](https://github.com/umuterdal/blindspot-mcp/issues) | [Contribute](https://github.com/umuterdal/blindspot-mcp/pulls)
+**v0.1.5** — [Report bugs](https://github.com/umuterdal/blindspot-mcp/issues) | [Contribute](https://github.com/umuterdal/blindspot-mcp/pulls)
 
 [![PyPI version](https://img.shields.io/pypi/v/blindspot-mcp.svg)](https://pypi.org/project/blindspot-mcp/)
 [![PyPI downloads](https://img.shields.io/pypi/dm/blindspot-mcp.svg)](https://pypi.org/project/blindspot-mcp/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
+
+### What's New in v0.1.5
+
+- Fail-closed safety orchestration (`safe_implement`, `safe_refactor`, `safe_optimize`, `safe_migrate`, `safe_fix`)
+- Governance and release controls (policy approvals, break-glass, rollout, backup/DR, release readiness)
+- Mandatory release evidence reporting (`conformance_matrix`, `gate_evidence_pack`, `kpi_report`, `open_risk_register`)
+- CI safety release gate workflow and expanded test coverage for safety/governance and Laravel route validation
 
 ### Install
 
