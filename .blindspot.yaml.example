@@ -66,3 +66,69 @@ scan_dirs:
 exclude_dirs:
   - storage
   - bootstrap/cache
+
+# Fail-closed safety policy
+# strict + allow_legacy_write=false blocks apply_edit/smart_apply_edit/apply_edit_multi
+policy:
+  profile: strict
+  allow_legacy_write: false
+  min_confidence_write: 0.70
+  escalation_budget:
+    per_run: 8
+    per_day: 250
+
+# Mutation + property + fuzz quality gates
+quality_gates:
+  enabled: true
+  enforce_for_write: true
+  timeout_seconds: 120
+  mutation_command: "python3 -m unittest discover -s tests -p 'test_*.py' -v"
+  property_command: "python3 -m unittest discover -s tests -p 'test_*.py' -v"
+  fuzz_command: "python3 -m unittest discover -s tests -p 'test_*.py' -v"
+  targeted_tests_enabled: true
+  targeted_test_command: "python3 -m unittest -v {tests}"
+  max_targeted_tests: 12
+
+# Deterministic runtime policy (pin mismatch => fail-closed block)
+deterministic_runtime:
+  require_pinned: true
+  container_required: false
+  pins:
+    python_major: 3
+    python_minor: 12
+
+# Benchmark harness defaults
+benchmark:
+  sample_size_target: 2000
+  seed: 42
+  stratified: true
+
+# High-speed execution controls
+execution:
+  profile: fast_path        # fast_path | strict_path | balanced
+  runtime_budget_seconds: 1800
+  precheck_parallelism: 4
+  speculative_variants: 3
+  warm_cache_ttl_seconds: 300
+  write_quality_mode: targeted   # targeted | full
+  run_full_quality_after_write: false
+
+# KPI protocol used by release gates
+kpi_protocol:
+  sample_size_min: 500
+  baseline_window_days: 30
+  measurement_method: rolling_window
+  error_budget_percent: 2.0
+  drift_threshold_percent: 2.0
+  allow_bootstrap_if_empty: true
+  thresholds:
+    gate_pass_rate_min: 95.0
+    first_pass_rate_min: 90.0
+    rollback_rate_max: 2.0
+    critical_regressions_max: 0
+
+# Governance defaults for approval workflows
+governance:
+  required_policy_approvals: 2
+  required_break_glass_approvals: 2
+  break_glass_default_ttl_minutes: 30

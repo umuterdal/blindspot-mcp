@@ -345,18 +345,60 @@ Blindspot auto-detects your framework and loads only the relevant plugin tools:
 
 ---
 
-## Core Tools (34 — Always Available)
+## Core Tools (34+) + Safety Orchestration
 
 These tools work on **every project**, regardless of language or framework:
 
 ### Editing & Safety
 | Tool | What It Does |
 |------|-------------|
-| `apply_edit` | Edit files without reading them into context. 5 modes: search-replace, batch, symbol, line-range, occurrence. Syntax check + auto-rollback on error. |
-| `smart_apply_edit` | Same as `apply_edit` + automatic ripple effect analysis. Warns you if the change affects other files. |
-| `apply_edit_multi` | Edit multiple files atomically in one call. If any file fails validation, all changes roll back. |
+| `apply_edit` | Legacy direct edit tool. In strict fail-closed mode this tool is blocked unless `policy.allow_legacy_write=true`. |
+| `smart_apply_edit` | Legacy safe edit tool with ripple analysis. In strict fail-closed mode this is also blocked unless `policy.allow_legacy_write=true`. |
+| `apply_edit_multi` | Legacy multi-file atomic edit. Blocked in strict mode unless explicitly allowed. |
 | `get_edit_region` | Get a specific region of a file with line numbers. Much cheaper than reading the whole file. |
 | `diff_preview` | Preview multi-file edits without applying them. Dry-run mode for large refactoring. |
+
+### Fail-Closed Orchestration
+| Tool | What It Does |
+|------|-------------|
+| `compile_spec` | Converts natural-language request into typed goal, constraints, assumptions, risk domains, and targets. |
+| `goal_to_patch` | Produces deterministic patch plan (`compile → policy_write → edit → policy_merge → policy_deploy`). |
+| `get_runtime_manifest` | Returns deterministic runtime fingerprint + pinned toolchain checks. |
+| `list_patch_primitives` | Lists allowed write primitives used by fail-closed autopilot edits. |
+| `run_policy_evaluation` | Fail-closed gate for write/merge/deploy with risk + assumption checks. |
+| `run_mutation_property_fuzz_suite` | Runs mutation/property/fuzz verification gates and blocks writes when enforced. |
+| `safe_implement` | Main autopilot command: compile + prechecks + transactional edit + audited gates. |
+| `safe_refactor` / `safe_optimize` / `safe_migrate` / `safe_fix` | Same audited fail-closed pipeline for each change type. |
+| `record_incident_rule` / `list_incident_rules` | Incident memory rules to auto-block known bad patterns from prior failures. |
+| `get_assumption_ledger` / `resolve_assumption` | Tracks unresolved assumptions and blocks writes until resolved. |
+| `replay_session` | Replays an audited run from hash-chained records for deterministic verification. |
+| `conformance_matrix` | Adapter pass/fail matrix for required framework safety methods. |
+| `gate_evidence_pack` | Evidence bundle for write/merge/deploy decisions + rollback traces. |
+| `kpi_report` | KPI report with thresholds: `>=95`, `>=90`, `<=2`, `0 critical regression`. |
+| `open_risk_register` | Lists open assumptions and blocked/failed runs for closure tracking. |
+
+### Governance & Operations
+| Tool | What It Does |
+|------|-------------|
+| `get_scope_inventory` / `upsert_scope_owner` | Adapter scope inventory with owner, due date, done criteria, status. |
+| `get_kpi_protocol` / `set_kpi_protocol` | KPI measurement protocol (sample size, baseline window, drift threshold, error budget). |
+| `request_policy_change` / `approve_policy_change` / `list_policy_changes` | Multi-approval policy change flow with active policy promotion. |
+| `request_break_glass` / `approve_break_glass` / `get_break_glass_request` | Break-glass workflow for critical path interventions. |
+| `rotate_signing_key` / `list_key_rotations` | Signing key rotation audit trail (fingerprint based). |
+| `create_audit_backup` / `restore_audit_backup` / `run_dr_drill` | Backup/restore + disaster recovery drill workflow. |
+| `create_rollout_plan` / `execute_rollout_stage` / `get_rollout_status` | Staged rollout with automatic rollback on smoke failures. |
+| `run_security_quality_suite` | Prompt-injection red-team + PII redaction + escalation cap + rollout safety checks. |
+| `run_benchmark_harness` / `list_benchmark_runs` | Stratified benchmark runs (N>=2000 target) + historical performance tracking. |
+| `release_readiness_report` | Aggregated production gate with all mandatory reports + write/merge/deploy policy-hash consistency check. |
+
+### Release Evidence Pack (Required)
+At release close, collect exactly these 4 reports:
+1. `conformance_matrix` (all adapter pass/fail)
+2. `gate_evidence_pack` (write + merge + deploy evidence)
+3. `kpi_report` (threshold compliance)
+4. `open_risk_register` (remaining risk + closure target)
+
+`release_readiness_report` returns all of the above in one response.
 
 ### Intelligence & Analysis
 | Tool | What It Does |
@@ -399,22 +441,31 @@ Blindspot doesn't just find problems — it provides a complete safe-edit workfl
 
 ```
 1. get_context_for_edit(file, symbol)     ← Understand the code + track pipeline
-2. smart_apply_edit(file, search, replace) ← Edit + syntax check + ripple analysis
+2. safe_implement(feature_spec, ...)        ← Policy-gated transactional edit (recommended)
      ↓
    Returns:
-   - ripple_warnings: affected files with priority (HIGH/MEDIUM/LOW)
-   - ripple_coverage: % of references resolved
-   - scope_direction: narrowing/widening/modified
-   - test_suggestions: language-appropriate test commands
-   - fix_suggestions: auto-generated fixes for HIGH items
-   - edit_summary: changed symbols, priority counts, remaining risk
-   - session_metrics: cumulative stats across all edits
+   - policy_write / policy_merge / policy_deploy decisions
+   - prechecks: risk, transaction risks, domain rules, schema checks
+   - transactional edit result (+ rollback evidence if any gate fails)
+   - run_id for replay/audit evidence
      ↓
-3. Fix HIGH priority files (get_symbol_body → understand → fix)
-4. Pass resolved_items=[ids] in next smart_apply_edit call
-5. Check coverage_percent → aim for 100%
-6. post_edit_checklist(file) → required post-edit steps
+3. replay_session(run_id) / gate_evidence_pack(run_id) for proof
+4. kpi_report() + open_risk_register() for release readiness
+5. post_edit_checklist(file) → required post-edit steps
 ```
+
+Strict profile additionally enforces:
+- uncertainty fail-closed (`confidence_score < policy.min_confidence_write` blocks write)
+- patch primitive validation (requested primitive must match detected edit primitive)
+- deterministic runtime pin check before write/merge/deploy
+- incident-memory auto-block for known failure signatures
+- mutation/property/fuzz gate pass before transactional edit
+
+High-speed profile (`execution.profile=fast_path`) adds:
+- parallel prechecks with warm cache reuse
+- speculative patch candidate scoring/selection before apply
+- targeted impacted tests before write (instead of full suite at write stage)
+- runtime budget fail-closed (`runtime_budget_seconds`) per safe run
 
 **Session tracking across multiple edits:**
 - Ripple items tracked with lifecycle states: `open` → `resolved` → `reopened`
@@ -498,7 +549,7 @@ Once configured, start your AI agent and it will automatically have access to Bl
 1. Agent calls `build_deep_index` (one-time, indexes all symbols)
 2. Agent calls `get_project_snapshot` (understand the project structure)
 3. Before any edit, agent calls `get_context_for_edit` (get full awareness)
-4. Agent uses `smart_apply_edit` instead of raw file writes (safe editing)
+4. Agent uses `safe_implement` (strict fail-closed pipeline)
 
 ---
 
@@ -540,6 +591,28 @@ exclude_dirs:
   - .next
   - node_modules
   - coverage
+
+# Fail-closed policy (recommended defaults)
+policy:
+  profile: strict
+  allow_legacy_write: false
+  escalation_budget:
+    per_run: 8
+    per_day: 250
+
+# KPI measurement protocol
+kpi_protocol:
+  sample_size_min: 500
+  baseline_window_days: 30
+  measurement_method: rolling_window
+  error_budget_percent: 2.0
+  drift_threshold_percent: 2.0
+
+# Governance defaults
+governance:
+  required_policy_approvals: 2
+  required_break_glass_approvals: 2
+  break_glass_default_ttl_minutes: 30
 ```
 
 See [`examples/`](examples/) for framework-specific configuration templates.
@@ -696,6 +769,20 @@ pip install -e "."
 npx @modelcontextprotocol/inspector .venv/bin/blindspot-mcp --project-path /path/to/project
 
 # Or add to your AI agent config and use directly
+```
+
+### Release Gate (One Command)
+
+```bash
+python scripts/release_gate.py --project-path . --output .blindspot/output/release_readiness.json
+```
+
+The command exits non-zero when release readiness fails.
+
+Export mandatory 4 reports as separate files:
+
+```bash
+python scripts/export_required_reports.py --project-path . --out-dir .blindspot/output/reports
 ```
 
 ---

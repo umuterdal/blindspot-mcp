@@ -28,7 +28,7 @@ from mcp.server.fastmcp import Context, FastMCP
 
 # Local imports
 from .project_settings import ProjectSettings
-from .services import FileService, FileWatcherService, SearchService, SettingsService
+from .services import FileService, FileWatcherService, SearchService, SettingsService, SafetyOrchestrationService
 from .services.code_intelligence_service import CodeIntelligenceService
 from .services.file_edit_service import FileEditService
 from .services.generic_intelligence_service import GenericIntelligenceService
@@ -287,21 +287,19 @@ When editing important files (models, controllers, services, handlers, routes), 
 1. **Before editing**: Call `get_context_for_edit(file, symbol)` to understand the code
    - Returns: symbol code, class hierarchy, ripple effect, impact summary — ALL in one call
    - This replaces reading 5-10 files manually
-2. **Make the edit**: Call `smart_apply_edit(file, search, replace)` — NOT apply_edit
-   - Syntax check + auto-rollback on error
-   - Automatic ripple effect analysis on changed symbols
-   - Returns: risk level, affected files, coverage tracking
-3. **Read the response carefully**:
-   - `ripple_warnings` → affected files with priority (HIGH/MEDIUM/LOW)
-   - `ripple_coverage` → what % of references are resolved
-   - `scope_direction` → narrowing (fewer results) or widening (more results)
-   - `test_suggestions` → test commands to run
-4. **Fix affected files based on priority**:
-   - **HIGH (fix_required)** → Code WILL break. Read the full function first with `get_symbol_body`.
-   - **MEDIUM (check_redundancy / review_logic)** → May need review. Think about the business logic.
-   - **LOW (no_action)** → Auto-inherits change. Skip.
-5. **After all fixes**: Check `ripple_coverage.coverage_percent` — aim for 100%.
-   Run the `test_suggestions` commands. Call `post_edit_checklist(file)` for required steps.
+2. **Primary edit path**: Call `safe_implement(feature_spec, ...)` (or safe_refactor/safe_fix/etc.)
+   - Policy-gated write/merge/deploy
+   - Transactional edit with rollback evidence
+   - Full audit trail with `run_id` for replay
+3. **Read gate outputs carefully**:
+   - `policy_write`, `policy_merge`, `policy_deploy`
+   - `prechecks` (risk, transaction, domain rules, schema)
+   - `rollback` evidence if any gate blocks
+4. **Only if strict policy allows legacy writes**:
+   - Use `get_context_for_edit` → `smart_apply_edit` → resolve ripple warnings
+5. **After all fixes**:
+   - `replay_session(run_id)` and `gate_evidence_pack(run_id)` for proof
+   - `post_edit_checklist(file)` for required post-edit steps
 
 ## When to Use Which Tool
 
@@ -322,9 +320,11 @@ When editing important files (models, controllers, services, handlers, routes), 
 - `analyze_queries(controller, method)` → Query performance issues
 
 ### Making Edits
-- `smart_apply_edit(file, search, replace)` → PRIMARY edit tool (syntax check + ripple + tracking)
-- `apply_edit(file, search, replace)` → Simple edit (config, templates, or fixing flagged files)
-- `apply_edit_multi(file_edits)` → Fix multiple files at once
+- `safe_implement(feature_spec, ...)` → PRIMARY fail-closed edit pipeline
+- `safe_refactor / safe_optimize / safe_migrate / safe_fix` → same pipeline per change type
+- `run_policy_evaluation(...)` → check write/merge/deploy gates before attempting edits
+- `smart_apply_edit(file, search, replace)` → legacy safe edit (blocked in strict mode by default)
+- `apply_edit(file, search, replace)` / `apply_edit_multi(file_edits)` → legacy tools
 - `rename_symbol(file, old, new, dry_run=True)` → Cross-file rename (always dry_run first)
 - `diff_preview(edits)` → Preview changes without applying
 
@@ -337,6 +337,16 @@ When editing important files (models, controllers, services, handlers, routes), 
 - `search_code_advanced(pattern)` → Full-text search with regex, pagination
 - `find_files(pattern)` → Find files by glob pattern
 - `get_rebuild_status()` → Check if deep index is built and ready
+
+### Governance & Release
+- `get_scope_inventory()` / `upsert_scope_owner(...)` → Adapter owner + due date + done criteria tracking
+- `get_kpi_protocol()` / `set_kpi_protocol(...)` → KPI measurement protocol and thresholds
+- `request_policy_change(...)` / `approve_policy_change(...)` → Policy approval workflow
+- `request_break_glass(...)` / `approve_break_glass(...)` → Break-glass flow for critical paths
+- `create_audit_backup()` / `restore_audit_backup(...)` / `run_dr_drill()` → Backup/restore/DR controls
+- `create_rollout_plan(...)` / `execute_rollout_stage(...)` → Staged rollout with rollback on smoke failures
+- `run_security_quality_suite()` → Prompt-injection, PII redaction, escalation-cap safety checks
+- `release_readiness_report()` → Aggregated release gate report
 
 ## Compact Response System
 
@@ -434,6 +444,33 @@ def _compact_response(tool_name: str, result, ctx=None) -> dict:
     except Exception:
         # If save fails, return original result
         return result
+
+
+def _legacy_write_guard(ctx: Context, tool_name: str) -> Optional[dict]:
+    """Fail-closed gate for legacy write tools when strict policy is enabled."""
+    try:
+        policy = SafetyOrchestrationService(ctx).get_policy_status()
+        if (
+            policy.get("status") == "success"
+            and str(policy.get("profile", "strict")).lower() == "strict"
+            and not bool(policy.get("allow_legacy_write", False))
+        ):
+            return {
+                "status": "blocked",
+                "tool": tool_name,
+                "message": (
+                    f"{tool_name} is disabled in strict fail-closed policy. "
+                    "Use safe_implement/safe_refactor/safe_optimize/safe_migrate/safe_fix."
+                ),
+                "policy_hash": policy.get("policy_hash"),
+            }
+    except Exception as e:
+        return {
+            "status": "blocked",
+            "tool": tool_name,
+            "message": f"Policy check failed (fail-closed): {e}",
+        }
+    return None
 
 
 # ----- RESOURCES -----
@@ -793,6 +830,10 @@ def apply_edit(
     Returns:
         Dictionary with status and either compact diff or summary (for large changes).
     """
+    blocked = _legacy_write_guard(ctx, "apply_edit")
+    if blocked:
+        return blocked
+
     result = FileEditService(ctx).apply_edit(
         file_path=file_path,
         search=search,
@@ -889,6 +930,10 @@ def apply_edit_multi(
     Returns:
         Dictionary with per-file results and overall status.
     """
+    blocked = _legacy_write_guard(ctx, "apply_edit_multi")
+    if blocked:
+        return blocked
+
     return FileEditService(ctx).apply_edit_multi(file_edits=file_edits)
 
 
@@ -1166,6 +1211,10 @@ def smart_apply_edit(
         strict_mode: Dict with enforcement options (e.g., {"enforce_pipeline": True}).
         feedback: Dict mapping ripple_id -> {correct, note, original_action} for human overrides.
     """
+    blocked = _legacy_write_guard(ctx, "smart_apply_edit")
+    if blocked:
+        return blocked
+
     return AdvancedAnalysisService(ctx).smart_apply_edit(
         file_path=file_path,
         search=search,
@@ -1181,6 +1230,920 @@ def smart_apply_edit(
         test_results=test_results,
         strict_mode=strict_mode,
         feedback=feedback,
+    )
+
+
+# ----- SAFETY ORCHESTRATION TOOLS -----
+
+
+@mcp.tool()
+@handle_mcp_tool_errors(return_type="dict")
+@with_concurrency_limit
+def get_policy_status(ctx: Context) -> dict[str, Any]:
+    """Get effective fail-closed policy settings and policy hash."""
+    return SafetyOrchestrationService(ctx).get_policy_status()
+
+
+@mcp.tool()
+@handle_mcp_tool_errors(return_type="dict")
+@with_concurrency_limit
+def compile_spec(
+    feature_spec: str,
+    ctx: Context,
+    constraints: list = None,
+    acceptance_criteria: list = None,
+    risk_domains: list = None,
+) -> dict[str, Any]:
+    """Compile natural language feature request into typed goal/constraints/risk spec."""
+    return SafetyOrchestrationService(ctx).compile_spec(
+        feature_spec=feature_spec,
+        constraints=constraints,
+        acceptance_criteria=acceptance_criteria,
+        risk_domains=risk_domains,
+    )
+
+
+@mcp.tool()
+@handle_mcp_tool_errors(return_type="dict")
+@with_concurrency_limit
+def goal_to_patch(
+    feature_spec: str,
+    ctx: Context,
+    constraints: list = None,
+    acceptance_criteria: list = None,
+    risk_domains: list = None,
+) -> dict[str, Any]:
+    """Convert goal into fail-closed patch plan with stages, targets, and risk domains."""
+    return SafetyOrchestrationService(ctx).goal_to_patch(
+        feature_spec=feature_spec,
+        constraints=constraints,
+        acceptance_criteria=acceptance_criteria,
+        risk_domains=risk_domains,
+    )
+
+
+@mcp.tool()
+@handle_mcp_tool_errors(return_type="dict")
+@with_concurrency_limit
+def get_runtime_manifest(ctx: Context) -> dict[str, Any]:
+    """Get deterministic runtime manifest + pin checks."""
+    return SafetyOrchestrationService(ctx).get_runtime_manifest()
+
+
+@mcp.tool()
+@handle_mcp_tool_errors(return_type="dict")
+@with_concurrency_limit
+def list_patch_primitives(ctx: Context) -> dict[str, Any]:
+    """List supported patch primitives for fail-closed safe pipelines."""
+    return SafetyOrchestrationService(ctx).list_patch_primitives()
+
+
+@mcp.tool()
+@handle_mcp_tool_errors(return_type="dict")
+@with_concurrency_limit
+def run_mutation_property_fuzz_suite(
+    ctx: Context,
+    target_files: list = None,
+    enforce: bool = True,
+) -> dict[str, Any]:
+    """Run mutation/property/fuzz quality gates (fail-closed when enforce=true)."""
+    return _compact_response(
+        "run_mutation_property_fuzz_suite",
+        SafetyOrchestrationService(ctx).run_mutation_property_fuzz_suite(
+            target_files=target_files,
+            enforce=enforce,
+        ),
+        ctx,
+    )
+
+
+@mcp.tool()
+@handle_mcp_tool_errors(return_type="dict")
+@with_concurrency_limit
+def record_incident_rule(
+    name: str,
+    pattern: str,
+    ctx: Context,
+    scope: str = "global",
+    severity: str = "high",
+    action: str = "block",
+    active: bool = True,
+    note: str = "",
+) -> dict[str, Any]:
+    """Create incident-memory rule used to block repeated failure patterns."""
+    return SafetyOrchestrationService(ctx).record_incident_rule(
+        name=name,
+        pattern=pattern,
+        scope=scope,
+        severity=severity,
+        action=action,
+        active=active,
+        note=note,
+    )
+
+
+@mcp.tool()
+@handle_mcp_tool_errors(return_type="dict")
+@with_concurrency_limit
+def list_incident_rules(ctx: Context, active_only: bool = True, limit: int = 200) -> dict[str, Any]:
+    """List incident-memory rules."""
+    return _compact_response(
+        "list_incident_rules",
+        SafetyOrchestrationService(ctx).list_incident_rules(active_only=active_only, limit=limit),
+        ctx,
+    )
+
+
+@mcp.tool()
+@handle_mcp_tool_errors(return_type="dict")
+@with_concurrency_limit
+def get_assumption_ledger(ctx: Context, run_id: str = None) -> dict[str, Any]:
+    """List assumption ledger entries globally or for a specific run."""
+    return _compact_response(
+        "get_assumption_ledger",
+        SafetyOrchestrationService(ctx).get_assumption_ledger(run_id=run_id),
+        ctx,
+    )
+
+
+@mcp.tool()
+@handle_mcp_tool_errors(return_type="dict")
+@with_concurrency_limit
+def resolve_assumption(
+    assumption_id: str,
+    status: str,
+    ctx: Context,
+    evidence: str = None,
+    note: str = None,
+) -> dict[str, Any]:
+    """Resolve assumption ledger item (verified/rejected/resolved/open)."""
+    return SafetyOrchestrationService(ctx).resolve_assumption(
+        assumption_id=assumption_id,
+        status=status,
+        evidence=evidence,
+        note=note,
+    )
+
+
+@mcp.tool()
+@handle_mcp_tool_errors(return_type="dict")
+@with_concurrency_limit
+def run_policy_evaluation(
+    feature_spec: str,
+    ctx: Context,
+    stage: str = "write",
+    target_file: str = None,
+    target_files: list = None,
+    run_id: str = None,
+    risk_domains: list = None,
+    override_token: str = None,
+    break_glass_token: str = None,
+    estimated_escalation_cost: float = 0.0,
+    confidence_score: float = None,
+) -> dict[str, Any]:
+    """Evaluate strict policy gate for write/merge/deploy stages."""
+    return SafetyOrchestrationService(ctx).run_policy_evaluation(
+        feature_spec=feature_spec,
+        stage=stage,
+        target_file=target_file,
+        target_files=target_files,
+        run_id=run_id,
+        risk_domains=risk_domains,
+        override_token=override_token,
+        break_glass_token=break_glass_token,
+        estimated_escalation_cost=estimated_escalation_cost,
+        confidence_score=confidence_score,
+    )
+
+
+@mcp.tool()
+@handle_mcp_tool_errors(return_type="dict")
+@with_concurrency_limit
+def get_change_risk(file_path: str, ctx: Context, symbol: str = None) -> dict[str, Any]:
+    """Compute symbol/file-level ripple risk and critical-path classification."""
+    return SafetyOrchestrationService(ctx).get_change_risk(file_path=file_path, symbol=symbol)
+
+
+@mcp.tool()
+@handle_mcp_tool_errors(return_type="dict")
+@with_concurrency_limit
+def verify_schema(table_or_model: str, columns: list, ctx: Context) -> dict[str, Any]:
+    """Framework-agnostic schema verification (column/field existence)."""
+    return SafetyOrchestrationService(ctx).verify_schema(table_or_model, columns)
+
+
+@mcp.tool()
+@handle_mcp_tool_errors(return_type="dict")
+@with_concurrency_limit
+def detect_transaction_risks(file_path: str, ctx: Context) -> dict[str, Any]:
+    """Detect transaction boundary and consistency risks in a file."""
+    return _compact_response(
+        "detect_transaction_risks",
+        SafetyOrchestrationService(ctx).detect_transaction_risks(file_path),
+        ctx,
+    )
+
+
+@mcp.tool()
+@handle_mcp_tool_errors(return_type="dict")
+@with_concurrency_limit
+def get_domain_rules(file_path: str, ctx: Context) -> dict[str, Any]:
+    """Extract framework/domain-specific business rules from target file context."""
+    return _compact_response("get_domain_rules", SafetyOrchestrationService(ctx).get_domain_rules(file_path), ctx)
+
+
+@mcp.tool()
+@handle_mcp_tool_errors(return_type="dict")
+@with_concurrency_limit
+def generate_test_skeleton(file_path: str, symbol: str, ctx: Context) -> dict[str, Any]:
+    """Generate framework-aware test skeleton for changed symbol."""
+    return SafetyOrchestrationService(ctx).generate_test_skeleton(file_path, symbol)
+
+
+@mcp.tool()
+@handle_mcp_tool_errors(return_type="dict")
+@with_concurrency_limit
+def match_view_guards(file_path: str, symbol: str, ctx: Context) -> dict[str, Any]:
+    """Detect view/auth guard mismatches for rendered paths."""
+    return _compact_response("match_view_guards", SafetyOrchestrationService(ctx).match_view_guards(file_path, symbol), ctx)
+
+
+@mcp.tool()
+@handle_mcp_tool_errors(return_type="dict")
+@with_concurrency_limit
+def safe_implement(
+    feature_spec: str,
+    ctx: Context,
+    target_file: str = None,
+    search: str = None,
+    replace: str = None,
+    edits: list = None,
+    symbol: str = None,
+    new_code: str = None,
+    start_line: int = None,
+    end_line: int = None,
+    occurrence: int = None,
+    file_edits: list = None,
+    constraints: list = None,
+    acceptance_criteria: list = None,
+    risk_domains: list = None,
+    expected_schema_fields: list = None,
+    schema_entity: str = None,
+    override_token: str = None,
+    break_glass_token: str = None,
+    estimated_escalation_cost: float = 0.0,
+    confidence_score: float = None,
+    patch_primitive: str = None,
+    execution_profile: str = None,
+    runtime_budget_seconds: int = None,
+    release_id: str = None,
+    deploy_smoke_commands: list = None,
+    auto_rollback_deploy: bool = True,
+) -> dict[str, Any]:
+    """Fail-closed autopilot: compile spec -> policy gates -> transactional edit -> audited replay."""
+    result = SafetyOrchestrationService(ctx).safe_implement(
+        feature_spec=feature_spec,
+        action="implement",
+        target_file=target_file,
+        search=search,
+        replace=replace,
+        edits=edits,
+        symbol=symbol,
+        new_code=new_code,
+        start_line=start_line,
+        end_line=end_line,
+        occurrence=occurrence,
+        file_edits=file_edits,
+        constraints=constraints,
+        acceptance_criteria=acceptance_criteria,
+        risk_domains=risk_domains,
+        expected_schema_fields=expected_schema_fields,
+        schema_entity=schema_entity,
+        override_token=override_token,
+        break_glass_token=break_glass_token,
+        estimated_escalation_cost=estimated_escalation_cost,
+        confidence_score=confidence_score,
+        patch_primitive=patch_primitive,
+        execution_profile=execution_profile,
+        runtime_budget_seconds=runtime_budget_seconds,
+        release_id=release_id,
+        deploy_smoke_commands=deploy_smoke_commands,
+        auto_rollback_deploy=auto_rollback_deploy,
+    )
+    return _compact_response("safe_implement", result, ctx)
+
+
+@mcp.tool()
+@handle_mcp_tool_errors(return_type="dict")
+@with_concurrency_limit
+def safe_refactor(
+    feature_spec: str,
+    ctx: Context,
+    target_file: str = None,
+    search: str = None,
+    replace: str = None,
+    edits: list = None,
+    symbol: str = None,
+    new_code: str = None,
+    start_line: int = None,
+    end_line: int = None,
+    occurrence: int = None,
+    file_edits: list = None,
+    constraints: list = None,
+    acceptance_criteria: list = None,
+    risk_domains: list = None,
+    expected_schema_fields: list = None,
+    schema_entity: str = None,
+    override_token: str = None,
+    break_glass_token: str = None,
+    estimated_escalation_cost: float = 0.0,
+    confidence_score: float = None,
+    patch_primitive: str = None,
+    execution_profile: str = None,
+    runtime_budget_seconds: int = None,
+    release_id: str = None,
+    deploy_smoke_commands: list = None,
+    auto_rollback_deploy: bool = True,
+) -> dict[str, Any]:
+    """Fail-closed refactor pipeline with audit/replay evidence."""
+    result = SafetyOrchestrationService(ctx).safe_refactor(
+        feature_spec=feature_spec,
+        target_file=target_file,
+        search=search,
+        replace=replace,
+        edits=edits,
+        symbol=symbol,
+        new_code=new_code,
+        start_line=start_line,
+        end_line=end_line,
+        occurrence=occurrence,
+        file_edits=file_edits,
+        constraints=constraints,
+        acceptance_criteria=acceptance_criteria,
+        risk_domains=risk_domains,
+        expected_schema_fields=expected_schema_fields,
+        schema_entity=schema_entity,
+        override_token=override_token,
+        break_glass_token=break_glass_token,
+        estimated_escalation_cost=estimated_escalation_cost,
+        confidence_score=confidence_score,
+        patch_primitive=patch_primitive,
+        execution_profile=execution_profile,
+        runtime_budget_seconds=runtime_budget_seconds,
+        release_id=release_id,
+        deploy_smoke_commands=deploy_smoke_commands,
+        auto_rollback_deploy=auto_rollback_deploy,
+    )
+    return _compact_response("safe_refactor", result, ctx)
+
+
+@mcp.tool()
+@handle_mcp_tool_errors(return_type="dict")
+@with_concurrency_limit
+def safe_optimize(
+    feature_spec: str,
+    ctx: Context,
+    target_file: str = None,
+    search: str = None,
+    replace: str = None,
+    edits: list = None,
+    symbol: str = None,
+    new_code: str = None,
+    start_line: int = None,
+    end_line: int = None,
+    occurrence: int = None,
+    file_edits: list = None,
+    constraints: list = None,
+    acceptance_criteria: list = None,
+    risk_domains: list = None,
+    expected_schema_fields: list = None,
+    schema_entity: str = None,
+    override_token: str = None,
+    break_glass_token: str = None,
+    estimated_escalation_cost: float = 0.0,
+    confidence_score: float = None,
+    patch_primitive: str = None,
+    execution_profile: str = None,
+    runtime_budget_seconds: int = None,
+    release_id: str = None,
+    deploy_smoke_commands: list = None,
+    auto_rollback_deploy: bool = True,
+) -> dict[str, Any]:
+    """Fail-closed optimization pipeline with audit/replay evidence."""
+    result = SafetyOrchestrationService(ctx).safe_optimize(
+        feature_spec=feature_spec,
+        target_file=target_file,
+        search=search,
+        replace=replace,
+        edits=edits,
+        symbol=symbol,
+        new_code=new_code,
+        start_line=start_line,
+        end_line=end_line,
+        occurrence=occurrence,
+        file_edits=file_edits,
+        constraints=constraints,
+        acceptance_criteria=acceptance_criteria,
+        risk_domains=risk_domains,
+        expected_schema_fields=expected_schema_fields,
+        schema_entity=schema_entity,
+        override_token=override_token,
+        break_glass_token=break_glass_token,
+        estimated_escalation_cost=estimated_escalation_cost,
+        confidence_score=confidence_score,
+        patch_primitive=patch_primitive,
+        execution_profile=execution_profile,
+        runtime_budget_seconds=runtime_budget_seconds,
+        release_id=release_id,
+        deploy_smoke_commands=deploy_smoke_commands,
+        auto_rollback_deploy=auto_rollback_deploy,
+    )
+    return _compact_response("safe_optimize", result, ctx)
+
+
+@mcp.tool()
+@handle_mcp_tool_errors(return_type="dict")
+@with_concurrency_limit
+def safe_migrate(
+    feature_spec: str,
+    ctx: Context,
+    target_file: str = None,
+    search: str = None,
+    replace: str = None,
+    edits: list = None,
+    symbol: str = None,
+    new_code: str = None,
+    start_line: int = None,
+    end_line: int = None,
+    occurrence: int = None,
+    file_edits: list = None,
+    constraints: list = None,
+    acceptance_criteria: list = None,
+    risk_domains: list = None,
+    expected_schema_fields: list = None,
+    schema_entity: str = None,
+    override_token: str = None,
+    break_glass_token: str = None,
+    estimated_escalation_cost: float = 0.0,
+    confidence_score: float = None,
+    patch_primitive: str = None,
+    execution_profile: str = None,
+    runtime_budget_seconds: int = None,
+    release_id: str = None,
+    deploy_smoke_commands: list = None,
+    auto_rollback_deploy: bool = True,
+) -> dict[str, Any]:
+    """Fail-closed migration pipeline with policy-gated safety checks."""
+    result = SafetyOrchestrationService(ctx).safe_migrate(
+        feature_spec=feature_spec,
+        target_file=target_file,
+        search=search,
+        replace=replace,
+        edits=edits,
+        symbol=symbol,
+        new_code=new_code,
+        start_line=start_line,
+        end_line=end_line,
+        occurrence=occurrence,
+        file_edits=file_edits,
+        constraints=constraints,
+        acceptance_criteria=acceptance_criteria,
+        risk_domains=risk_domains,
+        expected_schema_fields=expected_schema_fields,
+        schema_entity=schema_entity,
+        override_token=override_token,
+        break_glass_token=break_glass_token,
+        estimated_escalation_cost=estimated_escalation_cost,
+        confidence_score=confidence_score,
+        patch_primitive=patch_primitive,
+        execution_profile=execution_profile,
+        runtime_budget_seconds=runtime_budget_seconds,
+        release_id=release_id,
+        deploy_smoke_commands=deploy_smoke_commands,
+        auto_rollback_deploy=auto_rollback_deploy,
+    )
+    return _compact_response("safe_migrate", result, ctx)
+
+
+@mcp.tool()
+@handle_mcp_tool_errors(return_type="dict")
+@with_concurrency_limit
+def safe_fix(
+    feature_spec: str,
+    ctx: Context,
+    target_file: str = None,
+    search: str = None,
+    replace: str = None,
+    edits: list = None,
+    symbol: str = None,
+    new_code: str = None,
+    start_line: int = None,
+    end_line: int = None,
+    occurrence: int = None,
+    file_edits: list = None,
+    constraints: list = None,
+    acceptance_criteria: list = None,
+    risk_domains: list = None,
+    expected_schema_fields: list = None,
+    schema_entity: str = None,
+    override_token: str = None,
+    break_glass_token: str = None,
+    estimated_escalation_cost: float = 0.0,
+    confidence_score: float = None,
+    patch_primitive: str = None,
+    execution_profile: str = None,
+    runtime_budget_seconds: int = None,
+    release_id: str = None,
+    deploy_smoke_commands: list = None,
+    auto_rollback_deploy: bool = True,
+) -> dict[str, Any]:
+    """Fail-closed bugfix pipeline with transactional rollback on gate failure."""
+    result = SafetyOrchestrationService(ctx).safe_fix(
+        feature_spec=feature_spec,
+        target_file=target_file,
+        search=search,
+        replace=replace,
+        edits=edits,
+        symbol=symbol,
+        new_code=new_code,
+        start_line=start_line,
+        end_line=end_line,
+        occurrence=occurrence,
+        file_edits=file_edits,
+        constraints=constraints,
+        acceptance_criteria=acceptance_criteria,
+        risk_domains=risk_domains,
+        expected_schema_fields=expected_schema_fields,
+        schema_entity=schema_entity,
+        override_token=override_token,
+        break_glass_token=break_glass_token,
+        estimated_escalation_cost=estimated_escalation_cost,
+        confidence_score=confidence_score,
+        patch_primitive=patch_primitive,
+        execution_profile=execution_profile,
+        runtime_budget_seconds=runtime_budget_seconds,
+        release_id=release_id,
+        deploy_smoke_commands=deploy_smoke_commands,
+        auto_rollback_deploy=auto_rollback_deploy,
+    )
+    return _compact_response("safe_fix", result, ctx)
+
+
+@mcp.tool()
+@handle_mcp_tool_errors(return_type="dict")
+@with_concurrency_limit
+def replay_session(run_id: str, ctx: Context) -> dict[str, Any]:
+    """Replay and verify hash-chained audit trail for a safety run."""
+    return _compact_response("replay_session", SafetyOrchestrationService(ctx).replay_session(run_id), ctx)
+
+
+@mcp.tool()
+@handle_mcp_tool_errors(return_type="dict")
+@with_concurrency_limit
+def conformance_matrix(ctx: Context) -> dict[str, Any]:
+    """Conformance Matrix report for framework adapters (pass/fail by required methods)."""
+    return SafetyOrchestrationService(ctx).conformance_matrix()
+
+
+@mcp.tool()
+@handle_mcp_tool_errors(return_type="dict")
+@with_concurrency_limit
+def gate_evidence_pack(ctx: Context, run_id: str = None, limit: int = 25) -> dict[str, Any]:
+    """Gate Evidence Pack report for write/merge/deploy decisions and rollback evidence."""
+    return _compact_response(
+        "gate_evidence_pack",
+        SafetyOrchestrationService(ctx).gate_evidence_pack(run_id=run_id, limit=limit),
+        ctx,
+    )
+
+
+@mcp.tool()
+@handle_mcp_tool_errors(return_type="dict")
+@with_concurrency_limit
+def kpi_report(ctx: Context, window_days: int = 30) -> dict[str, Any]:
+    """KPI Report with thresholds: >=95, >=90, <=2, and 0 critical regressions."""
+    return SafetyOrchestrationService(ctx).kpi_report(window_days=window_days)
+
+
+@mcp.tool()
+@handle_mcp_tool_errors(return_type="dict")
+@with_concurrency_limit
+def open_risk_register(ctx: Context, closure_days: int = 14, limit: int = 200) -> dict[str, Any]:
+    """Open-Risk Register report: unresolved assumptions + blocked/failed runs."""
+    return _compact_response(
+        "open_risk_register",
+        SafetyOrchestrationService(ctx).open_risk_register(closure_days=closure_days, limit=limit),
+        ctx,
+    )
+
+
+@mcp.tool()
+@handle_mcp_tool_errors(return_type="dict")
+@with_concurrency_limit
+def get_scope_inventory(ctx: Context) -> dict[str, Any]:
+    """List framework adapter scope inventory with owner/due date/done criteria."""
+    return SafetyOrchestrationService(ctx).get_scope_inventory()
+
+
+@mcp.tool()
+@handle_mcp_tool_errors(return_type="dict")
+@with_concurrency_limit
+def upsert_scope_owner(
+    framework: str,
+    owner: str,
+    due_date: str,
+    done_criteria: str,
+    ctx: Context,
+    status: str = "planned",
+) -> dict[str, Any]:
+    """Set adapter owner + due date + done criteria + status for scope governance."""
+    return SafetyOrchestrationService(ctx).upsert_scope_owner(
+        framework=framework,
+        owner=owner,
+        due_date=due_date,
+        done_criteria=done_criteria,
+        status=status,
+    )
+
+
+@mcp.tool()
+@handle_mcp_tool_errors(return_type="dict")
+@with_concurrency_limit
+def get_kpi_protocol(ctx: Context) -> dict[str, Any]:
+    """Get KPI measurement protocol: sample size, baseline window, drift threshold, error budget."""
+    return SafetyOrchestrationService(ctx).get_kpi_protocol()
+
+
+@mcp.tool()
+@handle_mcp_tool_errors(return_type="dict")
+@with_concurrency_limit
+def set_kpi_protocol(
+    sample_size_min: int,
+    baseline_window_days: int,
+    measurement_method: str,
+    error_budget_percent: float,
+    drift_threshold_percent: float,
+    thresholds: dict,
+    ctx: Context,
+) -> dict[str, Any]:
+    """Update KPI measurement protocol used by release gates."""
+    return SafetyOrchestrationService(ctx).set_kpi_protocol(
+        sample_size_min=sample_size_min,
+        baseline_window_days=baseline_window_days,
+        measurement_method=measurement_method,
+        error_budget_percent=error_budget_percent,
+        drift_threshold_percent=drift_threshold_percent,
+        thresholds=thresholds,
+    )
+
+
+@mcp.tool()
+@handle_mcp_tool_errors(return_type="dict")
+@with_concurrency_limit
+def request_policy_change(
+    requested_by: str,
+    reason: str,
+    policy: dict,
+    ctx: Context,
+    required_approvals: int = 2,
+) -> dict[str, Any]:
+    """Create policy change request; requires approvals before activation."""
+    return SafetyOrchestrationService(ctx).request_policy_change(
+        requested_by=requested_by,
+        reason=reason,
+        policy=policy,
+        required_approvals=required_approvals,
+    )
+
+
+@mcp.tool()
+@handle_mcp_tool_errors(return_type="dict")
+@with_concurrency_limit
+def approve_policy_change(
+    change_id: str,
+    approver: str,
+    ctx: Context,
+    note: str = None,
+) -> dict[str, Any]:
+    """Approve pending policy change (multi-approval flow)."""
+    return SafetyOrchestrationService(ctx).approve_policy_change(change_id=change_id, approver=approver, note=note)
+
+
+@mcp.tool()
+@handle_mcp_tool_errors(return_type="dict")
+@with_concurrency_limit
+def list_policy_changes(ctx: Context, status: str = None, limit: int = 100) -> dict[str, Any]:
+    """List policy change requests and active approved policy."""
+    return _compact_response(
+        "list_policy_changes",
+        SafetyOrchestrationService(ctx).list_policy_changes(status=status, limit=limit),
+        ctx,
+    )
+
+
+@mcp.tool()
+@handle_mcp_tool_errors(return_type="dict")
+@with_concurrency_limit
+def rotate_signing_key(
+    key_name: str,
+    old_value: str,
+    new_value: str,
+    rotated_by: str,
+    ctx: Context,
+    note: str = "",
+) -> dict[str, Any]:
+    """Record signing key rotation with fingerprints for audit trail."""
+    return SafetyOrchestrationService(ctx).rotate_signing_key(
+        key_name=key_name,
+        old_value=old_value,
+        new_value=new_value,
+        rotated_by=rotated_by,
+        note=note,
+    )
+
+
+@mcp.tool()
+@handle_mcp_tool_errors(return_type="dict")
+@with_concurrency_limit
+def list_key_rotations(ctx: Context, key_name: str = None, limit: int = 100) -> dict[str, Any]:
+    """List key rotation history."""
+    return SafetyOrchestrationService(ctx).list_key_rotations(key_name=key_name, limit=limit)
+
+
+@mcp.tool()
+@handle_mcp_tool_errors(return_type="dict")
+@with_concurrency_limit
+def run_benchmark_harness(
+    ctx: Context,
+    sample_size: int = 2000,
+    seed: int = 42,
+    stratified: bool = True,
+) -> dict[str, Any]:
+    """Run benchmark harness with stratified synthetic workload + KPI checks."""
+    return _compact_response(
+        "run_benchmark_harness",
+        SafetyOrchestrationService(ctx).run_benchmark_harness(
+            sample_size=sample_size,
+            seed=seed,
+            stratified=stratified,
+        ),
+        ctx,
+    )
+
+
+@mcp.tool()
+@handle_mcp_tool_errors(return_type="dict")
+@with_concurrency_limit
+def list_benchmark_runs(ctx: Context, limit: int = 50) -> dict[str, Any]:
+    """List historical benchmark harness runs."""
+    return _compact_response(
+        "list_benchmark_runs",
+        SafetyOrchestrationService(ctx).list_benchmark_runs(limit=limit),
+        ctx,
+    )
+
+
+@mcp.tool()
+@handle_mcp_tool_errors(return_type="dict")
+@with_concurrency_limit
+def request_break_glass(
+    requested_by: str,
+    reason: str,
+    ctx: Context,
+    scope: str = "global",
+    ttl_minutes: Optional[int] = None,
+    required_approvals: Optional[int] = None,
+) -> dict[str, Any]:
+    """Create break-glass request for critical path override."""
+    return SafetyOrchestrationService(ctx).request_break_glass(
+        requested_by=requested_by,
+        reason=reason,
+        scope=scope,
+        ttl_minutes=ttl_minutes,
+        required_approvals=required_approvals,
+    )
+
+
+@mcp.tool()
+@handle_mcp_tool_errors(return_type="dict")
+@with_concurrency_limit
+def approve_break_glass(
+    request_id: str,
+    approver: str,
+    ctx: Context,
+    note: str = None,
+) -> dict[str, Any]:
+    """Approve break-glass request; returns token once quorum is reached."""
+    return SafetyOrchestrationService(ctx).approve_break_glass(request_id=request_id, approver=approver, note=note)
+
+
+@mcp.tool()
+@handle_mcp_tool_errors(return_type="dict")
+@with_concurrency_limit
+def get_break_glass_request(request_id: str, ctx: Context) -> dict[str, Any]:
+    """Fetch break-glass request details and approvals."""
+    return SafetyOrchestrationService(ctx).get_break_glass_request(request_id=request_id)
+
+
+@mcp.tool()
+@handle_mcp_tool_errors(return_type="dict")
+@with_concurrency_limit
+def create_audit_backup(ctx: Context, created_by: str = "system") -> dict[str, Any]:
+    """Create audit/governance backup archive with checksum."""
+    return SafetyOrchestrationService(ctx).create_audit_backup(created_by=created_by)
+
+
+@mcp.tool()
+@handle_mcp_tool_errors(return_type="dict")
+@with_concurrency_limit
+def list_audit_backups(ctx: Context, limit: int = 50) -> dict[str, Any]:
+    """List backup archives."""
+    return SafetyOrchestrationService(ctx).list_audit_backups(limit=limit)
+
+
+@mcp.tool()
+@handle_mcp_tool_errors(return_type="dict")
+@with_concurrency_limit
+def restore_audit_backup(backup_id: str, ctx: Context, dry_run: bool = True) -> dict[str, Any]:
+    """Restore backup archive (or verify only with dry_run=true)."""
+    return SafetyOrchestrationService(ctx).restore_audit_backup(backup_id=backup_id, dry_run=dry_run)
+
+
+@mcp.tool()
+@handle_mcp_tool_errors(return_type="dict")
+@with_concurrency_limit
+def run_dr_drill(ctx: Context, created_by: str = "drill") -> dict[str, Any]:
+    """Run backup + restore verification drill."""
+    return SafetyOrchestrationService(ctx).run_dr_drill(created_by=created_by)
+
+
+@mcp.tool()
+@handle_mcp_tool_errors(return_type="dict")
+@with_concurrency_limit
+def create_rollout_plan(release_id: str, ctx: Context, stages: list = None) -> dict[str, Any]:
+    """Create staged rollout plan (canary -> full)."""
+    return SafetyOrchestrationService(ctx).create_rollout_plan(release_id=release_id, stages=stages)
+
+
+@mcp.tool()
+@handle_mcp_tool_errors(return_type="dict")
+@with_concurrency_limit
+def execute_rollout_stage(
+    release_id: str,
+    stage: str,
+    traffic_percent: float,
+    ctx: Context,
+    smoke_commands: list = None,
+    auto_rollback: bool = True,
+) -> dict[str, Any]:
+    """Execute one rollout stage and rollback automatically on failed smoke commands."""
+    return SafetyOrchestrationService(ctx).execute_rollout_stage(
+        release_id=release_id,
+        stage=stage,
+        traffic_percent=traffic_percent,
+        smoke_commands=smoke_commands,
+        auto_rollback=auto_rollback,
+    )
+
+
+@mcp.tool()
+@handle_mcp_tool_errors(return_type="dict")
+@with_concurrency_limit
+def get_rollout_status(release_id: str, ctx: Context) -> dict[str, Any]:
+    """Get rollout status/events for a release."""
+    return _compact_response("get_rollout_status", SafetyOrchestrationService(ctx).get_rollout_status(release_id), ctx)
+
+
+@mcp.tool()
+@handle_mcp_tool_errors(return_type="dict")
+@with_concurrency_limit
+def run_security_quality_suite(ctx: Context, include_redteam: bool = True) -> dict[str, Any]:
+    """Run prompt-injection red-team, PII redaction, escalation-cap and rollout safety checks."""
+    return _compact_response(
+        "run_security_quality_suite",
+        SafetyOrchestrationService(ctx).run_security_quality_suite(include_redteam=include_redteam),
+        ctx,
+    )
+
+
+@mcp.tool()
+@handle_mcp_tool_errors(return_type="dict")
+@with_concurrency_limit
+def release_readiness_report(
+    ctx: Context,
+    window_days: int = 30,
+    closure_days: int = 14,
+    include_security_suite: bool = True,
+) -> dict[str, Any]:
+    """Aggregate production release readiness gate with required reports + security suite."""
+    return _compact_response(
+        "release_readiness_report",
+        SafetyOrchestrationService(ctx).release_readiness_report(
+            window_days=window_days,
+            closure_days=closure_days,
+            include_security_suite=include_security_suite,
+        ),
+        ctx,
     )
 
 

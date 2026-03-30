@@ -457,13 +457,14 @@ class LaravelIntelligenceService(BaseService):
 
     # ── get_route_map ─────────────────────────────────────────────────
 
-    def get_route_map(self, filter_prefix: Optional[str] = None) -> Dict[str, Any]:
+    def get_route_map(self, filter_prefix: Optional[str] = None, include_all: bool = False) -> Dict[str, Any]:
         """
         Parse route files and return route → controller → method mapping.
         Supports nested Route::prefix()->name()->middleware()->group() patterns.
 
         Args:
             filter_prefix: Optional route name prefix filter (e.g., "provider.career")
+            include_all: If True, return full route list without context truncation
         """
         base = self._get_project_path()
         if not base:
@@ -502,7 +503,7 @@ class LaravelIntelligenceService(BaseService):
         total = len(routes)
 
         # Context protection: if no filter and too many routes, truncate and warn
-        if not filter_prefix and total > 50:
+        if not include_all and not filter_prefix and total > 50:
             return {
                 "status": "success",
                 "routes": routes[:50],

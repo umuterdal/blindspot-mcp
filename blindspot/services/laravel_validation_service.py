@@ -6,6 +6,7 @@ service methods to deliver actionable insights: validation chain tracing,
 middleware stack resolution, and pre-edit impact checking.
 """
 
+import json
 import logging
 import os
 import re
@@ -653,9 +654,15 @@ class LaravelValidationService(BaseService):
         # Try as route name prefix first
         if '.' in route_name:
             prefix = route_name.rsplit('.', 1)[0] + '.'
-            route_data = intel.get_route_map(prefix)
+            try:
+                route_data = intel.get_route_map(prefix, include_all=True)
+            except TypeError:
+                route_data = intel.get_route_map(prefix)
         else:
-            route_data = intel.get_route_map()
+            try:
+                route_data = intel.get_route_map(include_all=True)
+            except TypeError:
+                route_data = intel.get_route_map()
 
         all_routes = route_data.get("routes", [])
         target_route = None
@@ -718,7 +725,10 @@ class LaravelValidationService(BaseService):
         # 5. Group ALL routes by their throttle middleware
         throttle_groups: Dict[str, List[Dict[str, str]]] = {}
         # Re-fetch all routes (no filter) for grouping
-        all_route_data = intel.get_route_map()
+        try:
+            all_route_data = intel.get_route_map(include_all=True)
+        except TypeError:
+            all_route_data = intel.get_route_map()
         for r in all_route_data.get("routes", []):
             r_middleware = r.get("middleware") or []
             for mw in r_middleware:
@@ -1447,6 +1457,135 @@ class LaravelValidationService(BaseService):
 
     # ── verify_endpoint ───────────────────────────────────────────────
 
+    @staticmethod
+    def _normalize_url_path(path: str) -> str:
+        """Normalize a URL/route path to '/foo/bar' form."""
+        path = (path or "").strip()
+        if not path:
+            return "/"
+        normalized = "/" + path.lstrip("/")
+        normalized = re.sub(r"/+", "/", normalized)
+        return normalized.rstrip("/") or "/"
+
+    @staticmethod
+    def _method_matches(request_method: str, route_method: str) -> bool:
+        """Match route methods including multi-method forms like GET|HEAD."""
+        req = (request_method or "").upper()
+        parts = [
+            m.strip().upper()
+            for m in str(route_method or "").split("|")
+            if m and m.strip()
+        ]
+        if not parts:
+            return False
+        if req in parts:
+            return True
+        # Laravel commonly exposes GET routes as GET|HEAD.
+        if req == "HEAD" and "GET" in parts:
+            return True
+        return False
+
+    @classmethod
+    def _path_matches(cls, url_path: str, route_path: str) -> bool:
+        """Match exact/static and parameterized Laravel route paths."""
+        url_norm = cls._normalize_url_path(url_path)
+        route_norm = cls._normalize_url_path(route_path)
+        if url_norm == route_norm:
+            return True
+
+        # Optional params: /foo/{bar?} -> /foo or /foo/value
+        opt_pattern = re.sub(r"/\{[^}/]+\?\}", r"(?:/[^/]+)?", route_norm)
+        # Required params: /foo/{bar} -> /foo/value
+        dyn_pattern = re.sub(r"\{[^}/]+\}", r"[^/]+", opt_pattern)
+        dyn_pattern = f"^{dyn_pattern}$"
+        return re.match(dyn_pattern, url_norm) is not None
+
+    def _load_routes_from_artisan(self, base: str) -> List[Dict[str, Any]]:
+        """
+        Load full route list from `php artisan route:list --json` when available.
+        This avoids context truncation and supports GET|HEAD style methods.
+        """
+        artisan = os.path.join(base, "artisan")
+        if not os.path.isfile(artisan):
+            return []
+
+        try:
+            result = subprocess.run(
+                ["php", artisan, "route:list", "--json"],
+                cwd=base,
+                capture_output=True,
+                text=True,
+                timeout=25,
+            )
+        except Exception as e:
+            logger.debug("route:list execution failed: %s", e)
+            return []
+
+        if result.returncode != 0 or not result.stdout.strip():
+            logger.debug("route:list failed: %s", (result.stderr or result.stdout).strip())
+            return []
+
+        try:
+            raw_routes = json.loads(result.stdout)
+        except Exception as e:
+            logger.debug("route:list json parse failed: %s", e)
+            return []
+
+        parsed: List[Dict[str, Any]] = []
+        for item in raw_routes if isinstance(raw_routes, list) else []:
+            methods_raw = str(item.get("method") or "")
+            methods = [m.strip().upper() for m in methods_raw.split("|") if m.strip()]
+            uri = str(item.get("uri") or "/")
+            path = self._normalize_url_path(uri)
+            name = str(item.get("name") or "")
+            action_raw = str(item.get("action") or "")
+
+            controller_ref = ""
+            action = ""
+            if "@@" in action_raw:
+                # Defensive: malformed action fallback
+                action_raw = action_raw.replace("@@", "@")
+            if "@" in action_raw and "Closure" not in action_raw:
+                ctrl_raw, action = action_raw.rsplit("@", 1)
+                if "Http\\Controllers\\" in ctrl_raw:
+                    controller_ref = ctrl_raw.split("Http\\Controllers\\", 1)[1]
+                elif "Controllers\\" in ctrl_raw:
+                    controller_ref = ctrl_raw.split("Controllers\\", 1)[1]
+                else:
+                    controller_ref = ctrl_raw
+            elif action_raw and "Closure" not in action_raw:
+                ctrl_raw = action_raw
+                if "Http\\Controllers\\" in ctrl_raw:
+                    controller_ref = ctrl_raw.split("Http\\Controllers\\", 1)[1]
+                elif "Controllers\\" in ctrl_raw:
+                    controller_ref = ctrl_raw.split("Controllers\\", 1)[1]
+                else:
+                    controller_ref = ctrl_raw
+                action = "__invoke"
+
+            middleware_raw = item.get("middleware")
+            middleware_list: List[str] = []
+            if isinstance(middleware_raw, list):
+                middleware_list = [str(m).strip() for m in middleware_raw if str(m).strip()]
+            elif isinstance(middleware_raw, str):
+                middleware_list = [m.strip() for m in middleware_raw.split(",") if m.strip()]
+
+            parameters = re.findall(r"\{(\w+)\??\}", path)
+            for m in (methods or ["GET"]):
+                entry: Dict[str, Any] = {
+                    "method": m,
+                    "path": path,
+                    "controller": controller_ref,
+                    "action": action,
+                    "name": name,
+                    "middleware": middleware_list or None,
+                }
+                if parameters:
+                    entry["parameters"] = parameters
+                parsed.append(entry)
+
+        return parsed
+
     def verify_endpoint(self, method: str, url: str) -> Dict[str, Any]:
         """
         Verify an endpoint: route registration, controller syntax, middleware,
@@ -1464,24 +1603,30 @@ class LaravelValidationService(BaseService):
         method_upper = method.upper()
 
         # 1. Search routes for matching method+URL
-        route_data = intel.get_route_map()
-        all_routes = route_data.get("routes", [])
+        # Prefer artisan route:list to avoid truncated maps on large projects.
+        all_routes = self._load_routes_from_artisan(base)
+        if not all_routes:
+            try:
+                route_data = intel.get_route_map(include_all=True)
+            except TypeError:
+                route_data = intel.get_route_map()
+            all_routes = route_data.get("routes", [])
 
         target_route = None
-        url_normalized = url.rstrip("/") or "/"
+        url_normalized = self._normalize_url_path(url)
         for r in all_routes:
-            r_method = (r.get("method") or "").upper()
-            r_path = (r.get("path") or "").rstrip("/") or "/"
-            if r_method == method_upper and r_path == url_normalized:
+            r_method = r.get("method") or ""
+            r_path = r.get("path") or ""
+            if self._method_matches(method_upper, r_method) and self._path_matches(url_normalized, r_path):
                 target_route = r
                 break
 
         if not target_route:
             # Try partial match
             for r in all_routes:
-                r_method = (r.get("method") or "").upper()
-                r_path = (r.get("path") or "")
-                if r_method == method_upper and url_normalized in r_path:
+                r_method = r.get("method") or ""
+                r_path = self._normalize_url_path(r.get("path") or "")
+                if self._method_matches(method_upper, r_method) and (url_normalized in r_path or r_path in url_normalized):
                     target_route = r
                     break
 

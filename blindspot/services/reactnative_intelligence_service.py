@@ -210,6 +210,31 @@ class ReactNativeIntelligenceService(BaseService):
                         results.append((fpath, rel))
         return results
 
+    def _resolve_rn_file_path(self, base: str, file_path: str) -> Optional[str]:
+        """
+        Resolve RN file paths for both workspace-relative and repo-relative inputs.
+
+        Examples:
+        - app/screens/OnboardingScreen.tsx
+        - mobile/app/screens/OnboardingScreen.tsx
+        """
+        normalized = (file_path or "").strip().lstrip("./")
+        if not normalized:
+            return None
+
+        candidates = [
+            os.path.join(base, normalized),
+            os.path.join(os.path.dirname(base), normalized),
+        ]
+
+        if os.path.basename(base).lower() == "mobile" and normalized.startswith("mobile/"):
+            candidates.append(os.path.join(base, normalized.split("/", 1)[1]))
+
+        for candidate in candidates:
+            if os.path.isfile(candidate):
+                return candidate
+        return None
+
     def _read_file(self, fpath: str) -> Optional[str]:
         """Read file content safely."""
         try:
@@ -2115,6 +2140,7 @@ class ReactNativeIntelligenceService(BaseService):
             return {"status": "error", "message": "Project path not set"}
 
         result: Dict[str, Any] = {
+            "status": "success",
             "file_path": file_path,
             "symbol_name": symbol_name,
             "symbol_type": "unknown",
@@ -2123,7 +2149,9 @@ class ReactNativeIntelligenceService(BaseService):
             "references": [],
         }
 
-        target_path = os.path.join(base, file_path)
+        target_path = self._resolve_rn_file_path(base, file_path)
+        if not target_path:
+            return {"status": "error", "message": f"File not found: {file_path}"}
         target_content = self._read_file(target_path)
         if not target_content:
             return {"status": "error", "message": f"File not found: {file_path}"}

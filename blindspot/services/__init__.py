@@ -39,6 +39,7 @@ from .generic_intelligence_service import GenericIntelligenceService
 
 # Advanced Analysis Services
 from .advanced_analysis_service import AdvancedAnalysisService
+from .safety_orchestration_service import SafetyOrchestrationService
 
 __all__ = [
     # New Architecture
@@ -63,4 +64,5 @@ __all__ = [
 
     # Advanced Analysis Services
     'AdvancedAnalysisService',
+    'SafetyOrchestrationService',
 ]
