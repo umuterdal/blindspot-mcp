@@ -348,13 +348,26 @@ Blindspot auto-detects your framework and loads only the relevant plugin tools:
 - **Tested on real projects** — Verified on multiple real-world projects with real data
 - **Alpha** — Architecture and parsing logic complete, needs community testing on diverse projects. Your bug reports and PRs will make these production-ready!
 
-**No framework detected?** The 34 core tools still work perfectly on any project in any language. They use the deep index (tree-sitter) for symbol extraction, cross-file references, class hierarchies, and impact analysis.
+**No framework detected?** Built-in toolset yine çalışır. Blindspot v0.1.5 ile birlikte server tarafında **84 built-in MCP tool** bulunur; framework plugin'leri proje yapısına göre buna eklenir.
 
 ---
 
-## Core Tools (34+) + Safety Orchestration
+## Core Tools (84 Built-In) + Safety Orchestration
 
 These tools work on **every project**, regardless of language or framework:
+
+### Project Bootstrap & Runtime
+| Tool | What It Does |
+|------|-------------|
+| `set_project_path` | MCP oturumu için proje kökünü ayarlar. CLI'da `--project-path` vermediysen ilk çağrılması gereken tooldur. |
+| `get_settings_info` | Aktif proje ayarlarını ve konfigürasyon durumunu döndürür. |
+| `get_policy_status` | Etkin fail-closed policy profilini (`policy_hash` dahil) döndürür. |
+| `get_change_risk` | Bir dosya/sembol değişikliğinin risk seviyesini hızlı özetler. |
+| `create_temp_directory` / `check_temp_directory` | Index/safety için kullanılan temp dizinin oluşturulması ve sağlık kontrolü. |
+| `get_file_watcher_status` / `configure_file_watcher` | File watcher durumunu ve davranışını yönetir (debounce, exclude pattern, observer type). |
+| `refresh_search_tools` | Ortamdaki arama araçlarını (`rg`, `ugrep`, `ag`, `grep`) yeniden keşfeder. |
+| `clear_settings` | Cache + ayarları temizler (yerel geliştirme / reset senaryoları). |
+| `list_audit_backups` | Güvenlik/audit backup kayıtlarını listeler. |
 
 ### Editing & Safety
 | Tool | What It Does |
@@ -440,6 +453,14 @@ At release close, collect exactly these 4 reports:
 | `full_audit` | Comprehensive project audit: security (hardcoded secrets, XSS, SQL injection), performance (N+1, unbounded queries), quality (debug statements, TODOs), dead code. |
 | `post_edit_checklist` | Language-aware post-edit steps: syntax check, type check, tests, cache clear — per language (PHP, JS/TS, Python, Go, Rust, Ruby, Java). |
 
+### Built-In Tool Inventory (v0.1.5)
+
+Below is the exact built-in tool inventory currently registered in `blindspot/server.py`:
+
+```text
+set_project_path, search_code_advanced, find_files, get_file_summary, get_symbol_body, refresh_index, build_deep_index, get_settings_info, create_temp_directory, check_temp_directory, clear_settings, refresh_search_tools, get_file_watcher_status, configure_file_watcher, find_references, get_class_hierarchy, get_impact_analysis, get_ripple_effect, get_project_snapshot, detect_anti_patterns, apply_edit, get_edit_region, apply_edit_multi, analyze_queries, rename_symbol, check_eager_loading, auto_anti_pattern_check, detect_cache_conflicts, diff_preview, full_audit, post_edit_checklist, get_rebuild_status, get_context_for_edit, smart_apply_edit, get_policy_status, compile_spec, goal_to_patch, get_runtime_manifest, list_patch_primitives, run_mutation_property_fuzz_suite, record_incident_rule, list_incident_rules, get_assumption_ledger, resolve_assumption, run_policy_evaluation, get_change_risk, verify_schema, detect_transaction_risks, get_domain_rules, generate_test_skeleton, match_view_guards, safe_implement, safe_refactor, safe_optimize, safe_migrate, safe_fix, replay_session, conformance_matrix, gate_evidence_pack, kpi_report, open_risk_register, get_scope_inventory, upsert_scope_owner, get_kpi_protocol, set_kpi_protocol, request_policy_change, approve_policy_change, list_policy_changes, rotate_signing_key, list_key_rotations, run_benchmark_harness, list_benchmark_runs, request_break_glass, approve_break_glass, get_break_glass_request, create_audit_backup, list_audit_backups, restore_audit_backup, run_dr_drill, create_rollout_plan, execute_rollout_stage, get_rollout_status, run_security_quality_suite, release_readiness_report
+```
+
 ---
 
 ## Smart Edit Pipeline
@@ -491,7 +512,7 @@ High-speed profile (`execution.profile=fast_path`) adds:
 
 ## Framework-Specific Features (Per Plugin)
 
-Each of the 16 framework plugins includes specialized tools plus these 5 universal methods:
+Each of the 16 framework plugins includes specialized tools and is validated against this 10-method adapter contract:
 
 | Method | What It Does |
 |--------|-------------|
@@ -500,6 +521,11 @@ Each of the 16 framework plugins includes specialized tools plus these 5 univers
 | `get_domain_rules` | Directory-aware rules: controllers need auth, models need validation, services need error handling |
 | `generate_test_skeleton` | Generate framework-appropriate test boilerplate (Jest, pytest, JUnit, Go test, RSpec, ExUnit, etc.) |
 | `match_view_guards` | Cross-reference backend auth guards with frontend template/component conditions |
+| `contract_replay` | Endpoint contract replay/smoke validation for API compatibility drift |
+| `migration_verify` | Migration safety checks (up/down, index impact, dry-run style verification) |
+| `cache_consistency` | Read/write/invalidate consistency checks for cache keys |
+| `event_flow_verify` | Event dispatch/listener flow verification for breakage detection |
+| `ui_regression_smoke` | UI regression smoke checks for view/template surface changes |
 
 ---
 
@@ -624,6 +650,54 @@ governance:
 
 See [`examples/`](examples/) for framework-specific configuration templates.
 
+### Complete Safety Config Reference (`.blindspot.yaml`)
+
+The v0.1.5 safety pipeline reads the following keys:
+
+| Key | Type | Purpose |
+|-----|------|---------|
+| `policy.profile` | `strict \| relaxed` | Strict mode enables fail-closed enforcement for write/merge/deploy gates. |
+| `policy.allow_legacy_write` | `bool` | If `false`, legacy write tools (`apply_edit`, `smart_apply_edit`, `apply_edit_multi`) are blocked. |
+| `policy.min_confidence_write` | `0.0-1.0` | Minimum confidence threshold before write gates allow execution. |
+| `policy.escalation_budget.per_run` | `float` | Max escalation cost allowed per run. |
+| `policy.escalation_budget.per_day` | `float` | Max escalation cost allowed per day. |
+| `quality_gates.enabled` | `bool` | Enables mutation/property/fuzz quality gate orchestration. |
+| `quality_gates.enforce_for_write` | `bool` | If true, failed quality gates block writes. |
+| `quality_gates.timeout_seconds` | `int` | Timeout for quality gate command execution. |
+| `quality_gates.mutation_command` | `string` | Command for mutation-style checks. |
+| `quality_gates.property_command` | `string` | Command for property-based checks. |
+| `quality_gates.fuzz_command` | `string` | Command for fuzz checks. |
+| `quality_gates.targeted_tests_enabled` | `bool` | Enables impacted test selection in fast path. |
+| `quality_gates.targeted_test_command` | `string` | Command template; `{tests}` is substituted with impacted test modules. |
+| `quality_gates.max_targeted_tests` | `int` | Upper bound for targeted tests per run. |
+| `deterministic_runtime.require_pinned` | `bool` | Enforces runtime pin checks (fail-closed on mismatch). |
+| `deterministic_runtime.container_required` | `bool` | Requires runtime image digest for containerized execution. |
+| `deterministic_runtime.pins.python_major` | `int` | Required Python major version. |
+| `deterministic_runtime.pins.python_minor` | `int` | Required Python minor version. |
+| `benchmark.sample_size_target` | `int` | Target sample size for benchmark harness. |
+| `benchmark.seed` | `int` | Deterministic sampling seed. |
+| `benchmark.stratified` | `bool` | Enables stratified benchmark generation across framework/risk classes. |
+| `execution.profile` | `fast_path \| strict_path \| balanced` | Pipeline mode selection. |
+| `execution.runtime_budget_seconds` | `int` | Maximum allowed runtime per safe run. |
+| `execution.precheck_parallelism` | `int` | Parallel workers used for prechecks. |
+| `execution.speculative_variants` | `int` | Number of speculative patch candidates to score. |
+| `execution.warm_cache_ttl_seconds` | `int` | TTL for precheck warm-cache hits. |
+| `execution.write_quality_mode` | `targeted \| full` | Targeted or full quality mode at write stage. |
+| `execution.run_full_quality_after_write` | `bool` | Run full quality suite post-write even in fast path. |
+| `kpi_protocol.sample_size_min` | `int` | Minimum run sample size for KPI validity. |
+| `kpi_protocol.baseline_window_days` | `int` | Rolling baseline window length. |
+| `kpi_protocol.measurement_method` | `string` | KPI measurement strategy label (e.g. `rolling_window`). |
+| `kpi_protocol.error_budget_percent` | `float` | Allowed KPI error budget. |
+| `kpi_protocol.drift_threshold_percent` | `float` | Allowed KPI drift threshold. |
+| `kpi_protocol.allow_bootstrap_if_empty` | `bool` | If true, empty datasets can bootstrap without hard fail. |
+| `kpi_protocol.thresholds.gate_pass_rate_min` | `float` | Minimum required gate pass rate. |
+| `kpi_protocol.thresholds.first_pass_rate_min` | `float` | Minimum required first-pass success rate. |
+| `kpi_protocol.thresholds.rollback_rate_max` | `float` | Maximum rollback rate. |
+| `kpi_protocol.thresholds.critical_regressions_max` | `int` | Maximum allowed critical regressions. |
+| `governance.required_policy_approvals` | `int` | Number of approvals required for policy changes. |
+| `governance.required_break_glass_approvals` | `int` | Number of approvals required for break-glass requests. |
+| `governance.break_glass_default_ttl_minutes` | `int` | Default TTL for approved break-glass windows. |
+
 ---
 
 ## CLI Options
@@ -632,9 +706,10 @@ See [`examples/`](examples/) for framework-specific configuration templates.
 blindspot-mcp [options]
 
 Options:
-  --project-path PATH     Root directory of the project (required)
+  --project-path PATH     Root directory of the project (recommended; otherwise call set_project_path)
   --framework NAME        Override auto-detected framework
   --transport TYPE        stdio | sse | streamable-http (default: stdio)
+  --mount-path PATH       Mount path when using SSE transport
   --port PORT             Port for HTTP transports (default: 8000)
   --indexer-path PATH     Custom path for storing index data
   --tool-prefix PREFIX    Prefix for all tool names
@@ -680,7 +755,7 @@ Options:
 **Key design decisions:**
 
 - **Local only** — Your code never leaves your machine. Everything runs in-process.
-- **Framework-aware loading** — Only the detected framework's plugin loads. A Next.js project gets ~45 tools, not 241.
+- **Framework-aware loading** — Detected framework plugin'leri otomatik yüklenir. Built-in toolset 84 tooldur; plugin bazlı ekstra araçlar yalnızca ilgili projede aktif olur.
 - **Deep index + file scanning** — Tree-sitter for structured symbol data, regex for cross-file references. Best of both worlds.
 - **Compact responses** — Every tool is designed to return the minimum data needed. Large diffs get summarized. Symbol bodies can be fetched in compact mode (~90% fewer tokens).
 
@@ -792,6 +867,31 @@ Export mandatory 4 reports as separate files:
 python scripts/export_required_reports.py --project-path . --out-dir .blindspot/output/reports
 ```
 
+### PyPI Release Checklist (Maintainers)
+
+```bash
+# 1) bump version
+# edit pyproject.toml -> [project].version
+
+# 2) run tests
+python -m unittest discover -s tests -p "test_*.py" -v
+
+# 3) build + validate artifacts
+python -m build
+python -m twine check dist/*
+
+# 4) publish
+python -m twine upload dist/*
+
+# 5) git release
+git add pyproject.toml README.md
+git commit -m "Bump version to X.Y.Z"
+git tag -a vX.Y.Z -m "Release vX.Y.Z"
+git push origin main --tags
+```
+
+Versioning note: package version is `X.Y.Z` in `pyproject.toml`; git tag uses `vX.Y.Z`.
+
 ---
 
 ## Compatible AI Tools & Models
@@ -858,16 +958,17 @@ Supported monorepo tools: npm workspaces, yarn workspaces, pnpm workspaces, Turb
 ## Project Stats
 
 ```
-Total Python files:     112
-Total lines of code:    73,000+
+Tracked Python files:   123 (blindspot + tests + scripts)
+Tracked LOC:            ~79,700
 Framework plugins:      16
-Total MCP tools:        241 (34 core + ~13 per plugin)
+Built-in MCP tools:     84 (server-registered)
+Plugin tools:           Auto-loaded by detected framework(s)
 Supported languages:    12 (PHP, TypeScript, JavaScript, Python, Java,
                             Kotlin, Go, Rust, Ruby, C#, Dart, Elixir)
 Tree-sitter parsers:    12
 Syntax check support:   PHP, JavaScript, TypeScript, Python, Go, Rust
 Monorepo support:       Automatic workspace detection
-Session tracking:       Ripple lifecycle, pipeline enforcement, coverage metrics
+Session tracking:       Audit/replay, assumption ledger, policy gates, rollback evidence
 Compact responses:      Large results auto-saved to .blindspot/output/
 ```
 
