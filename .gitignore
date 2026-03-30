@@ -32,9 +32,6 @@ Thumbs.db
 htmlcov/
 .tox/
 test_env/
-tests/test_governance_store.py
-tests/test_safety_orchestration_service.py
-tests/test_laravel_validation_service.py
 
 # Environment variables
 .env
