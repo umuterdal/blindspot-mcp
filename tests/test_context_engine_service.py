@@ -825,6 +825,50 @@ class SignalEnrichmentTests(unittest.TestCase):
             "src/main/java/com/example/controller/CheckoutController.java",
         )
 
+    def test_query_prefers_framework_controller_method_for_route_like_laravel_query(self):
+        """Free-text route/controller queries should resolve to the owning
+        controller method instead of abstaining or drifting into support
+        paths like routes/web.php.
+        """
+        with open(os.path.join(self.tmp.name, ".blindspot.yaml"), "w", encoding="utf-8") as f:
+            f.write(
+                "language: php\n"
+                "framework: laravel\n"
+                "scan_dirs:\n"
+                "  controllers: app/Http/Controllers\n"
+                "  routes: routes\n"
+            )
+        os.makedirs(os.path.join(self.tmp.name, "app", "Http", "Controllers"), exist_ok=True)
+        os.makedirs(os.path.join(self.tmp.name, "routes"), exist_ok=True)
+        with open(os.path.join(self.tmp.name, "app", "Http", "Controllers", "HomeController.php"), "w", encoding="utf-8") as handle:
+            handle.write("<?php class HomeController { public function index() {} }\n")
+        with open(os.path.join(self.tmp.name, "routes", "web.php"), "w", encoding="utf-8") as handle:
+            handle.write("<?php Route::get('/', [HomeController::class, 'index']);\n")
+        ctx = _build_ctx_with_fake_index(
+            self.tmp.name,
+            search_hits=[
+                {"symbol_id": "route", "file": "routes/web.php", "short_name": "web", "score": 6.25},
+                {"symbol_id": "home-index", "file": "app/Http/Controllers/HomeController.php",
+                 "short_name": "HomeController.index", "score": 5.82},
+                {"symbol_id": "home-class", "file": "app/Http/Controllers/HomeController.php",
+                 "short_name": "HomeController", "score": 5.61},
+            ],
+        )
+        patches = self._patch_structural(direct_callers=[], indirect_dependents=[])
+        with patches[0], patches[1], patches[2], patches[3], patches[4]:
+            result = ContextEngineService(ctx).get_context(
+                query="laravel homepage route controller index method web php",
+                intent="before_edit",
+                include_source=False,
+            )
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(
+            result["query_resolution"]["target"],
+            "app/Http/Controllers/HomeController.php",
+        )
+        self.assertEqual(result["query_resolution"]["symbol"], "index")
+
     # ---- 4. Ranking stability --------------------------------------------
 
     def test_ranking_priority_order_direct_caller_over_all_auxiliary_signals(self):
@@ -998,6 +1042,43 @@ class SignalEnrichmentTests(unittest.TestCase):
         self.assertEqual(bootstrap_reason["certainty"], "probable")
         self.assertEqual(bootstrap_reason["evidence_type"], "framework_wiring")
         self.assertIn("bootstrap/app.php", result["relationship_buckets"]["probable"])
+
+    def test_framework_paths_from_cochange_are_upgraded_to_wiring_when_content_matches(self):
+        with open(os.path.join(self.tmp.name, ".blindspot.yaml"), "w", encoding="utf-8") as f:
+            f.write(
+                "language: php\n"
+                "framework: laravel\n"
+                "scan_dirs:\n"
+                "  services: app/Services\n"
+                "  routes: routes\n"
+            )
+        os.makedirs(os.path.join(self.tmp.name, "app", "Services"), exist_ok=True)
+        os.makedirs(os.path.join(self.tmp.name, "routes"), exist_ok=True)
+        with open(os.path.join(self.tmp.name, "app", "Services", "SitemapService.php"), "w", encoding="utf-8") as f:
+            f.write("<?php class SitemapService { public function pages() {} }\n")
+        with open(os.path.join(self.tmp.name, "routes", "sitemap.php"), "w", encoding="utf-8") as f:
+            f.write("<?php Route::get('/sitemap', [SitemapController::class, 'pages']);\n")
+
+        ctx = _build_ctx_with_fake_index(
+            self.tmp.name,
+            cochanged=[{"peer": "routes/sitemap.php", "count": 4, "last_seen": "2026-04-01"}],
+        )
+        patches = self._patch_structural(direct_callers=[], indirect_dependents=[])
+        with patches[0], patches[1], patches[2], patches[3], patches[4]:
+            result = ContextEngineService(ctx).get_context(
+                target="app/Services/SitemapService.php",
+                intent="before_edit",
+                symbol="pages",
+                include_source=False,
+            )
+
+        route_reason = next(
+            item for item in result["related_file_reasons"]
+            if item.get("file") == "routes/sitemap.php"
+        )
+        self.assertEqual(route_reason["role"], "framework_entrypoint")
+        self.assertEqual(route_reason["certainty"], "probable")
+        self.assertEqual(route_reason["evidence_type"], "framework_wiring")
 
     def test_scan_only_direct_caller_is_not_marked_certain(self):
         ctx = _build_ctx_with_fake_index(self.tmp.name)

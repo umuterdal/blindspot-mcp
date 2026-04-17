@@ -66,6 +66,12 @@ _LANGUAGE_HINT_TOKENS = frozenset({
     "nodejs", "reactnative",
 })
 
+_FRAMEWORK_QUERY_HINT_TOKENS = frozenset({
+    "route", "routes", "router", "web", "api", "controller", "controllers",
+    "middleware", "navigation", "screen", "page", "pages", "homepage",
+    "home", "index", "bootstrap", "config", "entrypoint", "method",
+})
+
 
 def _is_generic_hook(symbol_name: Optional[str]) -> bool:
     if not symbol_name:
@@ -675,8 +681,15 @@ class ContextEngineService(BaseService):
                     f"Changed together with the target in {count} recent commits "
                     f"(last {peer.get('last_seen', 'unknown')})."
                 ),
-                "priority": 40,
-            }
+                    "priority": 40,
+                }
+
+        self._upgrade_framework_related_reasons(
+            reasons=reasons,
+            target=target,
+            symbol_context=symbol_context,
+            direct_callers=direct_callers or [],
+        )
 
         # Semantic fallback: when the structural + co-change signal is thin
         # (very few related files found) blend in BM25 top hits so the agent
@@ -711,6 +724,52 @@ class ContextEngineService(BaseService):
         )
         return ranked[:max_related]
 
+    def _upgrade_framework_related_reasons(
+        self,
+        reasons: Dict[str, Dict[str, Any]],
+        target: str,
+        symbol_context: Dict[str, Any],
+        direct_callers: List[Dict[str, Any]],
+    ) -> None:
+        structure = self._get_structure()
+        if not structure:
+            return
+        framework = str(structure.framework or "none").lower()
+        if framework not in {"laravel", "symfony", "nestjs", "express", "node", "spring", "flutter", "reactnative"}:
+            return
+        hints = self._framework_hint_tokens(target, symbol_context, direct_callers)
+        if not hints:
+            return
+
+        for file_path, item in list(reasons.items()):
+            if file_path == target:
+                continue
+            framework_role = self._framework_role_for_file(
+                file_path,
+                structure.categorize_file(file_path) or "other",
+            )
+            if not framework_role:
+                continue
+            matched = self._framework_file_matches_hints(file_path, hints, structure)
+            if not matched:
+                continue
+            reason_text = str(item.get("reason") or "")
+            if not reason_text or "Framework" not in reason_text:
+                reason_text = (
+                    f"Framework wiring references target-related tokens "
+                    f"({', '.join(matched[:3])})."
+                )
+            item.update(
+                {
+                    "role": framework_role,
+                    "certainty": "probable",
+                    "evidence_type": "framework_wiring",
+                    "evidence_strength": "medium",
+                    "reason": reason_text,
+                    "priority": max(int(item.get("priority", 0)), 76),
+                }
+            )
+
     def _framework_related_files(
         self,
         target: str,
@@ -737,14 +796,7 @@ class ContextEngineService(BaseService):
         for rel_path in candidate_paths:
             if rel_path == target:
                 continue
-            full_path = os.path.join(structure.project_path, rel_path)
-            try:
-                with open(full_path, "r", encoding="utf-8", errors="replace") as handle:
-                    content = handle.read(8000)
-            except Exception:
-                continue
-            lowered = content.lower()
-            matched = [token for token in hints if token in lowered]
+            matched = self._framework_file_matches_hints(rel_path, hints, structure)
             if not matched:
                 continue
             role = "framework_entrypoint"
@@ -765,6 +817,21 @@ class ContextEngineService(BaseService):
             if len(matches) >= max_related:
                 break
         return matches
+
+    def _framework_file_matches_hints(
+        self,
+        rel_path: str,
+        hints: List[str],
+        structure,
+    ) -> List[str]:
+        full_path = os.path.join(structure.project_path, rel_path)
+        try:
+            with open(full_path, "r", encoding="utf-8", errors="replace") as handle:
+                content = handle.read(12000)
+        except Exception:
+            return []
+        lowered = content.lower()
+        return [token for token in hints if token in lowered]
 
     def _framework_role_for_file(self, file_path: str, category: str) -> Optional[str]:
         normalized = file_path.replace("\\", "/").lower()
@@ -964,7 +1031,7 @@ class ContextEngineService(BaseService):
         if not callable(search):
             return None
         try:
-            ranked = search(query, limit=12) or []
+            ranked = search(query, limit=24) or []
         except Exception:
             return None
         if not ranked:
@@ -997,7 +1064,11 @@ class ContextEngineService(BaseService):
             return None
         if top_role != "source" and score_gap < 1.0 and (score_ratio is None or score_ratio < 1.35):
             return None
+        top_framework_score = float(top.get("framework_match_score") or 0.0)
         if second and score_gap < 0.35 and (score_ratio is None or score_ratio < 1.12):
+            if top_framework_score < 1.15:
+                return None
+        elif second and score_gap < 0.2 and top_framework_score < 1.25:
             return None
 
         short = top.get("short_name") or ""
@@ -1093,8 +1164,10 @@ class ContextEngineService(BaseService):
     def _rerank_query_hits(self, query: str, hits: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         if not hits:
             return []
+        structure = self._get_structure()
         query_tokens = set(_tokenize_text(query))
         query_language_tokens = {token for token in query_tokens if token in _LANGUAGE_HINT_TOKENS}
+        query_framework_tokens = {token for token in query_tokens if token in _FRAMEWORK_QUERY_HINT_TOKENS}
         wants_auxiliary = {
             role for role, tokens in _QUERY_AUXILIARY_TOKENS.items()
             if query_tokens.intersection(tokens)
@@ -1105,6 +1178,10 @@ class ContextEngineService(BaseService):
             path_role = _classify_path_role(row.get("file"))
             short_name = str(row.get("short_name") or "")
             file_path = str(row.get("file") or "")
+            category = (
+                (structure.categorize_file(file_path) if structure else None)
+                or ""
+            ).lower()
             short_tokens = set(_tokenize_text(short_name))
             basename_tokens = set(_tokenize_text(os.path.basename(file_path)))
             compact_short = _compact_token(short_name)
@@ -1112,6 +1189,7 @@ class ContextEngineService(BaseService):
             compact_query_tokens = {_compact_token(token) for token in query_tokens if token}
             base_score = float(row.get("score") or 0.0)
             adjusted = base_score
+            framework_match_score = 1.0
 
             if path_role == "source":
                 adjusted *= 1.12
@@ -1139,7 +1217,36 @@ class ContextEngineService(BaseService):
                 )
                 adjusted *= 1.35 if language_match else 0.88
 
+            if query_framework_tokens:
+                if category in {"controllers", "routes", "router", "navigation", "middleware"}:
+                    framework_match_score *= 1.14
+                if "controller" in query_framework_tokens or "controllers" in query_framework_tokens:
+                    if category == "controllers" or "controller" in compact_path:
+                        framework_match_score *= 1.16
+                if {"route", "routes", "router", "web", "api"}.intersection(query_framework_tokens):
+                    if category in {"routes", "router"} or any(token in compact_path for token in ("route", "routes", "router", "web")):
+                        framework_match_score *= 1.08
+                if {"middleware", "navigation", "bootstrap", "config"}.intersection(query_framework_tokens):
+                    if any(token in compact_path for token in ("middleware", "navigation", "bootstrap", "config")):
+                        framework_match_score *= 1.08
+                if "method" in query_framework_tokens and "." in short_name:
+                    framework_match_score *= 1.06
+                if "index" in query_framework_tokens and (
+                    short_name.lower().endswith(".index") or short_name.lower() == "index"
+                ):
+                    framework_match_score *= 1.18
+                if {"home", "homepage"}.intersection(query_framework_tokens) and (
+                    "home" in compact_short or "home" in compact_path
+                ):
+                    framework_match_score *= 1.14
+                if {"page", "pages"}.intersection(query_framework_tokens) and (
+                    "page" in compact_short or "page" in compact_path
+                ):
+                    framework_match_score *= 1.1
+                adjusted *= framework_match_score
+
             row["path_role"] = path_role
+            row["framework_match_score"] = round(framework_match_score, 4)
             row["adjusted_score"] = round(adjusted, 4)
             ranked.append(row)
 
