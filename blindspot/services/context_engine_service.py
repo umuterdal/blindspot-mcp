@@ -8,6 +8,7 @@ dozens of specialized tools.
 from __future__ import annotations
 
 import os
+import re
 from typing import Any, Dict, List, Optional
 
 from .base_service import BaseService
@@ -42,12 +43,62 @@ _GENERIC_HOOK_NAMES = frozenset({
     "__file_scope__",
 })
 
+_QUERY_AUXILIARY_TOKENS = {
+    "test": frozenset({"test", "tests", "spec", "specs"}),
+    "fixture": frozenset({"fixture", "fixtures", "eval", "evals"}),
+    "example": frozenset({"example", "examples", "sample", "samples"}),
+    "docs": frozenset({"doc", "docs", "documentation"}),
+    "generated": frozenset({"generated", "build", "dist", "cache", "output"}),
+}
+
+_QUERY_PATH_ROLE_PRIORITY = {
+    "source": 5,
+    "test": 4,
+    "docs": 3,
+    "example": 2,
+    "fixture": 1,
+    "generated": 0,
+}
+
+_LANGUAGE_HINT_TOKENS = frozenset({
+    "php", "python", "javascript", "typescript", "java", "kotlin",
+    "dart", "flutter", "go", "golang", "zig", "csharp", "node",
+    "nodejs", "reactnative",
+})
+
 
 def _is_generic_hook(symbol_name: Optional[str]) -> bool:
     if not symbol_name:
         return False
     short = symbol_name.rsplit(".", 1)[-1]
     return short in _GENERIC_HOOK_NAMES
+
+
+def _tokenize_text(text: Optional[str]) -> List[str]:
+    return [token.lower() for token in re.findall(r"\w+", text or "", flags=re.UNICODE)]
+
+
+def _compact_token(text: Optional[str]) -> str:
+    return re.sub(r"[^a-z0-9]+", "", (text or "").lower())
+
+
+def _classify_path_role(file_path: Optional[str]) -> str:
+    normalized = (file_path or "").replace("\\", "/").lower()
+    if not normalized:
+        return "source"
+    segments = [segment for segment in normalized.split("/") if segment]
+    segment_set = set(segments)
+    if ".blindspot" in segment_set:
+        return "generated"
+    if segment_set.intersection({"test", "tests", "__tests__", "spec", "specs"}):
+        return "test"
+    if segment_set.intersection({"evals", "fixtures"}):
+        return "fixture"
+    if segment_set.intersection({"example", "examples", "sample", "samples"}):
+        return "example"
+    if segment_set.intersection({"doc", "docs"}):
+        return "docs"
+    return "source"
 
 
 class ContextEngineService(BaseService):
@@ -596,10 +647,15 @@ class ContextEngineService(BaseService):
             ranked = search(query, limit=limit * 2) or []
         except Exception:
             return []
+        ranked = self._rerank_query_hits(query, ranked)
+        target_role = _classify_path_role(target)
         out: List[Dict[str, Any]] = []
         for hit in ranked:
             file_path = hit.get("file")
             if not file_path or file_path == target:
+                continue
+            hit_role = hit.get("path_role") or _classify_path_role(file_path)
+            if target_role == "source" and hit_role != "source":
                 continue
             out.append(hit)
             if len(out) >= limit:
@@ -679,12 +735,29 @@ class ContextEngineService(BaseService):
         if not callable(search):
             return None
         try:
-            ranked = search(query, limit=5) or []
+            ranked = search(query, limit=12) or []
         except Exception:
             return None
         if not ranked:
             return None
+        ranked = self._rerank_query_hits(query, ranked)
         top = ranked[0]
+        second = ranked[1] if len(ranked) > 1 else None
+        score = float(top.get("adjusted_score") or top.get("score") or 0.0)
+        second_score = float(second.get("adjusted_score") or second.get("score") or 0.0) if second else 0.0
+        score_gap = round(score - second_score, 4)
+        score_ratio = round(score / max(second_score, 0.0001), 4) if second_score else None
+        top_role = top.get("path_role") or _classify_path_role(top.get("file"))
+
+        # Abstain when the best hit is still weak or the top lane is an
+        # auxiliary path whose margin over the next candidate is too thin.
+        if score < 0.5:
+            return None
+        if top_role != "source" and score_gap < 1.0 and (score_ratio is None or score_ratio < 1.35):
+            return None
+        if second and score_gap < 0.35 and (score_ratio is None or score_ratio < 1.12):
+            return None
+
         short = top.get("short_name") or ""
         inferred_symbol: Optional[str] = None
         inferred_owner: Optional[str] = None
@@ -700,6 +773,10 @@ class ContextEngineService(BaseService):
             "symbol": inferred_symbol,
             "owner": inferred_owner,
             "score": top.get("score"),
+            "adjusted_score": round(score, 4),
+            "score_gap": score_gap,
+            "score_ratio": score_ratio,
+            "path_role": top_role,
             "match_symbol_id": top.get("symbol_id"),
             "alternatives": [
                 {
@@ -707,8 +784,10 @@ class ContextEngineService(BaseService):
                     "file": r.get("file"),
                     "short_name": r.get("short_name"),
                     "score": r.get("score"),
+                    "adjusted_score": r.get("adjusted_score"),
+                    "path_role": r.get("path_role"),
                 }
-                for r in ranked[1:5]
+                for r in ranked[1:6]
             ],
         }
 
@@ -721,15 +800,81 @@ class ContextEngineService(BaseService):
             ranked = search(query, limit=limit) or []
         except Exception:
             return []
+        ranked = self._rerank_query_hits(query, ranked)
         return [
             {
                 "symbol_id": r.get("symbol_id"),
                 "file": r.get("file"),
                 "short_name": r.get("short_name"),
                 "score": r.get("score"),
+                "adjusted_score": r.get("adjusted_score"),
+                "path_role": r.get("path_role"),
             }
             for r in ranked
         ]
+
+    def _rerank_query_hits(self, query: str, hits: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        if not hits:
+            return []
+        query_tokens = set(_tokenize_text(query))
+        query_language_tokens = {token for token in query_tokens if token in _LANGUAGE_HINT_TOKENS}
+        wants_auxiliary = {
+            role for role, tokens in _QUERY_AUXILIARY_TOKENS.items()
+            if query_tokens.intersection(tokens)
+        }
+        ranked: List[Dict[str, Any]] = []
+        for hit in hits:
+            row = dict(hit)
+            path_role = _classify_path_role(row.get("file"))
+            short_name = str(row.get("short_name") or "")
+            file_path = str(row.get("file") or "")
+            short_tokens = set(_tokenize_text(short_name))
+            basename_tokens = set(_tokenize_text(os.path.basename(file_path)))
+            compact_short = _compact_token(short_name)
+            compact_path = _compact_token(file_path)
+            compact_query_tokens = {_compact_token(token) for token in query_tokens if token}
+            base_score = float(row.get("score") or 0.0)
+            adjusted = base_score
+
+            if path_role == "source":
+                adjusted *= 1.12
+            elif path_role in wants_auxiliary:
+                adjusted *= 1.02
+            else:
+                adjusted *= {
+                    "test": 0.72,
+                    "docs": 0.45,
+                    "example": 0.35,
+                    "fixture": 0.18,
+                    "generated": 0.08,
+                }.get(path_role, 1.0)
+
+            if short_tokens.intersection(query_tokens):
+                adjusted *= 1.1
+            elif basename_tokens.intersection(query_tokens):
+                adjusted *= 1.03
+            if any(token and (token in compact_short or token in compact_path) for token in compact_query_tokens):
+                adjusted *= 1.08
+            if query_language_tokens:
+                language_match = any(
+                    token in compact_short or token in compact_path
+                    for token in query_language_tokens
+                )
+                adjusted *= 1.35 if language_match else 0.88
+
+            row["path_role"] = path_role
+            row["adjusted_score"] = round(adjusted, 4)
+            ranked.append(row)
+
+        ranked.sort(
+            key=lambda item: (
+                float(item.get("adjusted_score") or 0.0),
+                _QUERY_PATH_ROLE_PRIORITY.get(str(item.get("path_role") or "source"), 0),
+                str(item.get("short_name") or ""),
+            ),
+            reverse=True,
+        )
+        return ranked
 
     def _collect_related_files(
         self,
@@ -788,6 +933,7 @@ class ContextEngineService(BaseService):
         direct_callers = response.get("direct_callers", []) or []
         indirect_dependents = response.get("indirect_dependents", []) or []
         related_files = response.get("related_files", []) or []
+        query_resolution = response.get("query_resolution") or {}
         evidence = {
             "has_symbol_match": bool(symbol_context.get("found")),
             "direct_callers": len(direct_callers),
@@ -795,6 +941,8 @@ class ContextEngineService(BaseService):
             "related_files": len(related_files),
             "risk_reasons": len(response.get("risk_reasons", []) or []),
             "has_blast_radius": bool(response.get("blast_radius")),
+            "query_resolved": bool(query_resolution),
+            "query_path_role": query_resolution.get("path_role"),
         }
 
         score = 0.45
@@ -808,10 +956,19 @@ class ContextEngineService(BaseService):
             score += min(0.08, evidence["direct_callers"] * 0.03)
         if evidence["indirect_dependents"]:
             score += min(0.05, evidence["indirect_dependents"] * 0.02)
+        if evidence["query_resolved"] and evidence["query_path_role"] == "source":
+            score += 0.05
         if "deep_index" in missing_context:
             score -= 0.2
         if response.get("target", {}).get("symbol") and not evidence["has_symbol_match"]:
             score -= 0.25
+        if evidence["query_resolved"]:
+            if evidence["query_path_role"] and evidence["query_path_role"] != "source":
+                score -= 0.18
+            if float(query_resolution.get("score_gap") or 0.0) < 0.35:
+                score -= 0.12
+            if query_resolution.get("score_ratio") is not None and float(query_resolution.get("score_ratio") or 0.0) < 1.12:
+                score -= 0.08
 
         score = max(0.0, min(1.0, round(score, 2)))
         if score >= 0.8:
@@ -828,6 +985,10 @@ class ContextEngineService(BaseService):
             inferred.append("Symbol-level evidence is limited because the deep index is missing.")
         if response.get("target", {}).get("symbol") and not evidence["has_symbol_match"]:
             inferred.append("The requested symbol was not resolved exactly; some impact data may be approximate.")
+        if evidence["query_resolved"] and evidence["query_path_role"] != "source":
+            inferred.append("Free-text query resolution landed on a non-source path, so the match may reflect supporting code.")
+        if evidence["query_resolved"] and float(query_resolution.get("score_gap") or 0.0) < 0.35:
+            inferred.append("The free-text query had a thin margin over the next candidate; verify query_resolution before editing.")
 
         return {
             "level": level,

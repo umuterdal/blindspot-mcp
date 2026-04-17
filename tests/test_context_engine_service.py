@@ -655,6 +655,46 @@ class SignalEnrichmentTests(unittest.TestCase):
         self.assertEqual(result["query_resolution"]["symbol"], "greet")
         self.assertGreaterEqual(len(result["query_resolution"].get("alternatives", [])), 1)
 
+    def test_query_prefers_source_hit_over_fixture_when_scores_are_close(self):
+        """FP guard: eval/fixture hits often share many lexical tokens with
+        implementation helpers. Query resolution must still prefer a real
+        source file over a nearby fixture unless the query explicitly asks
+        for fixture/eval content.
+        """
+        os.makedirs(os.path.join(self.tmp.name, "src"), exist_ok=True)
+        os.makedirs(os.path.join(self.tmp.name, "evals", "fixtures", "ts_case"), exist_ok=True)
+        with open(os.path.join(self.tmp.name, "src", "strategy.py"), "w", encoding="utf-8") as handle:
+            handle.write("def _capture_constructor_body_assignments():\n    return None\n")
+        with open(
+            os.path.join(self.tmp.name, "evals", "fixtures", "ts_case", "controller_fixture.py"),
+            "w",
+            encoding="utf-8",
+        ) as handle:
+            handle.write("class FixtureController:\n    def __init__(self):\n        pass\n")
+        ctx = _build_ctx_with_fake_index(
+            self.tmp.name,
+            search_hits=[
+                {"symbol_id": "fixture-top", "file": "evals/fixtures/ts_case/controller_fixture.py",
+                 "short_name": "FixtureController.constructor", "score": 9.6},
+                {"symbol_id": "source-next", "file": "src/strategy.py",
+                 "short_name": "_capture_constructor_body_assignments", "score": 9.1},
+            ],
+        )
+        patches = self._patch_structural(direct_callers=[], indirect_dependents=[])
+        with patches[0], patches[1], patches[2], patches[3], patches[4]:
+            result = ContextEngineService(ctx).get_context(
+                query="typescript constructor body dependency injection call resolution",
+                intent="before_edit",
+                include_source=False,
+            )
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(
+            result["query_resolution"]["target"],
+            "src/strategy.py",
+        )
+        self.assertEqual(result["query_resolution"]["path_role"], "source")
+
     def test_query_with_no_match_returns_needs_target_and_candidates(self):
         """FP guard: when BM25 cannot confidently resolve anything, the
         engine must not fabricate a target. It must surface ``needs_target``
@@ -668,6 +708,71 @@ class SignalEnrichmentTests(unittest.TestCase):
         self.assertEqual(result["status"], "needs_target")
         self.assertIn("query", result)
         self.assertIsInstance(result.get("query_candidates", []), list)
+
+    def test_query_abstains_when_top_candidates_are_ambiguous(self):
+        """FP guard: if the top two source candidates are too close, the
+        engine must not invent a winner. ``needs_target`` is safer than a
+        low-margin guess that sends the agent into the wrong file.
+        """
+        os.makedirs(os.path.join(self.tmp.name, "app"), exist_ok=True)
+        with open(os.path.join(self.tmp.name, "app", "auth_service.py"), "w", encoding="utf-8") as handle:
+            handle.write("def authenticate(token):\n    return token\n")
+        with open(os.path.join(self.tmp.name, "app", "provider_auth.py"), "w", encoding="utf-8") as handle:
+            handle.write("def authenticate(token):\n    return token\n")
+        ctx = _build_ctx_with_fake_index(
+            self.tmp.name,
+            search_hits=[
+                {"symbol_id": "a", "file": "app/auth_service.py",
+                 "short_name": "authenticate", "score": 8.0},
+                {"symbol_id": "b", "file": "app/provider_auth.py",
+                 "short_name": "authenticate", "score": 7.96},
+            ],
+        )
+        result = ContextEngineService(ctx).get_context(
+            query="authenticate",
+            intent="before_edit",
+            include_source=False,
+        )
+        self.assertEqual(result["status"], "needs_target")
+        self.assertGreaterEqual(len(result.get("query_candidates", [])), 2)
+
+    def test_query_prefers_language_matched_source_when_multiple_helpers_exist(self):
+        """FN guard: when several source helpers implement the same idea in
+        different languages, an explicit language token in the query must
+        lift the matching implementation above unrelated languages.
+        """
+        os.makedirs(os.path.join(self.tmp.name, "blindspot", "indexing", "strategies"), exist_ok=True)
+        for filename in ("php_strategy.py", "javascript_strategy.py", "typescript_strategy.py"):
+            with open(
+                os.path.join(self.tmp.name, "blindspot", "indexing", "strategies", filename),
+                "w",
+                encoding="utf-8",
+            ) as handle:
+                handle.write("def _capture_constructor_body_assignments():\n    return None\n")
+        ctx = _build_ctx_with_fake_index(
+            self.tmp.name,
+            search_hits=[
+                {"symbol_id": "php", "file": "blindspot/indexing/strategies/php_strategy.py",
+                 "short_name": "PHPParsingStrategy._capture_constructor_body_assignments", "score": 17.5},
+                {"symbol_id": "js", "file": "blindspot/indexing/strategies/javascript_strategy.py",
+                 "short_name": "JavaScriptParsingStrategy._capture_constructor_body_assignments", "score": 17.0},
+                {"symbol_id": "ts", "file": "blindspot/indexing/strategies/typescript_strategy.py",
+                 "short_name": "TypeScriptParsingStrategy._capture_constructor_body_assignments", "score": 14.7},
+            ],
+        )
+        patches = self._patch_structural(direct_callers=[], indirect_dependents=[])
+        with patches[0], patches[1], patches[2], patches[3], patches[4]:
+            result = ContextEngineService(ctx).get_context(
+                query="typescript constructor body dependency injection call resolution",
+                intent="before_edit",
+                include_source=False,
+            )
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(
+            result["query_resolution"]["target"],
+            "blindspot/indexing/strategies/typescript_strategy.py",
+        )
 
     # ---- 4. Ranking stability --------------------------------------------
 
@@ -730,6 +835,33 @@ class SignalEnrichmentTests(unittest.TestCase):
         if "co_change" in role_first_index and "semantic_related" in role_first_index:
             self.assertLess(role_first_index["co_change"],
                             role_first_index["semantic_related"])
+
+    def test_semantic_fallback_filters_fixture_and_test_paths_for_source_targets(self):
+        """FP guard: semantic fallback should help a source edit, not yank
+        the agent into fixtures or tests that merely share tokens.
+        """
+        ctx = _build_ctx_with_fake_index(
+            self.tmp.name,
+            search_hits=[
+                {"symbol_id": "fixture", "file": "evals/fixtures/demo_case.py",
+                 "short_name": "greet_case", "score": 10.0},
+                {"symbol_id": "test", "file": "tests/test_service.py",
+                 "short_name": "test_greet", "score": 9.8},
+                {"symbol_id": "source", "file": "app/greeter_helpers.py",
+                 "short_name": "format_greeting", "score": 8.0},
+            ],
+        )
+        patches = self._patch_structural(direct_callers=[], indirect_dependents=[])
+        with patches[0], patches[1], patches[2], patches[3], patches[4]:
+            result = self._run_get_context(ctx)
+
+        semantic_files = {
+            r["file"] for r in result["related_file_reasons"]
+            if r.get("role") == "semantic_related"
+        }
+        self.assertIn("app/greeter_helpers.py", semantic_files)
+        self.assertNotIn("evals/fixtures/demo_case.py", semantic_files)
+        self.assertNotIn("tests/test_service.py", semantic_files)
 
 
 class CrossFileRefsFixtureRegressionTests(unittest.TestCase):
@@ -1648,7 +1780,3 @@ class CrossFileRefsFixtureRegressionTests(unittest.TestCase):
             by_target,
             f"Missing this.günlük.info() edge. All edges: {edges}",
         )
-
-
-
-
