@@ -86,17 +86,31 @@ def _classify_path_role(file_path: Optional[str]) -> str:
     normalized = (file_path or "").replace("\\", "/").lower()
     if not normalized:
         return "source"
-    segments = [segment for segment in normalized.split("/") if segment]
-    segment_set = set(segments)
-    if ".blindspot" in segment_set:
+    stripped = normalized.lstrip("./")
+    segments = [segment for segment in stripped.split("/") if segment]
+    if stripped.startswith(".blindspot/output/"):
         return "generated"
-    if segment_set.intersection({"test", "tests", "__tests__", "spec", "specs"}):
+    if (
+        stripped.startswith("tests/")
+        or stripped.startswith("test/")
+        or stripped.startswith("__tests__/")
+        or "/tests/" in f"/{stripped}"
+        or "/test/" in f"/{stripped}"
+        or "/__tests__/" in f"/{stripped}"
+        or stripped.startswith("src/test/")
+        or stripped.startswith("src/androidtest/")
+    ):
         return "test"
-    if segment_set.intersection({"evals", "fixtures"}):
+    if stripped.startswith("evals/fixtures/") or stripped.startswith("fixtures/"):
         return "fixture"
-    if segment_set.intersection({"example", "examples", "sample", "samples"}):
+    if (
+        stripped.startswith("examples/")
+        or stripped.startswith("example/")
+        or stripped.startswith("samples/")
+        or stripped.startswith("sample/")
+    ):
         return "example"
-    if segment_set.intersection({"doc", "docs"}):
+    if stripped.startswith("docs/") or stripped.startswith("doc/"):
         return "docs"
     return "source"
 
@@ -542,14 +556,20 @@ class ContextEngineService(BaseService):
             if not file_path:
                 continue
             via = ", ".join(item.get("via", [])[:2]) or "an intermediate caller"
+            category = str(item.get("category") or "")
+            framework_role = self._framework_role_for_file(file_path, category)
             reasons[file_path] = {
                 "file": file_path,
-                "role": "indirect_dependent",
+                "role": framework_role or "indirect_dependent",
                 "certainty": "probable",
-                "evidence_type": "dependency_expansion",
+                "evidence_type": "framework_wiring" if framework_role else "dependency_expansion",
                 "evidence_strength": "medium",
-                "reason": f"Depends on a direct caller through {via}.",
-                "priority": 70,
+                "reason": (
+                    f"Framework wiring reaches the target through {via}."
+                    if framework_role else
+                    f"Depends on a direct caller through {via}."
+                ),
+                "priority": 75 if framework_role else 70,
             }
 
         for file_path in impact_context.get("symbol_impact", {}).get("top_files", []) or []:
@@ -702,6 +722,15 @@ class ContextEngineService(BaseService):
             if len(matches) >= max_related:
                 break
         return matches
+
+    def _framework_role_for_file(self, file_path: str, category: str) -> Optional[str]:
+        normalized = file_path.replace("\\", "/").lower()
+        category = (category or "").lower()
+        if category in {"routes", "router", "navigation", "middleware"}:
+            return "framework_entrypoint"
+        if any(token in normalized for token in ("/routes/", "/router/", "/navigation/", "/middleware/")):
+            return "framework_entrypoint"
+        return None
 
     def _framework_candidate_paths(self, structure) -> List[str]:
         candidate_dirs = []
@@ -892,7 +921,20 @@ class ContextEngineService(BaseService):
         if not ranked:
             return None
         ranked = self._rerank_query_hits(query, ranked)
+        query_tokens = set(_tokenize_text(query))
+        wants_auxiliary = any(
+            query_tokens.intersection(tokens)
+            for tokens in _QUERY_AUXILIARY_TOKENS.values()
+        )
         top = ranked[0]
+        if not wants_auxiliary and (top.get("path_role") or _classify_path_role(top.get("file"))) != "source":
+            best_source = next(
+                (item for item in ranked if (item.get("path_role") or _classify_path_role(item.get("file"))) == "source"),
+                None,
+            )
+            if best_source is not None:
+                top = best_source
+                ranked = [top] + [item for item in ranked if item is not top]
         second = ranked[1] if len(ranked) > 1 else None
         score = float(top.get("adjusted_score") or top.get("score") or 0.0)
         second_score = float(second.get("adjusted_score") or second.get("score") or 0.0) if second else 0.0

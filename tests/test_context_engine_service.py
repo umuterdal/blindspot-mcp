@@ -783,6 +783,48 @@ class SignalEnrichmentTests(unittest.TestCase):
             "blindspot/indexing/strategies/typescript_strategy.py",
         )
 
+    def test_query_prefers_source_candidate_over_test_candidate_when_query_is_not_test_related(self):
+        """FP guard: exact token overlap inside a test symbol must not beat
+        the best source implementation unless the query explicitly asks for
+        test/spec content.
+        """
+        os.makedirs(os.path.join(self.tmp.name, "src", "main", "java", "com", "example", "controller"), exist_ok=True)
+        os.makedirs(os.path.join(self.tmp.name, "src", "test", "java", "com", "example", "controller"), exist_ok=True)
+        with open(
+            os.path.join(self.tmp.name, "src", "main", "java", "com", "example", "controller", "CheckoutController.java"),
+            "w",
+            encoding="utf-8",
+        ) as handle:
+            handle.write("class CheckoutController { double quoteTotal() { return 0; } }\n")
+        with open(
+            os.path.join(self.tmp.name, "src", "test", "java", "com", "example", "controller", "CheckoutControllerTest.java"),
+            "w",
+            encoding="utf-8",
+        ) as handle:
+            handle.write("class CheckoutControllerTest { void testQuoteTotal() {} }\n")
+        ctx = _build_ctx_with_fake_index(
+            self.tmp.name,
+            search_hits=[
+                {"symbol_id": "test", "file": "src/test/java/com/example/controller/CheckoutControllerTest.java",
+                 "short_name": "CheckoutControllerTest.testQuoteTotal", "score": 5.65},
+                {"symbol_id": "source", "file": "src/main/java/com/example/controller/CheckoutController.java",
+                 "short_name": "CheckoutController.quoteTotal", "score": 5.55},
+            ],
+        )
+        patches = self._patch_structural(direct_callers=[], indirect_dependents=[])
+        with patches[0], patches[1], patches[2], patches[3], patches[4]:
+            result = ContextEngineService(ctx).get_context(
+                query="pricing quote total",
+                intent="before_edit",
+                include_source=False,
+            )
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(
+            result["query_resolution"]["target"],
+            "src/main/java/com/example/controller/CheckoutController.java",
+        )
+
     # ---- 4. Ranking stability --------------------------------------------
 
     def test_ranking_priority_order_direct_caller_over_all_auxiliary_signals(self):

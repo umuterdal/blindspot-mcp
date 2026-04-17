@@ -129,6 +129,9 @@ FIXTURES = [
                 "app/Http/Controllers/CheckoutController.php",
                 "tests/Feature/CheckoutControllerTest.php",
             },
+            "related_file_roles": {
+                "routes/web.php": "framework_entrypoint",
+            },
         },
     },
     {
@@ -202,6 +205,15 @@ def _evaluate_fixture(root: Path, fixture: dict[str, Any]) -> dict[str, Any]:
         checks["indirect_dependents"] = expected["indirect_dependents"].issubset(indirect_files)
     if "related_files" in expected:
         checks["related_files"] = expected["related_files"].issubset(related_files)
+    if "related_file_roles" in expected:
+        produced_roles = {
+            item.get("file"): item.get("role")
+            for item in result.get("related_file_reasons", [])
+        }
+        checks["related_file_roles"] = all(
+            produced_roles.get(path) == role
+            for path, role in expected["related_file_roles"].items()
+        )
 
     # Exact-set precision: the produced set must equal the expected set.
     for key, expected_set in expected_exact.items():
@@ -222,6 +234,7 @@ def _evaluate_fixture(root: Path, fixture: dict[str, Any]) -> dict[str, Any]:
             "confidence": result.get("confidence"),
             "blast_radius": result.get("blast_radius"),
             "related_files": result.get("related_files"),
+            "related_file_reasons": result.get("related_file_reasons"),
             "direct_callers": sorted(direct_files),
             "indirect_dependents": sorted(indirect_files),
         },
