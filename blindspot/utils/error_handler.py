@@ -41,7 +41,7 @@ def handle_mcp_errors(return_type: str = 'str') -> Callable:
 
         @mcp.tool()
         @handle_mcp_errors(return_type='dict')
-        def search_code_advanced(pattern: str, ctx: Context, **kwargs) -> Dict[str, Any]:
+        def search_code(pattern: str, ctx: Context, **kwargs) -> Dict[str, Any]:
             return SearchService(ctx).search_code(pattern, **kwargs)
     """
     def decorator(func: Callable) -> Callable:

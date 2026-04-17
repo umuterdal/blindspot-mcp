@@ -73,12 +73,24 @@ class ContextHelper:
         """
         Get the unified index manager from the context.
 
+        Falls back to the process-global manager when the lifespan
+        context has no explicit instance attached, which is the case
+        for ad-hoc harnesses such as the evaluation runner.
+
         Returns:
             The UnifiedIndexManager instance, or None if not available
         """
+        mgr = None
         try:
-            return getattr(self.ctx.request_context.lifespan_context, 'index_manager', None)
+            mgr = getattr(self.ctx.request_context.lifespan_context, 'index_manager', None)
         except AttributeError:
+            mgr = None
+        if mgr is not None:
+            return mgr
+        try:
+            from ..indexing import get_index_manager
+            return get_index_manager()
+        except Exception:
             return None
 
     def validate_base_path(self) -> bool:

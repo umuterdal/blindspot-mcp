@@ -1,8 +1,5 @@
-"""
-Filesystem Tools - Technical components for file system operations.
-"""
+"""Filesystem helpers used by the core services."""
 
-from .file_matching_tool import FileMatchingTool
 from .file_system_tool import FileSystemTool
 
-__all__ = ['FileMatchingTool', 'FileSystemTool']
+__all__ = ["FileSystemTool"]

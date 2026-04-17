@@ -67,6 +67,116 @@ _FRAMEWORK_DEFAULTS: Dict[str, Dict[str, str]] = {
         "middleware": "src/middleware",
         "tests": "tests",
     },
+    "node": {
+        "models": "src/models",
+        "controllers": "src/controllers",
+        "views": "src/views",
+        "services": "src/services",
+        "migrations": "migrations",
+        "routes": "src/routes",
+        "middleware": "src/middleware",
+        "tests": "tests",
+    },
+    "nestjs": {
+        "models": "src",
+        "controllers": "src",
+        "views": "src",
+        "services": "src",
+        "migrations": "src/migrations",
+        "routes": "src",
+        "middleware": "src",
+        "tests": "test",
+    },
+    "nuxt": {
+        "models": "server/models",
+        "controllers": "server/api",
+        "views": "pages",
+        "services": "composables",
+        "migrations": "server/migrations",
+        "routes": "pages",
+        "middleware": "middleware",
+        "tests": "test",
+    },
+    "sveltekit": {
+        "models": "src/lib/server",
+        "controllers": "src/routes",
+        "views": "src/routes",
+        "services": "src/lib",
+        "migrations": "migrations",
+        "routes": "src/routes",
+        "middleware": "src",
+        "tests": "tests",
+    },
+    "fastapi": {
+        "models": "app/models",
+        "controllers": "app/api",
+        "views": "templates",
+        "services": "app/services",
+        "migrations": "alembic/versions",
+        "routes": "app/api",
+        "middleware": "app/middleware",
+        "tests": "tests",
+    },
+    "symfony": {
+        "models": "src/Entity",
+        "controllers": "src/Controller",
+        "views": "templates",
+        "services": "src/Service",
+        "migrations": "migrations",
+        "routes": "config/routes",
+        "middleware": "src/EventSubscriber",
+        "tests": "tests",
+    },
+    "go": {
+        "models": "internal",
+        "controllers": "internal",
+        "views": "web",
+        "services": "internal",
+        "migrations": "migrations",
+        "routes": "cmd",
+        "middleware": "internal/middleware",
+        "tests": "tests",
+    },
+    "spring": {
+        "models": "src/main/java",
+        "controllers": "src/main/java",
+        "views": "src/main/resources/templates",
+        "services": "src/main/java",
+        "migrations": "src/main/resources/db/migration",
+        "routes": "src/main/java",
+        "middleware": "src/main/java",
+        "tests": "src/test/java",
+    },
+    "aspnet": {
+        "models": "Models",
+        "controllers": "Controllers",
+        "views": "Views",
+        "services": "Services",
+        "migrations": "Migrations",
+        "routes": "Controllers",
+        "middleware": "Middleware",
+        "tests": "Tests",
+    },
+    "flutter": {
+        "models": "lib/models",
+        "controllers": "lib/screens",
+        "views": "lib/screens",
+        "services": "lib/services",
+        "migrations": "migrations",
+        "routes": "lib/router",
+        "middleware": "lib/middleware",
+        "tests": "test",
+    },
+    "reactnative": {
+        "models": "src/models",
+        "controllers": "src/screens",
+        "views": "src/screens",
+        "services": "src/services",
+        "migrations": "migrations",
+        "routes": "src/navigation",
+        "middleware": "src/middleware",
+        "tests": "__tests__",
+    },
     "none": {},
 }
 
@@ -77,6 +187,7 @@ _LANGUAGE_EXTENSIONS: Dict[str, List[str]] = {
     "typescript": [".ts", ".tsx"],
     "python": [".py", ".pyw"],
     "go": [".go"],
+    "dart": [".dart"],
     "rust": [".rs"],
     "java": [".java"],
     "kotlin": [".kt", ".kts"],
@@ -92,6 +203,9 @@ _TEMPLATE_EXTENSIONS: Dict[str, List[str]] = {
     "rails": [".erb", ".haml", ".slim"],
     "nextjs": [".tsx", ".jsx"],
     "express": [".ejs", ".hbs", ".pug"],
+    "nuxt": [".vue"],
+    "sveltekit": [".svelte"],
+    "reactnative": [".tsx", ".jsx"],
     "none": [],
 }
 
@@ -237,6 +351,17 @@ def _detect_language(project_path: str) -> Optional[str]:
 def _detect_framework(project_path: str, language: Optional[str]) -> Optional[str]:
     """Auto-detect framework from project files."""
     if language == "php":
+        composer = os.path.join(project_path, "composer.json")
+        if os.path.isfile(composer):
+            try:
+                import json
+                with open(composer, "r") as f:
+                    pkg = json.load(f)
+                deps = {**pkg.get("require", {}), **pkg.get("require-dev", {})}
+                if "symfony/framework-bundle" in deps:
+                    return "symfony"
+            except Exception as e:
+                logger.debug("Failed to parse composer.json for framework detection: %s", e)
         if os.path.exists(os.path.join(project_path, "artisan")):
             return "laravel"
     elif language in ("javascript", "typescript"):
@@ -255,8 +380,12 @@ def _detect_framework(project_path: str, language: Optional[str]) -> Optional[st
                     return "nuxt"
                 if "@sveltejs/kit" in deps:
                     return "sveltekit"
+                if "react-native" in deps or "expo" in deps:
+                    return "reactnative"
                 if "express" in deps:
                     return "express"
+                if any(pkg in deps for pkg in ("fastify", "koa", "hono", "@hapi/hapi")):
+                    return "node"
             except Exception as e:
                 logger.debug("Failed to parse package.json for framework detection: %s", e)
     elif language == "python":
@@ -349,19 +478,8 @@ def _detect_framework(project_path: str, language: Optional[str]) -> Optional[st
             except Exception as e:
                 logger.debug("Failed to read pubspec.yaml: %s", e)
 
-    # Check for React Native (separate from Next.js)
-    if language in ("javascript", "typescript"):
-        pkg_path = os.path.join(project_path, "package.json")
-        if os.path.isfile(pkg_path):
-            try:
-                import json
-                with open(pkg_path, "r") as f:
-                    pkg = json.load(f)
-                deps = {**pkg.get("dependencies", {}), **pkg.get("devDependencies", {})}
-                if "react-native" in deps and "next" not in deps:
-                    return "reactnative"
-            except Exception as e:
-                logger.debug("Failed to parse package.json for React Native detection: %s", e)
+    if language in ("javascript", "typescript") and os.path.isfile(os.path.join(project_path, "package.json")):
+        return "node"
 
     return "none"
 
@@ -427,7 +545,8 @@ def detect_workspaces(project_path: str) -> List[Dict[str, str]]:
             if os.path.isdir(sub):
                 # Check if it has its own project indicator
                 indicators = ["package.json", "go.mod", "Cargo.toml", "pyproject.toml",
-                              "requirements.txt", "composer.json", "Gemfile", "manage.py"]
+                              "requirements.txt", "composer.json", "Gemfile", "manage.py",
+                              "pubspec.yaml"]
                 for ind in indicators:
                     if os.path.isfile(os.path.join(sub, ind)):
                         workspace_dirs.append(sub)
@@ -495,7 +614,42 @@ def get_project_structure(project_path: str) -> ProjectStructure:
         scan_dirs.update(config.scan_dirs)
 
     # Ensure we also scan root-level common directories that exist
-    for extra_dir in ["app", "lib", "hooks", "store", "services", "components", "utils", "types"]:
+    for extra_dir in [
+        "app",
+        "src",
+        "lib",
+        "pages",
+        "api",
+        "routes",
+        "server",
+        "client",
+        "mobile",
+        "web",
+        "pkg",
+        "internal",
+        "cmd",
+        "domain",
+        "shared",
+        "modules",
+        "features",
+        "hooks",
+        "store",
+        "stores",
+        "services",
+        "components",
+        "screens",
+        "navigation",
+        "router",
+        "providers",
+        "contexts",
+        "composables",
+        "utils",
+        "types",
+        "tests",
+        "test",
+        "__tests__",
+        "spec",
+    ]:
         full = os.path.join(project_path, extra_dir)
         if os.path.isdir(full) and extra_dir not in scan_dirs.values():
             # Add with a sensible category name if not already covered

@@ -14,7 +14,7 @@ import threading
 from contextlib import contextmanager
 from typing import Any, Dict, Generator, Optional
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 6
 
 
 class SQLiteSchemaMismatchError(RuntimeError):
@@ -140,6 +140,116 @@ class SQLiteIndexStore:
         conn.execute(
             """
             CREATE INDEX IF NOT EXISTS idx_symbols_short_name ON symbols(short_name)
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS refs (
+                caller_symbol_id TEXT NOT NULL,
+                called_symbol_id TEXT NOT NULL,
+                caller_file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+                called_file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+                PRIMARY KEY (caller_symbol_id, called_symbol_id)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_refs_called ON refs(called_symbol_id)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_refs_caller ON refs(caller_symbol_id)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_refs_called_file ON refs(called_file_id)
+            """
+        )
+        # Git co-change signal: per-file-pair co-change counts over the
+        # bounded window of recent commits. ``file_a`` < ``file_b`` is
+        # enforced by the writer to avoid duplicate edges.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS cochanges (
+                file_a TEXT NOT NULL,
+                file_b TEXT NOT NULL,
+                count INTEGER NOT NULL,
+                last_seen TEXT,
+                PRIMARY KEY (file_a, file_b)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_cochanges_file_a ON cochanges(file_a)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_cochanges_file_b ON cochanges(file_b)
+            """
+        )
+        # BM25 retrieval table: one row per indexed symbol with the
+        # tokenised searchable blob and pre-computed document length.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS search_docs (
+                symbol_id TEXT PRIMARY KEY,
+                file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+                tokens TEXT NOT NULL,
+                doc_length INTEGER NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_search_docs_file ON search_docs(file_id)
+            """
+        )
+        # Inverted index for BM25: term -> symbol_id -> tf
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS search_postings (
+                term TEXT NOT NULL,
+                symbol_id TEXT NOT NULL,
+                tf INTEGER NOT NULL,
+                PRIMARY KEY (term, symbol_id)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_search_postings_term ON search_postings(term)
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS search_stats (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+            """
+        )
+        # Optional dense vector index for semantic retrieval. Populated
+        # only when an embedding backend is available; the context engine
+        # gracefully skips it otherwise.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS embeddings (
+                symbol_id TEXT PRIMARY KEY,
+                file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+                model TEXT NOT NULL,
+                dim INTEGER NOT NULL,
+                vector BLOB NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_embeddings_file ON embeddings(file_id)
             """
         )
 

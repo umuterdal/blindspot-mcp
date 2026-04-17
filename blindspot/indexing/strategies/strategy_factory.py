@@ -12,6 +12,7 @@ from .java_strategy import JavaParsingStrategy
 from .kotlin_strategy import KotlinParsingStrategy
 from .csharp_strategy import CSharpParsingStrategy
 from .go_strategy import GoParsingStrategy
+from .dart_strategy import DartParsingStrategy
 from .objective_c_strategy import ObjectiveCParsingStrategy
 from .zig_strategy import ZigParsingStrategy
 from .php_strategy import PHPParsingStrategy
@@ -138,6 +139,11 @@ class StrategyFactory:
                 go_strategy = GoParsingStrategy()
                 for ext in go_strategy.get_supported_extensions():
                     self._strategies[ext] = go_strategy
+
+                # Dart / Flutter
+                dart_strategy = DartParsingStrategy()
+                for ext in dart_strategy.get_supported_extensions():
+                    self._strategies[ext] = dart_strategy
 
                 # Objective-C
                 objc_strategy = ObjectiveCParsingStrategy()

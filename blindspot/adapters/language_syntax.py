@@ -82,7 +82,16 @@ class LanguageSyntax:
             return []
         results = []
         for m in re.finditer(self.function_pattern, content, re.MULTILINE):
-            info = {"name": m.group("name"), "line": content[:m.start()].count("\n") + 1}
+            groupdict = m.groupdict()
+            name = groupdict.get("name")
+            if not name:
+                for key, value in groupdict.items():
+                    if key.startswith("name") and value:
+                        name = value
+                        break
+            if not name:
+                continue
+            info = {"name": name, "line": content[:m.start()].count("\n") + 1}
             results.append(info)
         return results
 
@@ -98,6 +107,20 @@ class LanguageSyntax:
         if self.is_comment(stripped):
             return None
 
+        # PHP: `use X\Y\Z;` at top of file is an import; `use TraitName;`
+        # inside a class body is trait inclusion. Without multi-line context
+        # we rely on structural hints — bare single-word identifier with no
+        # namespace separator is classified as mixin, anything else as import.
+        if self.name == "php" and self.mixin_keywords and \
+                re.match(r'^use\s+', stripped):
+            use_target_match = re.match(r'^use\s+([\w\\]+(?:\s*,\s*[\w\\]+)*)\s*;', stripped)
+            if use_target_match and re.search(rf'\b{re.escape(symbol)}\b', stripped):
+                targets = [t.strip() for t in use_target_match.group(1).split(",")]
+                symbol_target = next((t for t in targets if t.split("\\")[-1] == symbol), None)
+                if symbol_target is not None and "\\" not in symbol_target:
+                    return "mixin_include"
+                return "import"
+
         # Import
         for kw in self.import_keywords:
             if re.search(rf'\b{kw}\b.*\b{re.escape(symbol)}\b', stripped):
@@ -112,6 +135,10 @@ class LanguageSyntax:
         # Instantiation
         if re.search(rf'\bnew\s+{re.escape(symbol)}\b', stripped):
             return "instantiation"
+
+        if self.name in {"javascript", "typescript"}:
+            if re.search(rf'<\s*/?\s*{re.escape(symbol)}\b', stripped):
+                return "instantiation"
 
         # Static call
         if self.static_access:
@@ -200,8 +227,11 @@ _JAVASCRIPT = LanguageSyntax(
     mixin_keywords=[],
     debug_functions=["console.log(", "console.warn(", "console.error(", "debugger;"],
     class_pattern=r'class\s+(?P<name>\w+)(?:\s+extends\s+(?P<parent>\w+))?',
-    function_pattern=r'(?:async\s+)?(?:function\s+(?P<name>\w+)|(?P<name2>\w+)\s*(?:=|:)\s*(?:async\s+)?(?:function|\([^)]*\)\s*=>))',
-    import_pattern=r'(?:import\s+.+\s+from|require\s*\()\s*[\'"]([^\'"]+)[\'"]',
+    function_pattern=(
+        r'^\s*(?:export\s+)?(?:async\s+)?function\s+(?P<name>\w+)\s*\('
+        r'|^\s*(?:export\s+)?(?:const|let|var)\s+(?P<name2>\w+)\s*=\s*(?:async\s+)?(?:function\b|\([^)]*\)\s*=>)'
+    ),
+    import_pattern=r'(?:import\s+(?:.+?\s+from\s+)?|export\s+.+?\s+from\s+|require\s*\()\s*[\'"]([^\'"]+)[\'"]',
     instantiation_pattern=r'new\s+(\w+)',
 )
 
@@ -222,9 +252,41 @@ _TYPESCRIPT = LanguageSyntax(
     mixin_keywords=[],
     debug_functions=["console.log(", "console.warn(", "console.error(", "debugger;"],
     class_pattern=r'(?:abstract\s+)?class\s+(?P<name>\w+)(?:\s+extends\s+(?P<parent>\w+))?(?:\s+implements\s+(?P<interfaces>[^{]+))?',
-    function_pattern=r'(?:async\s+)?(?:function\s+(?P<name>\w+)|(?P<name2>\w+)\s*(?:=|:)\s*(?:async\s+)?(?:function|\([^)]*\)\s*=>))',
-    import_pattern=r'import\s+.+\s+from\s+[\'"]([^\'"]+)[\'"]',
+    function_pattern=(
+        r'^\s*(?:export\s+)?(?:async\s+)?function\s+(?P<name>\w+)\s*\('
+        r'|^\s*(?:export\s+)?(?:const|let|var)\s+(?P<name2>\w+)\s*(?::[^=]+)?=\s*(?:async\s+)?(?:function\b|\([^)]*\)\s*=>)'
+    ),
+    import_pattern=r'(?:import\s+(?:.+?\s+from\s+)?|export\s+.+?\s+from\s+)\s*[\'"]([^\'"]+)[\'"]',
     instantiation_pattern=r'new\s+(\w+)',
+)
+
+_DART = LanguageSyntax(
+    name="dart",
+    extensions=[".dart"],
+    function_keyword="",
+    class_keyword="class",
+    import_keywords=["import", "export", "part"],
+    visibility_keywords=[],
+    instance_access=".",
+    static_access=".",
+    variable_prefix="",
+    line_comment="//",
+    alt_line_comment=None,
+    extends_keyword="extends",
+    implements_keyword="implements",
+    mixin_keywords=["with", "mixin"],
+    debug_functions=["print(", "debugPrint("],
+    class_pattern=(
+        r'^\s*(?:abstract\s+|base\s+|sealed\s+|final\s+)?class\s+(?P<name>\w+)'
+        r'(?:\s+extends\s+(?P<parent>\w+))?'
+        r'(?:\s+implements\s+(?P<interfaces>[^{]+))?'
+    ),
+    function_pattern=(
+        r'^\s*(?!if\b|for\b|while\b|switch\b|catch\b|return\b)'
+        r'(?:static\s+)?(?:[\w<>\?\[\],]+\s+)+(?P<name>\w+)\s*\([^;\n]*\)\s*(?:async\s*)?(?:\{|=>)'
+    ),
+    import_pattern=r'(?:import|export|part)\s+[\'"]([^\'"]+)[\'"]',
+    instantiation_pattern=r'\b(?:const|final|var|late)?\s*' + r'(\w+)\s*\(',
 )
 
 _GO = LanguageSyntax(
@@ -321,6 +383,7 @@ _SYNTAX_MAP: Dict[str, LanguageSyntax] = {
     "python": _PYTHON,
     "javascript": _JAVASCRIPT,
     "typescript": _TYPESCRIPT,
+    "dart": _DART,
     "go": _GO,
     "rust": _RUST,
     "java": _JAVA,

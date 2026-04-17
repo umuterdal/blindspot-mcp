@@ -7,14 +7,40 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FutureTimeoutError
 from typing import Dict, Iterable, List, Optional, Tuple
 
+
+# Reject short_name values that are clearly code fragments rather than
+# identifiers. Strategies that fail to extract a clean name sometimes
+# emit truncated source like ``"s() {\n            "``; those poison
+# BM25 alternatives and suffix-based call resolution.
+#
+# FP guard: allow alphanumerics, underscores, dots (``Class.method``),
+# dollar (PHP/JS), hyphen, and Unicode letters. Reject anything that
+# contains whitespace, brackets, quotes, or newlines.
+# FN guard: also reject empty/overly long names (>128 chars) which are
+# invariably source spans, not identifiers.
+_SHORT_NAME_BAD_CHARS = re.compile(r"[\s\(\)\{\}\[\]\"';,`]")
+_SHORT_NAME_MAX_LEN = 128
+
+
+def _is_clean_short_name(name: Optional[str]) -> bool:
+    if not name:
+        return False
+    if len(name) > _SHORT_NAME_MAX_LEN:
+        return False
+    return _SHORT_NAME_BAD_CHARS.search(name) is None
+
 from .json_index_builder import JSONIndexBuilder
 from .sqlite_store import SQLiteIndexStore
 from .models import FileInfo, SymbolInfo
+from .cochange import collect_cochanges, write_cochanges
+from .search_index import build_search_index
+from .embedding_index import build_embedding_index, embeddings_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -169,6 +195,34 @@ class SQLiteIndexBuilder(JSONIndexBuilder):
                 symbol_types,
             )
             self._resolve_pending_calls_sqlite(conn, pending_calls)
+
+            # Co-change signal: bounded git-log scan, indexed files only.
+            try:
+                indexed_paths = {
+                    row["path"] for row in conn.execute("SELECT path FROM files")
+                }
+                counts, last_seen = collect_cochanges(
+                    self.project_path, indexed_files=indexed_paths
+                )
+                write_cochanges(conn, counts, last_seen)
+                if counts:
+                    logger.info("Co-change pairs recorded: %s", len(counts))
+            except Exception as exc:  # pragma: no cover - best effort
+                logger.warning("Co-change extraction failed: %s", exc)
+
+            # BM25 retrieval index over symbol short_name + signature + docstring.
+            try:
+                build_search_index(conn)
+            except Exception as exc:  # pragma: no cover - best effort
+                logger.warning("Search index build failed: %s", exc)
+
+            # Optional dense embedding index — opt-in, skipped otherwise.
+            if embeddings_enabled():
+                try:
+                    build_embedding_index(conn)
+                except Exception as exc:  # pragma: no cover - best effort
+                    logger.warning("Embedding index build failed: %s", exc)
+
             try:
                 conn.execute("PRAGMA optimize")
             except Exception:  # pragma: no cover - best effort
@@ -246,6 +300,10 @@ class SQLiteIndexBuilder(JSONIndexBuilder):
                         symbol_rows,
                     )
 
+                file_pending = list(getattr(file_info, "pending_calls", []) or [])
+                if file_pending:
+                    self._resolve_pending_calls_sqlite(conn, file_pending)
+
             logger.debug(
                 "reindex_file: updated %s (%d symbols)",
                 rel_path,
@@ -259,6 +317,12 @@ class SQLiteIndexBuilder(JSONIndexBuilder):
     # Internal helpers -------------------------------------------------
 
     def _reset_database(self, conn):
+        conn.execute("DELETE FROM refs")
+        conn.execute("DELETE FROM embeddings")
+        conn.execute("DELETE FROM search_postings")
+        conn.execute("DELETE FROM search_docs")
+        conn.execute("DELETE FROM search_stats")
+        conn.execute("DELETE FROM cochanges")
         conn.execute("DELETE FROM symbols")
         conn.execute("DELETE FROM files")
         conn.execute(
@@ -298,8 +362,13 @@ class SQLiteIndexBuilder(JSONIndexBuilder):
     ) -> List[Tuple[str, int, Optional[str], Optional[int], Optional[int], Optional[str], Optional[str], str, str]]:
         rows: List[Tuple[str, int, Optional[str], Optional[int], Optional[int], Optional[str], Optional[str], str, str]] = []
         for symbol_id, symbol_info in symbols.items():
-            called_by = json.dumps(symbol_info.called_by or [])
             short_name = symbol_id.split("::")[-1]
+            # Skip symbols whose short_name is a raw code fragment
+            # rather than an identifier; they are BM25 noise and would
+            # never be resolvable by name anyway.
+            if not _is_clean_short_name(short_name):
+                continue
+            called_by = json.dumps(symbol_info.called_by or [])
             rows.append(
                 (
                     symbol_id,
@@ -344,51 +413,60 @@ class SQLiteIndexBuilder(JSONIndexBuilder):
         conn,
         pending_calls: List[Tuple[str, str]]
     ) -> None:
-        """Resolve cross-file call relationships directly in SQLite storage."""
+        """Resolve cross-file call relationships directly in SQLite storage.
+
+        Produces two outputs:
+        - Back-compatible `called_by` JSON column on each `symbols` row.
+        - Normalized rows in `refs(caller_symbol_id, called_symbol_id,
+          caller_file_id, called_file_id)` used by the query-time engine
+          for O(1) cross-file reference lookup.
+        """
         if not pending_calls:
             return
 
-        rows = list(conn.execute("SELECT symbol_id, short_name, called_by FROM symbols"))
+        rows = list(conn.execute(
+            "SELECT symbol_id, short_name, called_by, file_id FROM symbols"
+        ))
         symbol_map = {row["symbol_id"]: row for row in rows}
 
-        def _add_unique(mapping: Dict[str, Optional[str]], key: str, symbol_id: str) -> None:
-            if not key:
-                return
-            if key not in mapping:
-                mapping[key] = symbol_id
-                return
-            if mapping[key] != symbol_id:
-                mapping[key] = None
-
-        unique_short_name: Dict[str, Optional[str]] = {}
-        unique_suffix: Dict[str, Optional[str]] = {}
+        short_name_index: Dict[str, List[str]] = defaultdict(list)
+        suffix_index: Dict[str, List[str]] = defaultdict(list)
         for row in rows:
             short_name = row["short_name"] or ""
             symbol_id = row["symbol_id"]
-            _add_unique(unique_short_name, short_name, symbol_id)
+            if short_name:
+                short_name_index[short_name].append(symbol_id)
 
             parts = short_name.split(".") if short_name else []
             # Record proper suffixes only (exclude the full name) to match the
             # previous suffix-scan behavior that required a leading dot.
             for i in range(1, len(parts)):
                 suffix = ".".join(parts[-i:])
-                _add_unique(unique_suffix, suffix, symbol_id)
+                suffix_index[suffix].append(symbol_id)
 
         updates: Dict[str, set] = defaultdict(set)
+        ref_rows: List[Tuple[str, str, int, int]] = []
 
         for caller, called in pending_calls:
-            target_id: Optional[str] = None
+            target_ids: List[str] = []
             if called in symbol_map:
-                target_id = called
+                target_ids = [called]
             else:
-                target_id = unique_short_name.get(called)
-                if not target_id:
-                    target_id = unique_suffix.get(called)
+                target_ids = short_name_index.get(called) or suffix_index.get(called) or []
 
-            if not target_id:
+            if not target_ids:
                 continue
 
-            updates[target_id].add(caller)
+            for target_id in target_ids:
+                updates[target_id].add(caller)
+
+                caller_row = symbol_map.get(caller)
+                target_row = symbol_map.get(target_id)
+                if caller_row and target_row:
+                    caller_file_id = caller_row["file_id"]
+                    called_file_id = target_row["file_id"]
+                    if caller_file_id is not None and called_file_id is not None:
+                        ref_rows.append((caller, target_id, caller_file_id, called_file_id))
 
         for symbol_id, callers in updates.items():
             row = symbol_map.get(symbol_id)
@@ -404,4 +482,17 @@ class SQLiteIndexBuilder(JSONIndexBuilder):
             conn.execute(
                 "UPDATE symbols SET called_by=? WHERE symbol_id=?",
                 (json.dumps(merged), symbol_id),
+            )
+
+        if ref_rows:
+            conn.executemany(
+                """
+                INSERT OR IGNORE INTO refs(
+                    caller_symbol_id,
+                    called_symbol_id,
+                    caller_file_id,
+                    called_file_id
+                ) VALUES (?, ?, ?, ?)
+                """,
+                ref_rows,
             )

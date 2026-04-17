@@ -1,9 +1,9 @@
 [project]
 name = "blindspot-mcp"
-version = "0.1.5"
+version = "0.2.0"
 description = "The External Brain for AI Coding Agents — see what your LLM can't see. Provides instant, structured intelligence about your entire codebase without reading files into the AI's context window."
 readme = "README.md"
-license = {text = "MIT"}
+license = "MIT"
 requires-python = ">=3.12"
 authors = [
     {name = "Umut Erdal"},
@@ -14,7 +14,7 @@ keywords = [
     "ai",
     "coding-assistant",
     "code-intelligence",
-    "ripple-effect",
+    "context-engine",
     "refactoring",
     "code-analysis",
     "claude",
@@ -24,7 +24,6 @@ keywords = [
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
@@ -41,7 +40,6 @@ dependencies = [
     "tree-sitter-c-sharp>=0.23.0",
     "tree-sitter-kotlin>=0.23.0",
     "tree-sitter-zig>=0.23.0",
-    "watchdog>=4.0.0",
     "pyyaml>=6.0",
 ]
 

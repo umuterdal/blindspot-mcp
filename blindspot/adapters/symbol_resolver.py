@@ -1,8 +1,9 @@
 """Symbol resolver — language-agnostic symbol lookup using deep index.
 
-Uses the SQLite deep index (populated by tree-sitter parsers for 12+ languages)
-to resolve symbols, find references, trace hierarchies, and analyze impact
-without any hardcoded paths or language-specific logic.
+Primary path: query the SQLite deep index (symbols + refs tables) for
+cross-file callers, impact, and hierarchy. Text scanning is kept only as
+a supplement for files whose parser does not emit cross-file call edges
+(templates, regex-based strategies, fallback languages).
 """
 
 import logging
@@ -15,12 +16,33 @@ from .project_structure import ProjectStructure
 
 logger = logging.getLogger(__name__)
 
+# Extensions whose parsing strategies emit cross-file `pending_calls`,
+# so their caller edges already live in the normalized `refs` table.
+_INDEXED_CALLER_EXTENSIONS: Set[str] = {
+    ".py", ".pyw",
+    ".js", ".jsx", ".mjs", ".cjs",
+    ".ts", ".tsx",
+    ".kt", ".kts",
+    ".cs",
+    ".dart",
+    ".go",
+}
+
+
+def _has_indexed_caller_edges(rel_path: str) -> bool:
+    """Return True when the file's language populates the refs table."""
+    lower = rel_path.lower()
+    if lower.endswith(".blade.php"):
+        return False
+    return os.path.splitext(lower)[1] in _INDEXED_CALLER_EXTENSIONS
+
 
 class SymbolResolver:
     """Language-agnostic symbol resolution using deep index + file scanning.
 
-    All methods work with any language that has a tree-sitter parser.
-    Falls back to regex-based scanning for unsupported languages.
+    Primary path uses the SQLite `refs` table for cross-file callers.
+    Files whose parser does not populate `refs` are supplemented via a
+    narrow file scan scoped to that subset only.
     """
 
     def __init__(self, project_path: str, structure: ProjectStructure,
@@ -41,24 +63,55 @@ class SymbolResolver:
             return None
         return self.index_manager.get_file_summary(rel_path)
 
-    def get_symbol_info(self, rel_path: str, symbol_name: str) -> Optional[Dict]:
-        """Find a specific symbol's info (line, end_line, type, signature)."""
+    def get_symbol_info(
+        self,
+        rel_path: str,
+        symbol_name: str,
+        owner: Optional[str] = None,
+    ) -> Optional[Dict]:
+        """Find a specific symbol's info (line, end_line, type, signature).
+
+        When ``owner`` is supplied (e.g. the enclosing class name), exact
+        owner-qualified matches are preferred over bare name matches. This
+        lets callers disambiguate identically-named methods such as
+        ``User.save`` versus ``Order.save`` within the same file.
+        """
         summary = self.get_file_symbols(rel_path)
         if not summary:
             return None
 
+        exact_match: Optional[Tuple[str, Dict[str, Any]]] = None
+        owner_match: Optional[Tuple[str, Dict[str, Any]]] = None
+        suffix_match: Optional[Tuple[str, Dict[str, Any]]] = None
+
+        owner_prefix = f"{owner}." if owner else None
+
         for pool_key in ("functions", "methods", "classes"):
             for item in summary.get(pool_key, []):
                 name = item.get("name", "")
-                if name == symbol_name or name.endswith(f".{symbol_name}"):
-                    return {
-                        "name": name,
-                        "type": pool_key.rstrip("es").rstrip("s"),
-                        "line": item.get("line"),
-                        "end_line": item.get("end_line"),
-                        "signature": item.get("signature", ""),
-                    }
-        return None
+                if not name:
+                    continue
+                if name == symbol_name and exact_match is None:
+                    exact_match = (pool_key, item)
+                    continue
+                if owner_prefix and name == f"{owner_prefix}{symbol_name}" and owner_match is None:
+                    owner_match = (pool_key, item)
+                    continue
+                if name.endswith(f".{symbol_name}") and suffix_match is None:
+                    suffix_match = (pool_key, item)
+
+        chosen = owner_match or exact_match or suffix_match
+        if not chosen:
+            return None
+
+        pool_key, item = chosen
+        return {
+            "name": item.get("name", ""),
+            "type": pool_key.rstrip("es").rstrip("s"),
+            "line": item.get("line"),
+            "end_line": item.get("end_line"),
+            "signature": item.get("signature", ""),
+        }
 
     def _list_indexed_files(self) -> List[str]:
         """Get all files from the deep index."""
@@ -73,6 +126,23 @@ class SymbolResolver:
         """Get all classes from deep index across the project."""
         if not self.index_manager:
             return []
+
+        # Prefer single SQL pass when supported by the index manager.
+        lister = getattr(self.index_manager, "list_all_classes", None)
+        if callable(lister):
+            try:
+                return [
+                    {
+                        "name": row.get("name", ""),
+                        "file": row.get("file", ""),
+                        "line": row.get("line"),
+                        "end_line": row.get("end_line"),
+                        "signature": row.get("signature", ""),
+                    }
+                    for row in lister()
+                ]
+            except Exception as e:
+                logger.debug("list_all_classes failed, falling back: %s", e)
 
         results = []
         try:
@@ -94,106 +164,169 @@ class SymbolResolver:
     # ── Cross-file reference finding (language-agnostic) ──────────
 
     def find_references(self, symbol: str, scope: str = "all",
-                        context_filter: Optional[str] = None) -> Dict[str, Any]:
-        """Find all files referencing a symbol using file scanning.
+                        context_filter: Optional[str] = None,
+                        definition_file: Optional[str] = None,
+                        owner: Optional[str] = None) -> Dict[str, Any]:
+        """Find all files referencing a symbol.
 
-        Unlike the Laravel version which only scans .php files in hardcoded dirs,
-        this scans ALL source files in configured scan dirs using the language
-        syntax adapter for classification.
+        Primary path: query the deep index `refs` table for cross-file
+        callers. This is O(log N) per callee and avoids re-reading source
+        files during the query phase.
+
+        Supplement path: scan only those source/template files whose
+        language strategy does not populate the refs table (templates,
+        regex-based strategies, fallback languages). This keeps behavior
+        correct for Blade/Dart/Go/ObjC while keeping the hot path index-backed.
 
         Args:
             symbol: Symbol name to search for
             scope: Category to filter ('all', 'models', 'controllers', etc.)
-            context_filter: Optional class/model name for context filtering
+            context_filter: Optional class/model name for context filtering.
+                When supplied, index callers are restricted to symbols
+                whose short_name starts with ``context_filter.``
+            definition_file: Optional path of the file that defines the
+                symbol. When supplied, only callees defined in that file
+                are considered (receiver-awareness).
 
         Returns:
             Dict with references list, total count, and metadata.
         """
-        results = {"symbol": symbol, "scope": scope, "references": [], "total": 0}
+        results: Dict[str, Any] = {
+            "symbol": symbol,
+            "scope": scope,
+            "references": [],
+            "total": 0,
+        }
         if context_filter:
             results["context_filter"] = context_filter
 
-        # Determine directories to scan
-        if scope == "all":
-            scan_dirs = self.structure.get_all_scan_dirs()
-            if not scan_dirs:
-                # No config — scan entire project
-                scan_dirs = ["."]
-        else:
-            rel_dir = self.structure.get_rel_dir(scope)
-            scan_dirs = [rel_dir] if rel_dir else ["."]
+        aggregated: Dict[str, Dict[str, Any]] = {}
+        index_query_available = False
 
-        seen_files: Set[str] = set()
+        # ── 1. Index-backed caller lookup ─────────────────────────────
+        find_callers = getattr(self.index_manager, "find_callers", None) \
+            if self.index_manager is not None else None
+        if callable(find_callers):
+            index_query_available = True
+            try:
+                caller_rows = find_callers(
+                    called_short_name=symbol,
+                    called_file_path=definition_file,
+                    owner=owner or context_filter,
+                )
+            except Exception as exc:
+                logger.debug("find_callers failed for %s: %s", symbol, exc)
+                caller_rows = []
 
-        for scan_dir in scan_dirs:
-            full_dir = os.path.join(self.project_path, scan_dir)
-            if not os.path.isdir(full_dir):
+            for row in caller_rows:
+                caller_file = row.get("caller_file")
+                if not caller_file:
+                    continue
+                if scope != "all" and not self._file_in_scope(caller_file, scope):
+                    continue
+                self._append_index_usage(aggregated, row, symbol)
+
+        # ── 2. Supplement with targeted text scan ─────────────────────
+        for rel_path, fpath in self._scan_candidates(scope):
+            if rel_path in aggregated:
+                continue
+            fname = os.path.basename(fpath)
+            if not (self.structure.is_source_file(fname)
+                    or self.structure.is_template_file(fname)):
+                continue
+            if index_query_available and _has_indexed_caller_edges(rel_path):
                 continue
 
-            for root, dirs, files in os.walk(full_dir):
-                # Prune excluded dirs
-                dirs[:] = [d for d in dirs if not self.structure.should_exclude(d)]
+            try:
+                with open(fpath, "r", encoding="utf-8", errors="replace") as f:
+                    content = f.read()
+            except Exception:
+                continue
 
-                for fname in files:
-                    fpath = os.path.join(root, fname)
-                    rel_path = os.path.relpath(fpath, self.project_path)
+            if symbol not in content:
+                continue
 
-                    # Skip already-scanned files (overlapping scan dirs)
-                    if rel_path in seen_files:
-                        continue
-                    seen_files.add(rel_path)
+            syntax = get_syntax_for_file(fname)
+            lines = content.split("\n")
+            usages: List[Dict[str, Any]] = []
 
-                    # Check if it's a source/template file
-                    if not (self.structure.is_source_file(fname) or
-                            self.structure.is_template_file(fname)):
-                        continue
+            for i, line in enumerate(lines, 1):
+                if symbol not in line:
+                    continue
 
-                    try:
-                        with open(fpath, "r", encoding="utf-8", errors="replace") as f:
-                            content = f.read()
-                    except Exception:
-                        continue
+                usage_type = syntax.classify_usage(line, symbol)
+                if not usage_type:
+                    continue
 
-                    if symbol not in content:
+                if context_filter and usage_type in ("method_call", "reference"):
+                    if not self._line_has_context(lines, i, context_filter, syntax):
                         continue
 
-                    syntax = get_syntax_for_file(fname)
-                    lines = content.split("\n")
-                    usages = []
+                usages.append({
+                    "line": i,
+                    "type": usage_type,
+                    "snippet": line.strip()[:120],
+                })
 
-                    for i, line in enumerate(lines, 1):
-                        if symbol not in line:
-                            continue
+            if usages:
+                category = self.structure.categorize_file(rel_path)
+                aggregated[rel_path] = {
+                    "file": rel_path,
+                    "category": category or "other",
+                    "usages": usages,
+                    "count": len(usages),
+                }
 
-                        usage_type = syntax.classify_usage(line, symbol)
-                        if not usage_type:
-                            continue
-
-                        # Context filtering: skip if context_filter set and
-                        # this line doesn't relate to the specified class
-                        if context_filter and usage_type in ("method_call", "reference"):
-                            if not self._line_has_context(
-                                lines, i, context_filter, syntax
-                            ):
-                                continue
-
-                        usages.append({
-                            "line": i,
-                            "type": usage_type,
-                            "snippet": line.strip()[:120],
-                        })
-
-                    if usages:
-                        category = self.structure.categorize_file(rel_path)
-                        results["references"].append({
-                            "file": rel_path,
-                            "category": category or "other",
-                            "usages": usages,
-                            "count": len(usages),
-                        })
-
-        results["total"] = sum(r["count"] for r in results["references"])
+        references = list(aggregated.values())
+        references.sort(key=lambda r: r["file"])
+        results["references"] = references
+        results["total"] = sum(r["count"] for r in references)
         return results
+
+    def _append_index_usage(
+        self,
+        aggregated: Dict[str, Dict[str, Any]],
+        row: Dict[str, Any],
+        symbol: str,
+    ) -> None:
+        """Add an index-sourced caller row into the aggregated results.
+
+        Index-sourced edges are tagged ``method_call`` by default. The
+        PHP strategy emits a synthetic ``__file_scope__`` caller for
+        top-level scripts (procedural entry points, Laravel bootstrap
+        hooks, WordPress-style front controllers); those edges carry
+        real cross-file signal but should **not** compete head-to-head
+        with regular in-method callers. They are retagged as
+        ``module_script`` so ``_usage_weight`` can deprioritize them
+        without erasing the evidence.
+        """
+        caller_file = row["caller_file"]
+        caller_line = row.get("caller_line") or 0
+        caller_short = row.get("caller_short_name") or ""
+
+        snippet = self._read_line_snippet(caller_file, caller_line) or (
+            f"{caller_short} calls {symbol}"
+        )
+
+        entry = aggregated.get(caller_file)
+        if entry is None:
+            category = self.structure.categorize_file(caller_file)
+            entry = {
+                "file": caller_file,
+                "category": category or "other",
+                "usages": [],
+                "count": 0,
+            }
+            aggregated[caller_file] = entry
+
+        usage_type = "module_script" if caller_short == "__file_scope__" else "method_call"
+        entry["usages"].append({
+            "line": caller_line,
+            "type": usage_type,
+            "snippet": snippet,
+            "in_symbol": caller_short,
+        })
+        entry["count"] = len(entry["usages"])
 
     def _line_has_context(self, lines: List[str], line_num: int,
                           context: str, syntax: LanguageSyntax) -> bool:
@@ -204,13 +337,63 @@ class SymbolResolver:
         window = "\n".join(lines[start:end])
         return context in window
 
+    def _scan_candidates(self, scope: str) -> List[Tuple[str, str]]:
+        """Return candidate (rel_path, abs_path) pairs for a given scope."""
+        if scope == "all":
+            return list(self.structure.walk_source_files())
+
+        rel_dir = self.structure.get_rel_dir(scope)
+        scan_dirs = [rel_dir] if rel_dir else ["."]
+        collected: List[Tuple[str, str]] = []
+        for scan_dir in scan_dirs:
+            full_dir = os.path.join(self.project_path, scan_dir)
+            if not os.path.isdir(full_dir):
+                continue
+            for root, dirs, files in os.walk(full_dir):
+                dirs[:] = [d for d in dirs if not self.structure.should_exclude(d)]
+                for fname in files:
+                    abs_path = os.path.join(root, fname)
+                    rel_path = os.path.relpath(abs_path, self.project_path)
+                    collected.append((rel_path, abs_path))
+        return collected
+
+    def _file_in_scope(self, rel_path: str, scope: str) -> bool:
+        """Check if a file falls within a named scope/category."""
+        if scope == "all":
+            return True
+        rel_dir = self.structure.get_rel_dir(scope)
+        if rel_dir:
+            norm = rel_path.replace(os.sep, "/")
+            prefix = rel_dir.replace(os.sep, "/").rstrip("/") + "/"
+            if norm.startswith(prefix):
+                return True
+        category = self.structure.categorize_file(rel_path)
+        return category == scope
+
+    def _read_line_snippet(self, rel_path: str, line_number: int,
+                           max_len: int = 120) -> Optional[str]:
+        """Read a single line from the project file for snippet display."""
+        if not line_number or line_number <= 0:
+            return None
+        abs_path = os.path.join(self.project_path, rel_path)
+        try:
+            with open(abs_path, "r", encoding="utf-8", errors="replace") as f:
+                for idx, line in enumerate(f, 1):
+                    if idx == line_number:
+                        return line.strip()[:max_len]
+        except Exception:
+            return None
+        return None
+
     # ── Class hierarchy (language-agnostic) ───────────────────────
 
     def get_class_hierarchy(self, class_name: str) -> Dict[str, Any]:
         """Build class hierarchy from deep index + file scanning.
 
-        Works with any OOP language. Uses tree-sitter parsed data from
-        the deep index for signature/extends info, falls back to regex.
+        Works with any OOP language supported by the indexer. The
+        definition is resolved via the SQLite deep index (parsed by
+        language-specific strategies) and inheritance edges are
+        enriched by pattern matching on source where necessary.
 
         Args:
             class_name: Class name to look up
@@ -232,22 +415,35 @@ class SymbolResolver:
         class_file = None
         class_signature = None
 
-        # Try deep index first
+        # Try deep index first (single SQL pass)
         if self.index_manager:
-            try:
-                for rel_path in self._list_indexed_files():
-                    summary = self.index_manager.get_file_summary(rel_path)
-                    if not summary:
-                        continue
-                    for cls in summary.get("classes", []):
-                        if cls.get("name") == class_name:
-                            class_file = rel_path
-                            class_signature = cls.get("signature", "")
-                            break
-                    if class_file:
+            lookup = getattr(self.index_manager, "find_symbols_by_short_name", None)
+            if callable(lookup):
+                try:
+                    for row in lookup(class_name):
+                        if row.get("type") != "class":
+                            continue
+                        class_file = row.get("file")
+                        class_signature = row.get("signature", "")
                         break
-            except Exception as e:
-                logger.debug("Suppressed exception in best-effort path: %s", e)
+                except Exception as e:
+                    logger.debug("find_symbols_by_short_name failed: %s", e)
+
+            if class_file is None:
+                try:
+                    for rel_path in self._list_indexed_files():
+                        summary = self.index_manager.get_file_summary(rel_path)
+                        if not summary:
+                            continue
+                        for cls in summary.get("classes", []):
+                            if cls.get("name") == class_name:
+                                class_file = rel_path
+                                class_signature = cls.get("signature", "")
+                                break
+                        if class_file:
+                            break
+                except Exception as e:
+                    logger.debug("Suppressed exception in best-effort path: %s", e)
 
         # Parse extends/implements from signature or file content
         if class_file:
@@ -414,7 +610,7 @@ class SymbolResolver:
         affected_files: Set[str] = set()
 
         for symbol in symbols_to_check:
-            refs = self.find_references(symbol)
+            refs = self.find_references(symbol, definition_file=rel_path)
             # Exclude self-references
             external_refs = [
                 r for r in refs.get("references", [])
@@ -457,7 +653,7 @@ class SymbolResolver:
         Returns:
             Categorized impacts with risk level.
         """
-        refs = self.find_references(symbol)
+        refs = self.find_references(symbol, definition_file=rel_path)
         external_refs = [
             r for r in refs.get("references", [])
             if r["file"] != rel_path
@@ -540,41 +736,77 @@ class SymbolResolver:
         metrics["by_category"] = category_counts
         snapshot["metrics"] = metrics
 
-        # Classes from deep index
+        # Classes from deep index.
+        #
+        # Fast path: two single-SQL queries (``list_all_classes`` +
+        # ``list_class_method_counts``) replace the per-file
+        # ``get_file_summary`` loop that previously issued one query per
+        # indexed file. On a 9k-file repo this cuts the snapshot from
+        # ~8s to sub-second without changing the output shape.
+        # FP guard: the method-count lookup keys on ``(file, class)``,
+        # so classes with the same name in different files stay distinct.
         classes_summary = []
         if self.index_manager:
             try:
-                for rel_path in self._list_indexed_files():
-                    summary = self.index_manager.get_file_summary(rel_path)
-                    if not summary:
-                        continue
-                    for cls in summary.get("classes", []):
+                lister = getattr(self.index_manager, "list_all_classes", None)
+                counts_fn = getattr(self.index_manager, "list_class_method_counts", None)
+                if callable(lister) and callable(counts_fn):
+                    method_counts = counts_fn()
+                    for cls in lister():
                         cls_name = cls.get("name", "")
-                        # Count methods belonging to this specific class
-                        cls_method_count = sum(
-                            1 for m in summary.get("methods", [])
-                            if m.get("name", "").startswith(cls_name + ".")
-                        )
-                        # Also count from functions that have ClassName. prefix
-                        cls_method_count += sum(
-                            1 for f in summary.get("functions", [])
-                            if f.get("name", "").startswith(cls_name + ".")
-                        )
+                        rel_path = cls.get("file", "")
                         cls_info = {
                             "name": cls_name,
                             "file": rel_path,
-                            "methods": cls_method_count,
+                            "methods": method_counts.get((rel_path, cls_name), 0),
                             "category": self.structure.categorize_file(rel_path),
                         }
-                        if cls.get("signature"):
-                            cls_info["signature"] = cls["signature"][:100]
+                        sig = cls.get("signature") or ""
+                        if sig:
+                            cls_info["signature"] = sig[:100]
                         classes_summary.append(cls_info)
+                else:
+                    # Legacy fallback; kept so non-SQLite managers still work.
+                    for rel_path in self._list_indexed_files():
+                        summary = self.index_manager.get_file_summary(rel_path)
+                        if not summary:
+                            continue
+                        for cls in summary.get("classes", []):
+                            cls_name = cls.get("name", "")
+                            cls_method_count = sum(
+                                1 for m in summary.get("methods", [])
+                                if m.get("name", "").startswith(cls_name + ".")
+                            )
+                            cls_method_count += sum(
+                                1 for f in summary.get("functions", [])
+                                if f.get("name", "").startswith(cls_name + ".")
+                            )
+                            cls_info = {
+                                "name": cls_name,
+                                "file": rel_path,
+                                "methods": cls_method_count,
+                                "category": self.structure.categorize_file(rel_path),
+                            }
+                            if cls.get("signature"):
+                                cls_info["signature"] = cls["signature"][:100]
+                            classes_summary.append(cls_info)
             except Exception as e:
                 logger.debug("Suppressed exception in best-effort path: %s", e)
 
         snapshot["classes"] = classes_summary[:100]  # Cap at 100
 
-        # Hotspots: files with most symbols or most lines
+        # Hotspots: files with most symbols or most lines.
+        # Fast path: fetch every file's symbol count in one SQL pass
+        # instead of issuing one ``get_file_summary`` query per file.
+        symbol_counts_lookup: Dict[str, int] = {}
+        if self.index_manager:
+            counts_fn = getattr(self.index_manager, "list_file_symbol_counts", None)
+            if callable(counts_fn):
+                try:
+                    symbol_counts_lookup = counts_fn()
+                except Exception as e:
+                    logger.debug("Suppressed exception in best-effort path: %s", e)
+
         hotspots = []
         for rel_path, abs_path in all_files:
             try:
@@ -583,8 +815,8 @@ class SymbolResolver:
             except Exception:
                 line_count = 0
 
-            symbol_count = 0
-            if self.index_manager:
+            symbol_count = symbol_counts_lookup.get(rel_path, 0)
+            if not symbol_count and self.index_manager and not symbol_counts_lookup:
                 try:
                     s = self.index_manager.get_file_summary(rel_path)
                     if s:
@@ -607,17 +839,28 @@ class SymbolResolver:
         hotspots.sort(key=lambda x: x["lines"], reverse=True)
         snapshot["hotspots"] = hotspots[:20]
 
-        # Cross-references: which files import from which
+        # Cross-references: which files import from which.
+        #
+        # Fast path: one SQL query returns imports for every indexed
+        # file at once, eliminating the per-file ``get_file_summary``
+        # loop that was the primary snapshot bottleneck on large repos.
         cross_refs: Dict[str, List[str]] = {}
         if self.index_manager:
             try:
-                for rel_path in self._list_indexed_files():
-                    summary = self.index_manager.get_file_summary(rel_path)
-                    if not summary:
-                        continue
-                    imports = summary.get("imports", [])
-                    if imports:
-                        cross_refs[rel_path] = imports[:10]
+                imports_fn = getattr(self.index_manager, "list_file_imports", None)
+                if callable(imports_fn):
+                    all_imports = imports_fn()
+                    for rel_path, imports in all_imports.items():
+                        if imports:
+                            cross_refs[rel_path] = imports[:10]
+                else:
+                    for rel_path in self._list_indexed_files():
+                        summary = self.index_manager.get_file_summary(rel_path)
+                        if not summary:
+                            continue
+                        imports = summary.get("imports", [])
+                        if imports:
+                            cross_refs[rel_path] = imports[:10]
             except Exception as e:
                 logger.debug("Suppressed exception in best-effort path: %s", e)
 
@@ -709,14 +952,367 @@ class SymbolResolver:
                 "total_affected": impact["total_affected_files"],
                 "risk_level": impact["risk_level"],
                 "top_symbols": [
-                    {"symbol": i["symbol"], "files": i["referenced_in"]}
+                    {"symbol": i["symbol"], "files": i["files"]}
                     for i in impact["impacts"][:5]
                 ],
             }
 
         return context
 
+    def get_symbol_change_context(
+        self,
+        rel_path: str,
+        symbol: str,
+        change_type: str = "modify",
+        max_related: int = 10,
+        owner: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Build a richer change-impact context for a symbol.
+
+        This is the higher-signal view used by the public context engine:
+        direct callers, indirect dependents, blast radius, risk reasons,
+        and safe edit guidance. ``owner`` disambiguates identically
+        named methods across multiple classes in the same file.
+        """
+        ripple = self.get_ripple_effect(rel_path, symbol, change_type=change_type)
+        if ripple.get("status") != "success":
+            return ripple
+
+        symbol_info = self.get_symbol_info(rel_path, symbol, owner=owner)
+        effective_owner = owner
+        context_filter = owner
+        if symbol_info and not effective_owner:
+            raw_name = str(symbol_info.get("name", ""))
+            if "." in raw_name:
+                context_filter = raw_name.split(".", 1)[0]
+                effective_owner = context_filter
+
+        direct_refs = [
+            ref for ref in self.find_references(
+                symbol,
+                context_filter=context_filter,
+                definition_file=rel_path,
+                owner=effective_owner,
+            ).get("references", [])
+            if ref.get("file") != rel_path
+        ]
+        direct_refs.sort(
+            key=lambda ref: (
+                self._category_weight(str(ref.get("category", "other"))),
+                # Strongest usage weight across this ref's call sites.
+                # Ensures a file whose only evidence is a ``module_script``
+                # (synthetic file-scope) edge ranks below any file with
+                # at least one real in-method caller, even when categories
+                # tie. The previous sort ignored usage type, causing
+                # procedural PHP entry-points to crowd the top of
+                # ``direct_callers`` on Laravel/WordPress-style repos.
+                max(
+                    (
+                        self._usage_weight(str(u.get("type", "reference")))
+                        for u in (ref.get("usages") or [])
+                        if isinstance(u, dict)
+                    ),
+                    default=1.0,
+                ),
+                int(ref.get("count", 0)),
+            ),
+            reverse=True,
+        )
+        direct_callers = self._summarize_direct_callers(direct_refs, max_related=max_related)
+        indirect_dependents = self._find_indirect_dependents(
+            origin_file=rel_path,
+            direct_callers=direct_callers,
+            max_related=max_related,
+        )
+        blast_radius = self._build_blast_radius(
+            direct_refs=direct_refs,
+            direct_callers=direct_callers,
+            indirect_dependents=indirect_dependents,
+            change_type=change_type,
+        )
+        risk_reasons = self._build_risk_reasons(
+            rel_path=rel_path,
+            direct_refs=direct_refs,
+            direct_callers=direct_callers,
+            indirect_dependents=indirect_dependents,
+            blast_radius=blast_radius,
+            ripple=ripple,
+        )
+        safe_edit_hints = self._build_safe_edit_hints(
+            rel_path=rel_path,
+            symbol=symbol,
+            direct_callers=direct_callers,
+            indirect_dependents=indirect_dependents,
+            ripple=ripple,
+        )
+
+        return {
+            "status": "success",
+            "file": rel_path,
+            "symbol": symbol,
+            "canonical_symbol": symbol_info.get("name", symbol) if symbol_info else symbol,
+            "change_type": change_type,
+            "direct_callers": direct_callers,
+            "indirect_dependents": indirect_dependents,
+            "blast_radius": blast_radius,
+            "risk_reasons": risk_reasons,
+            "safe_edit_hints": safe_edit_hints,
+            "ripple_effect": ripple,
+        }
+
     # ── Helpers ───────────────────────────────────────────────────
+
+    def _summarize_direct_callers(
+        self,
+        refs: List[Dict[str, Any]],
+        max_related: int = 10,
+    ) -> List[Dict[str, Any]]:
+        """Convert raw reference hits into agent-friendly direct caller summaries."""
+        direct_callers: List[Dict[str, Any]] = []
+        for ref in refs[:max_related]:
+            usages = ref.get("usages", []) if isinstance(ref.get("usages"), list) else []
+            usage_types = sorted(
+                {
+                    str(usage.get("type", "reference"))
+                    for usage in usages
+                    if isinstance(usage, dict)
+                }
+            )
+            strongest_usage = "reference"
+            strongest_score = -1.0
+            for usage_type in usage_types or ["reference"]:
+                score = self._usage_weight(usage_type)
+                if score > strongest_score:
+                    strongest_usage = usage_type
+                    strongest_score = score
+
+            snippets = [
+                {
+                    "line": int(usage.get("line", 0)),
+                    "type": str(usage.get("type", "reference")),
+                    "snippet": str(usage.get("snippet", "")),
+                }
+                for usage in usages[:3]
+                if isinstance(usage, dict)
+            ]
+            direct_callers.append(
+                {
+                    "file": ref.get("file", ""),
+                    "category": ref.get("category", "other"),
+                    "count": int(ref.get("count", 0)),
+                    "strongest_usage": strongest_usage,
+                    "usage_types": usage_types or ["reference"],
+                    "snippets": snippets,
+                }
+            )
+        return direct_callers
+
+    def _find_indirect_dependents(
+        self,
+        origin_file: str,
+        direct_callers: List[Dict[str, Any]],
+        max_related: int = 10,
+    ) -> List[Dict[str, Any]]:
+        """Approximate second-order dependents by expanding direct caller files."""
+        indirect: Dict[str, Dict[str, Any]] = {}
+        direct_files = {item.get("file") for item in direct_callers if item.get("file")}
+
+        # Cap expansion to keep context cheap and responsive.
+        for caller in direct_callers[: min(6, len(direct_callers))]:
+            caller_file = str(caller.get("file", ""))
+            if not caller_file:
+                continue
+            impact = self.get_impact_analysis(caller_file)
+            if impact.get("status") != "success":
+                continue
+
+            for item in impact.get("impacts", []):
+                for dependent_file in item.get("files", []) or []:
+                    if (
+                        not dependent_file
+                        or dependent_file == origin_file
+                        or dependent_file in direct_files
+                    ):
+                        continue
+
+                    if dependent_file not in indirect:
+                        indirect[dependent_file] = {
+                            "file": dependent_file,
+                            "category": self.structure.categorize_file(dependent_file) or "other",
+                            "via": [],
+                            "symbols": set(),
+                        }
+                    indirect[dependent_file]["via"].append(caller_file)
+                    symbol_name = item.get("symbol")
+                    if symbol_name:
+                        indirect[dependent_file]["symbols"].add(str(symbol_name))
+
+        ranked = []
+        for item in indirect.values():
+            via_files = sorted(set(item["via"]))
+            symbols = sorted(item["symbols"])
+            ranked.append(
+                {
+                    "file": item["file"],
+                    "category": item["category"],
+                    "via": via_files[:3],
+                    "symbols": symbols[:5],
+                    "count": len(via_files),
+                }
+            )
+
+        ranked.sort(
+            key=lambda item: (
+                self._category_weight(str(item.get("category", "other"))),
+                int(item.get("count", 0)),
+            ),
+            reverse=True,
+        )
+        return ranked[:max_related]
+
+    def _build_blast_radius(
+        self,
+        direct_refs: List[Dict[str, Any]],
+        direct_callers: List[Dict[str, Any]],
+        indirect_dependents: List[Dict[str, Any]],
+        change_type: str = "modify",
+    ) -> Dict[str, Any]:
+        """Build a compact blast-radius summary for an agent."""
+        weighted = self._compute_weighted_risk(direct_refs, change_type=change_type)
+        direct_files = len(direct_callers)
+        indirect_files = len(indirect_dependents)
+        total_usages = sum(int(ref.get("count", 0)) for ref in direct_refs)
+        categories = sorted(
+            {
+                str(item.get("category", "other"))
+                for item in direct_callers + indirect_dependents
+                if item.get("category")
+            }
+        )
+        combined_score = round(
+            float(weighted.get("risk_score", 0.0)) + indirect_files * 0.9 + len(categories) * 0.5,
+            2,
+        )
+        if combined_score >= 35.0:
+            level = "critical"
+        elif combined_score >= 18.0:
+            level = "high"
+        elif combined_score >= 8.0:
+            level = "medium"
+        else:
+            level = "low"
+
+        return {
+            "risk_level": level,
+            "risk_score": combined_score,
+            "direct_files": direct_files,
+            "direct_usages": total_usages,
+            "indirect_files": indirect_files,
+            "total_files": direct_files + indirect_files,
+            "categories": categories,
+            "high_risk_files": weighted.get("high_risk_impacts", [])[:5],
+        }
+
+    def _build_risk_reasons(
+        self,
+        rel_path: str,
+        direct_refs: List[Dict[str, Any]],
+        direct_callers: List[Dict[str, Any]],
+        indirect_dependents: List[Dict[str, Any]],
+        blast_radius: Dict[str, Any],
+        ripple: Dict[str, Any],
+    ) -> List[str]:
+        """Turn structural risk into short human-readable reasons."""
+        reasons: List[str] = []
+        direct_files = int(blast_radius.get("direct_files", 0))
+        indirect_files = int(blast_radius.get("indirect_files", 0))
+        categories = blast_radius.get("categories", []) or []
+
+        if direct_files >= 8:
+            reasons.append(f"Symbol has broad direct usage across {direct_files} files.")
+        elif direct_files >= 3:
+            reasons.append(f"Symbol is used directly in {direct_files} files.")
+
+        if indirect_files:
+            reasons.append(
+                f"Second-order dependency chain detected through {indirect_files} indirect dependents."
+            )
+
+        usage_types = {
+            str(usage.get("type", "reference"))
+            for ref in direct_refs
+            for usage in ref.get("usages", []) or []
+            if isinstance(usage, dict)
+        }
+        if "extends_or_implements" in usage_types:
+            reasons.append("Inheritance or interface contracts depend on this symbol.")
+        if "instantiation" in usage_types:
+            reasons.append("Construction paths depend on this symbol's API shape.")
+        if "static_call" in usage_types:
+            reasons.append("Static call sites depend on the symbol name and signature.")
+        if "method_call" in usage_types:
+            reasons.append("Runtime method call sites depend on current behavior.")
+
+        if any(cat in categories for cat in ("controllers", "routes", "middleware")):
+            reasons.append("Request/entry-point code depends on this change.")
+        if any(cat in categories for cat in ("models", "services")):
+            reasons.append("Core domain code is in the dependency path.")
+        if any("test" in str(item.get("file", "")).lower() for item in direct_callers + indirect_dependents):
+            reasons.append("Tests reference the affected path and should be re-run.")
+
+        sensitive_paths = [ref.get("file", "") for ref in direct_refs if any(
+            token in str(ref.get("file", "")).lower() for token in ("auth", "payment", "webhook")
+        )]
+        if sensitive_paths:
+            reasons.append("Sensitive auth/payment/webhook paths are affected.")
+
+        if ripple.get("summary", {}).get("high_risk_impact_count", 0):
+            reasons.append("Weighted ripple model flagged high-risk downstream files.")
+
+        if not reasons:
+            reasons.append(f"Change appears localized to {rel_path} with limited downstream coupling.")
+
+        return reasons[:6]
+
+    def _build_safe_edit_hints(
+        self,
+        rel_path: str,
+        symbol: str,
+        direct_callers: List[Dict[str, Any]],
+        indirect_dependents: List[Dict[str, Any]],
+        ripple: Dict[str, Any],
+    ) -> List[str]:
+        """Generate signal-specific hints that improve agent edit quality.
+
+        Only hints grounded in actual relationships are emitted; generic
+        reminders (e.g. ``Read the symbol first``) are intentionally
+        omitted to keep token usage low and the signal dense.
+        """
+        hints: List[str] = []
+
+        if direct_callers:
+            top_files = ", ".join(item["file"] for item in direct_callers[:3])
+            hints.append(f"Inspect the top direct callers first: {top_files}.")
+
+        usage_types = {
+            usage_type
+            for caller in direct_callers
+            for usage_type in caller.get("usage_types", [])
+        }
+        if "extends_or_implements" in usage_types:
+            hints.append("Preserve the public contract unless you also update subclasses or implementations.")
+        if "instantiation" in usage_types:
+            hints.append("Avoid changing constructor shape or required initialization without updating call sites.")
+        if "static_call" in usage_types or "method_call" in usage_types:
+            hints.append("Keep the symbol name and call signature stable unless you intend a coordinated refactor.")
+
+        if indirect_dependents:
+            hints.append("Re-check files that depend on direct callers; they can break even if first-order callers compile.")
+
+        if ripple.get("summary", {}).get("risk_level") in {"high", "critical"}:
+            hints.append("Treat this as a broad change: make the edit in smaller steps and verify related files incrementally.")
+
+        return hints[:6]
 
     @staticmethod
     def _category_weight(category: str) -> float:
@@ -741,9 +1337,14 @@ class SymbolResolver:
             "instantiation": 1.3,
             "static_call": 1.25,
             "method_call": 1.2,
-            "import": 0.85,
-            "type_hint": 0.95,
             "reference": 1.0,
+            "type_hint": 0.95,
+            "import": 0.85,
+            # File-scope / top-level script callers (synthetic
+            # ``__file_scope__`` symbol): real cross-file edges but
+            # weaker than any in-method caller. Kept above 0 so they
+            # still contribute to risk scoring.
+            "module_script": 0.55,
         }
         return float(weights.get(usage_type, 1.0))
 
@@ -754,6 +1355,8 @@ class SymbolResolver:
             return 1.15
         if t == "delete":
             return 1.35
+        if t in {"signature_change", "contract_change"}:
+            return 1.25
         return 1.0
 
     def _compute_weighted_risk(self, refs: List[Dict[str, Any]], change_type: str = "modify") -> Dict[str, Any]:

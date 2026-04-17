@@ -1,0 +1,6 @@
+{
+  "name": "blindspot/php-laravel-impact",
+  "require": {
+    "php": "^8.2"
+  }
+}

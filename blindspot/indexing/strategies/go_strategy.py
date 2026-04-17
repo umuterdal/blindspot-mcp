@@ -3,9 +3,18 @@ Go parsing strategy using regex patterns.
 """
 
 import re
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Set, Tuple, Optional
 from .base_strategy import ParsingStrategy
 from ..models import SymbolInfo, FileInfo
+
+
+# Go language keywords and common built-ins that syntactically look like calls
+# but must never be treated as cross-file references.
+_GO_CALL_BLACKLIST: Set[str] = {
+    "if", "for", "switch", "return", "defer", "go", "select",
+    "append", "cap", "close", "copy", "delete", "len", "make",
+    "new", "panic", "print", "println", "recover", "range",
+}
 
 
 class GoParsingStrategy(ParsingStrategy):
@@ -94,8 +103,9 @@ class GoParsingStrategy(ParsingStrategy):
                     )
                     classes.append(interface_name)
 
-        # Phase 2: Add call relationship analysis
-        self._analyze_go_calls(content, symbols, file_path)
+        # Phase 2: collect pending_calls so cross-file references land in the
+        # deep index (refs table) during the build phase.
+        pending_calls = self._collect_go_pending_calls(lines, file_path)
 
         file_info = FileInfo(
             language=self.get_language_name(),
@@ -104,38 +114,61 @@ class GoParsingStrategy(ParsingStrategy):
             imports=imports,
             package=package
         )
+        if pending_calls:
+            file_info.pending_calls = pending_calls
 
         return symbols, file_info
 
-    def _analyze_go_calls(self, content: str, symbols: Dict[str, SymbolInfo], file_path: str):
-        """Analyze Go function calls for relationships."""
-        lines = content.splitlines()
-        current_function = None
-        is_function_declaration_line = False
+    def _collect_go_pending_calls(
+        self,
+        lines: List[str],
+        file_path: str,
+    ) -> List[Tuple[str, str]]:
+        """Emit (caller_symbol_id, called_short_name) pairs via brace tracking."""
+        pending: List[Tuple[str, str]] = []
+        seen: Set[Tuple[str, str]] = set()
 
-        for i, line in enumerate(lines):
-            original_line = line
-            line = line.strip()
+        current_caller: Optional[str] = None
+        depth = 0
+        entered_body = False
 
-            # Track current function context
-            if line.startswith('func '):
-                func_name = self._extract_go_function_name(line)
-                if func_name:
-                    current_function = self._create_symbol_id(file_path, func_name)
-                    is_function_declaration_line = True
-            else:
-                is_function_declaration_line = False
+        for raw_line in lines:
+            stripped = raw_line.strip()
+            clean, _ = self._strip_go_comments(raw_line, False)
 
-            # Find function calls: functionName() or obj.methodName()
-            # Skip the function declaration line itself to avoid false self-calls
-            if current_function and not is_function_declaration_line and ('(' in line and ')' in line):
-                called_functions = self._extract_go_called_functions(line)
-                for called_func in called_functions:
-                    # Find the called function in symbols and add relationship
-                    for symbol_id, symbol_info in symbols.items():
-                        if called_func in symbol_id.split("::")[-1]:
-                            if current_function not in symbol_info.called_by:
-                                symbol_info.called_by.append(current_function)
+            if current_caller is None:
+                if stripped.startswith("func "):
+                    func_name = self._extract_go_function_name(stripped)
+                    if func_name:
+                        current_caller = self._create_symbol_id(file_path, func_name)
+                        depth = clean.count("{") - clean.count("}")
+                        entered_body = depth > 0
+                continue
+
+            # Inside a function body: count braces outside strings.
+            open_count = self._count_unquoted_characters(clean, "{")
+            close_count = self._count_unquoted_characters(clean, "}")
+            if open_count or close_count:
+                if not entered_body and open_count:
+                    entered_body = True
+                depth += open_count - close_count
+
+            if entered_body:
+                for match in re.finditer(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(", clean):
+                    called = match.group(1)
+                    if called in _GO_CALL_BLACKLIST or called == "func":
+                        continue
+                    key = (current_caller, called)
+                    if key not in seen:
+                        seen.add(key)
+                        pending.append(key)
+
+            if entered_body and depth <= 0:
+                current_caller = None
+                depth = 0
+                entered_body = False
+
+        return pending
 
     def _extract_go_function_name(self, line: str) -> Optional[str]:
         """Extract function name from Go function declaration."""

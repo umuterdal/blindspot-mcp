@@ -66,26 +66,40 @@ class ParsingStrategy(ABC):
 
         return normalized or os.path.basename(file_path)
 
-    def _extract_line_number(self, content: str, symbol_position: int) -> int:
+    def _extract_line_number(self, content_bytes: bytes, byte_position: int) -> int:
         """
-        Extract line number from character position in content.
+        Extract line number from a tree-sitter byte position.
+
+        Tree-sitter reports ``start_byte``/``end_byte`` as offsets into
+        the UTF-8 buffer it parsed. Counting newlines in the decoded
+        ``str`` with that offset is only correct for pure-ASCII files;
+        any multi-byte character before the target shifts the slice
+        boundary and reports a wrong line number. Counting the newline
+        byte (``0x0A``) in the byte buffer is encoding-safe.
 
         Args:
-            content: File content
-            symbol_position: Character position in content
+            content_bytes: UTF-8 bytes of the file
+            byte_position: Byte position (tree-sitter ``start_byte``)
 
         Returns:
             Line number (1-based)
         """
-        return content[:symbol_position].count('\n') + 1
+        return content_bytes[:byte_position].count(b'\n') + 1
 
     def _get_file_name(self, file_path: str) -> str:
         """Get just the filename from a full path."""
         return os.path.basename(file_path)
 
-    def _safe_extract_text(self, content: str, start: int, end: int) -> str:
-        """Safely extract text from content, handling bounds."""
+    def _safe_extract_text(self, content_bytes: bytes, start: int, end: int) -> str:
+        """Byte-safe text extraction for tree-sitter spans.
+
+        Slices the UTF-8 buffer using the parser's byte offsets and
+        decodes only that window. ``errors='replace'`` protects against
+        malformed inputs without crashing indexing.
+        """
         try:
-            return content[start:end].strip()
+            return content_bytes[start:end].decode(
+                'utf-8', errors='replace',
+            ).strip()
         except (IndexError, TypeError):
             return ""

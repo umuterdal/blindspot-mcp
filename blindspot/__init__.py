@@ -1,8 +1,8 @@
-"""Blindspot MCP — The External Brain for AI Coding Agents.
+"""Blindspot MCP.
 
-A Model Context Protocol server that provides instant, structured intelligence
-about your entire codebase — relationships, schemas, affected files, cache keys —
-all without reading files into the AI's context window.
+A small local context engine for AI coding agents. It helps an agent
+understand project structure, symbols, relationships, and change impact
+before editing code.
 """
 
-__version__ = "0.1.4"
+__version__ = "0.2.0"

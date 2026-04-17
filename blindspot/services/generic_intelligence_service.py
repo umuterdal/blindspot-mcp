@@ -5,11 +5,13 @@ for core tools (find_references, get_class_hierarchy, get_impact_analysis,
 get_ripple_effect, get_project_snapshot, get_context_for_edit).
 
 It delegates to SymbolResolver which uses:
-- Deep index (SQLite + tree-sitter) for symbol data
+- The SQLite deep index populated by per-language strategies (tree-sitter
+  for JS/TS/Kotlin/Java/C#/PHP, Python ``ast``, regex for Go/Dart/Zig/ObjC).
 - ProjectStructure adapter for directory resolution
 - LanguageSyntax adapter for language-specific patterns
 
-Works with PHP, JavaScript/TypeScript, Python, Go, Rust, Java, Ruby, and more.
+Works across PHP, JavaScript/TypeScript, Python, Dart, Go, Java, Kotlin,
+C#, Ruby, and more.
 """
 
 import logging
@@ -56,22 +58,31 @@ class GenericIntelligenceService(BaseService):
     # ── find_references ──────────────────────────────────────────
 
     def find_references(self, symbol: str, scope: str = "all",
-                        context_filter: Optional[str] = None) -> Dict[str, Any]:
+                        context_filter: Optional[str] = None,
+                        definition_file: Optional[str] = None) -> Dict[str, Any]:
         """Find all files that reference a symbol.
 
-        Language-agnostic: scans all source files using config scan_dirs
-        and language syntax adapter for usage classification.
+        Uses the deep-index ``refs`` table for cross-file callers and
+        supplements with a narrow text scan on files whose language does
+        not produce indexed caller edges (templates, fallback languages).
 
         Args:
             symbol: Symbol name to search for
             scope: Category filter ('all', 'models', 'controllers', etc.)
-            context_filter: Optional class name for context filtering
+            context_filter: Optional class name for caller/context filtering
+            definition_file: Optional path of the file that defines the
+                symbol, used to disambiguate same-named methods
         """
         resolver = self._get_resolver()
         if not resolver:
             return {"status": "error", "message": "Project path not set"}
 
-        result = resolver.find_references(symbol, scope, context_filter)
+        result = resolver.find_references(
+            symbol,
+            scope,
+            context_filter,
+            definition_file=definition_file,
+        )
         result["status"] = "success"
         return result
 
@@ -161,3 +172,24 @@ class GenericIntelligenceService(BaseService):
             return {"status": "error", "message": "Project path not set"}
 
         return resolver.get_context_for_edit(file_path, symbol)
+
+    def get_symbol_change_context(
+        self,
+        file_path: str,
+        symbol: str,
+        change_type: str = "modify",
+        max_related: int = 10,
+        owner: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Return richer symbol change context for the context engine."""
+        resolver = self._get_resolver()
+        if not resolver:
+            return {"status": "error", "message": "Project path not set"}
+
+        return resolver.get_symbol_change_context(
+            file_path,
+            symbol,
+            change_type=change_type,
+            max_related=max_related,
+            owner=owner,
+        )

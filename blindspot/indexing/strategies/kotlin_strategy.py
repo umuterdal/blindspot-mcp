@@ -90,7 +90,7 @@ class KotlinParsingStrategy(ParsingStrategy):
         node_type = node.type
 
         if node_type in {"class_declaration", "object_declaration", "interface_declaration"}:
-            name = self._get_kotlin_type_name(node, context.content)
+            name = self._get_kotlin_type_name(node, context.content_bytes)
             if name:
                 symbol_id = self._create_symbol_id(context.file_path, name)
                 symbol_kind = "interface" if node_type == "interface_declaration" else "class"
@@ -149,7 +149,7 @@ class KotlinParsingStrategy(ParsingStrategy):
                 self._register_call(context, current_function, called)
 
         if node_type in {"import_header", "import_declaration"}:
-            import_path = self._extract_kotlin_import_from_node(node, context.content)
+            import_path = self._extract_kotlin_import_from_node(node, context.content_bytes)
             if import_path and import_path not in context.imports:
                 context.imports.append(import_path)
 
@@ -215,7 +215,12 @@ class KotlinParsingStrategy(ParsingStrategy):
         if expected_from_line:
             return expected_from_line
 
-        header = context.content[node.start_byte : node.end_byte].split("\n", 1)[0]
+        # Tree-sitter offsets index ``context.content_bytes``; slicing
+        # the decoded ``str`` here corrupts the header whenever the file
+        # has non-ASCII content before this node.
+        header = self._slice_bytes(
+            context.content_bytes, node.start_byte, node.end_byte,
+        ).split("\n", 1)[0]
         expected_from_header = self._extract_fun_name_from_line(header)
         if expected_from_header:
             return expected_from_header
@@ -224,7 +229,9 @@ class KotlinParsingStrategy(ParsingStrategy):
     def _get_kotlin_function_signature(self, node, context: "TraversalContext") -> str:
         if 0 <= node.start_point[0] < len(context.lines):
             return context.lines[node.start_point[0]].strip()
-        snippet = context.content[node.start_byte : node.end_byte]
+        snippet = self._slice_bytes(
+            context.content_bytes, node.start_byte, node.end_byte,
+        )
         return snippet.split("\n", 1)[0].strip()
 
     def _extract_kotlin_import_from_node(self, node, content: str) -> Optional[str]:
@@ -240,7 +247,9 @@ class KotlinParsingStrategy(ParsingStrategy):
         for line in content.splitlines():
             stripped = line.strip()
             if stripped.startswith("package "):
-                match = re.match(r"package\s+([A-Za-z0-9_\\.]+)", stripped)
+                # ``\w`` is Unicode-aware in Python regex so this accepts
+                # non-ASCII package segments (e.g. ``com.örnek.service``).
+                match = re.match(r"package\s+([\w.]+)", stripped, flags=re.UNICODE)
                 return match.group(1) if match else None
             if stripped and not stripped.startswith(("//", "/*", "*")):
                 # Stop scanning once code starts.
@@ -289,8 +298,12 @@ class KotlinParsingStrategy(ParsingStrategy):
         if not raw:
             return None
         cleaned = raw.strip()
-        # Remove trailing punctuation/braces that can appear in malformed nodes
-        cleaned = re.split(r"[^A-Za-z0-9_]+", cleaned, maxsplit=1)[0]
+        # Strip at the first non-identifier character. ``\w`` matches
+        # Unicode letters/digits/underscore by default in Python regex,
+        # which is required because Kotlin (like Java) allows Unicode
+        # identifiers. The previous ``[A-Za-z0-9_]+`` pattern silently
+        # truncated names like ``Günlükçü`` at the first non-ASCII byte.
+        cleaned = re.split(r"[^\w]+", cleaned, maxsplit=1, flags=re.UNICODE)[0]
         return cleaned or None
 
     def _identifier_is_plausible_in_declaration_line(
