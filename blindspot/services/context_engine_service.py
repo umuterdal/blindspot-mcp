@@ -570,6 +570,8 @@ class ContextEngineService(BaseService):
                         "static_call", "type_hint",
                     }
                 )
+                if category == "migrations" and strongest in {"method_call", "reference"}:
+                    is_strong_direct = False
                 certainty = "certain" if is_strong_direct else "probable"
                 evidence_strength = "strong" if is_strong_direct else "medium"
                 priority = 90 if is_strong_direct else 78

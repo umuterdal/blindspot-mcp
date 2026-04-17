@@ -1106,6 +1106,30 @@ class SignalEnrichmentTests(unittest.TestCase):
         self.assertEqual(migration_reason["evidence_strength"], "medium")
         self.assertIn("supporting evidence", migration_reason["reason"])
 
+    def test_index_backed_migration_direct_caller_is_not_marked_certain(self):
+        ctx = _build_ctx_with_fake_index(self.tmp.name)
+        direct_callers = [
+            {
+                "file": "database/migrations/2024_01_01_create_users.php",
+                "category": "migrations",
+                "count": 1,
+                "evidence_source": "index",
+                "strongest_usage": "method_call",
+                "usage_types": ["method_call"],
+                "snippets": [{"line": 3, "type": "method_call", "snippet": "public function up(): void {"}],
+            }
+        ]
+        patches = self._patch_structural(direct_callers=direct_callers, indirect_dependents=[])
+        with patches[0], patches[1], patches[2], patches[3], patches[4]:
+            result = self._run_get_context(ctx)
+
+        migration_reason = next(
+            item for item in result["related_file_reasons"]
+            if item.get("file") == "database/migrations/2024_01_01_create_users.php"
+        )
+        self.assertEqual(migration_reason["certainty"], "probable")
+        self.assertEqual(migration_reason["evidence_strength"], "medium")
+
 
 class CrossFileRefsFixtureRegressionTests(unittest.TestCase):
     """Ensure PHP and Java cross-file ``pending_calls`` still populate the
@@ -1484,6 +1508,19 @@ class CrossFileRefsFixtureRegressionTests(unittest.TestCase):
             "database/migrations/2024_01_01_000000_create_users.php",
             ref_files,
             f"Migration DSL method must not appear as controller direct caller. Got {refs}",
+        )
+
+        owner_refs = resolver.find_references(
+            "index",
+            scope="all",
+            definition_file="app/Http/Controllers/HomeController.php",
+            owner="HomeController",
+        )
+        owner_ref_files = {item.get("file") for item in owner_refs.get("references", [])}
+        self.assertNotIn(
+            "database/migrations/2024_01_01_000000_create_users.php",
+            owner_ref_files,
+            f"Owner-qualified lookup must also exclude migration DSL collisions. Got {owner_refs}",
         )
 
     def test_ts_variable_bound_calls_resolve_to_owning_class(self):

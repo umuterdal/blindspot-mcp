@@ -1050,12 +1050,22 @@ class SymbolResolver:
               inside ``up()`` should not count as a caller of
               ``HomeController.index``.
         """
-        if owner or not self._is_ambiguous_scan_symbol(symbol):
+        if not self._is_ambiguous_scan_symbol(symbol):
             return False
 
         category = (self.structure.categorize_file(caller_file) or "other").lower()
+        normalized = (caller_file or "").replace("\\", "/").lower()
         caller_short = (caller_short_name or "").lower()
-        if category == "migrations" and caller_short in {"up", "down", "change"}:
+        if category == "migrations" or normalized.startswith(("database/migrations/", "migrations/")):
+            if caller_short in {"up", "down", "change"}:
+                return True
+            if caller_short.endswith((".up", ".down", ".change")):
+                return True
+            # Owner-qualified lookup does not rescue migration DSL edges:
+            # the false positive already happened upstream when the callee
+            # was recorded under the generic method name.
+            if owner and caller_short.split(".")[-1] in {"up", "down", "change"}:
+                return True
             return True
         return False
 
