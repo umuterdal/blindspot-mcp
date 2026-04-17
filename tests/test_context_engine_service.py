@@ -195,6 +195,13 @@ class ContextEngineServiceTests(unittest.TestCase):
         self.assertEqual(result["indirect_dependents"][0]["file"], "tests/test_main.py")
         self.assertGreaterEqual(len(result["risk_reasons"]), 1)
         self.assertGreaterEqual(len(result["safe_edit_hints"]), 1)
+        self.assertIn("relationship_buckets", result)
+        self.assertIn("service.py", result["relationship_buckets"]["certain"])
+        self.assertIn("tests/test_main.py", result["relationship_buckets"]["probable"])
+        first_reason = result["related_file_reasons"][0]
+        self.assertIn("certainty", first_reason)
+        self.assertIn("evidence_type", first_reason)
+        self.assertIn("evidence_strength", first_reason)
 
     def test_signature_change_context_builds_coordinated_edit_plan(self):
         with patch(
@@ -654,6 +661,8 @@ class SignalEnrichmentTests(unittest.TestCase):
         self.assertEqual(result["query_resolution"]["target"], "service.py")
         self.assertEqual(result["query_resolution"]["symbol"], "greet")
         self.assertGreaterEqual(len(result["query_resolution"].get("alternatives", [])), 1)
+        self.assertIn("selection_reason", result["query_resolution"])
+        self.assertIn("rejected_reason", result["query_resolution"]["alternatives"][0])
 
     def test_query_prefers_source_hit_over_fixture_when_scores_are_close(self):
         """FP guard: eval/fixture hits often share many lexical tokens with
@@ -862,6 +871,55 @@ class SignalEnrichmentTests(unittest.TestCase):
         self.assertIn("app/greeter_helpers.py", semantic_files)
         self.assertNotIn("evals/fixtures/demo_case.py", semantic_files)
         self.assertNotIn("tests/test_service.py", semantic_files)
+
+    def test_framework_wiring_surfaces_route_file_as_probable_relation(self):
+        """Laravel/Symfony-style route wiring is not a direct call edge but
+        still matters for edits around controllers and their services. It
+        must surface separately as a probable framework wiring relation.
+        """
+        with open(os.path.join(self.tmp.name, ".blindspot.yaml"), "w", encoding="utf-8") as f:
+            f.write(
+                "language: php\n"
+                "framework: laravel\n"
+                "scan_dirs:\n"
+                "  services: app/Services\n"
+                "  controllers: app/Http/Controllers\n"
+                "  routes: routes\n"
+                "  tests: tests\n"
+            )
+        os.makedirs(os.path.join(self.tmp.name, "app", "Services"), exist_ok=True)
+        os.makedirs(os.path.join(self.tmp.name, "app", "Http", "Controllers"), exist_ok=True)
+        os.makedirs(os.path.join(self.tmp.name, "routes"), exist_ok=True)
+        with open(os.path.join(self.tmp.name, "app", "Services", "PricingService.php"), "w", encoding="utf-8") as f:
+            f.write("<?php class PricingService { public function rateFor($tier) {} }\n")
+        with open(os.path.join(self.tmp.name, "app", "Http", "Controllers", "CheckoutController.php"), "w", encoding="utf-8") as f:
+            f.write("<?php class CheckoutController { public function quote() {} }\n")
+        with open(os.path.join(self.tmp.name, "routes", "web.php"), "w", encoding="utf-8") as f:
+            f.write("<?php Route::post('/checkout', [CheckoutController::class, 'quote']);\n")
+
+        ctx = _build_ctx_with_fake_index(self.tmp.name)
+        direct_callers = [
+            {"file": "app/Http/Controllers/CheckoutController.php", "category": "controllers", "count": 1,
+             "strongest_usage": "method_call", "usage_types": ["method_call"], "snippets": []},
+        ]
+        patches = self._patch_structural(direct_callers=direct_callers, indirect_dependents=[])
+        with patches[0], patches[1], patches[2], patches[3], patches[4]:
+            result = ContextEngineService(ctx).get_context(
+                target="app/Services/PricingService.php",
+                intent="before_edit",
+                symbol="rateFor",
+                include_source=False,
+            )
+
+        route_reason = next(
+            (item for item in result["related_file_reasons"] if item.get("file") == "routes/web.php"),
+            None,
+        )
+        self.assertIsNotNone(route_reason, result["related_file_reasons"])
+        self.assertEqual(route_reason["role"], "framework_entrypoint")
+        self.assertEqual(route_reason["certainty"], "probable")
+        self.assertEqual(route_reason["evidence_type"], "framework_wiring")
+        self.assertIn("routes/web.php", result["relationship_buckets"]["probable"])
 
 
 class CrossFileRefsFixtureRegressionTests(unittest.TestCase):

@@ -186,6 +186,7 @@ class ContextEngineService(BaseService):
             "safe_edit_hints": [],
             "related_files": [],
             "related_file_reasons": [],
+            "relationship_buckets": {"certain": [], "probable": [], "inferred": []},
             "missing_context": [],
             "confidence": "high",
             "confidence_details": {},
@@ -294,6 +295,9 @@ class ContextEngineService(BaseService):
             direct_callers=response["direct_callers"],
             indirect_dependents=response["indirect_dependents"],
             max_related=max_related,
+        )
+        response["relationship_buckets"] = self._build_relationship_buckets(
+            response["related_file_reasons"]
         )
         self._append_cochange_risk(response, target)
         response["confidence_details"] = self._build_confidence_details(response)
@@ -486,6 +490,9 @@ class ContextEngineService(BaseService):
             target: {
                 "file": target,
                 "role": "definition",
+                "certainty": "certain",
+                "evidence_type": "definition",
+                "evidence_strength": "strong",
                 "reason": (
                     f"Defines symbol '{symbol_context.get('canonical_name') or symbol_context.get('symbol')}'."
                     if symbol_context.get("found")
@@ -510,6 +517,9 @@ class ContextEngineService(BaseService):
                 reasons[file_path] = {
                     "file": file_path,
                     "role": "file_scope_caller",
+                    "certainty": "certain",
+                    "evidence_type": "cross_file_reference",
+                    "evidence_strength": "strong",
                     "reason": (
                         "References target from a top-level/module script "
                         "(procedural entry-point, not inside a function)."
@@ -520,6 +530,9 @@ class ContextEngineService(BaseService):
                 reasons[file_path] = {
                     "file": file_path,
                     "role": "direct_caller",
+                    "certainty": "certain",
+                    "evidence_type": "cross_file_reference",
+                    "evidence_strength": "strong",
                     "reason": f"Calls or references the target symbol directly via {strongest}.",
                     "priority": 90,
                 }
@@ -532,6 +545,9 @@ class ContextEngineService(BaseService):
             reasons[file_path] = {
                 "file": file_path,
                 "role": "indirect_dependent",
+                "certainty": "probable",
+                "evidence_type": "dependency_expansion",
+                "evidence_strength": "medium",
                 "reason": f"Depends on a direct caller through {via}.",
                 "priority": 70,
             }
@@ -541,6 +557,9 @@ class ContextEngineService(BaseService):
                 reasons[file_path] = {
                     "file": file_path,
                     "role": "ripple",
+                    "certainty": "probable",
+                    "evidence_type": "ripple_model",
+                    "evidence_strength": "medium",
                     "reason": "Appears in the ripple-effect summary for this symbol.",
                     "priority": 60,
                 }
@@ -557,9 +576,23 @@ class ContextEngineService(BaseService):
                     reasons[file_path] = {
                         "file": file_path,
                         "role": "file_impact",
+                        "certainty": "probable",
+                        "evidence_type": "file_impact",
+                        "evidence_strength": "medium",
                         "reason": f"References file-level symbol '{symbol_name}'.",
                         "priority": 50,
                     }
+
+        for item in self._framework_related_files(
+            target=target,
+            symbol_context=symbol_context,
+            direct_callers=direct_callers or [],
+            max_related=max_related,
+        ):
+            file_path = item.get("file")
+            if not file_path or file_path in reasons:
+                continue
+            reasons[file_path] = item
 
         # Co-change signal: files that historically move together with the
         # target. Lower priority than direct/indirect call graph but strong
@@ -572,6 +605,9 @@ class ContextEngineService(BaseService):
             reasons[file_path] = {
                 "file": file_path,
                 "role": "co_change",
+                "certainty": "inferred",
+                "evidence_type": "history",
+                "evidence_strength": "light",
                 "reason": (
                     f"Changed together with the target in {count} recent commits "
                     f"(last {peer.get('last_seen', 'unknown')})."
@@ -595,6 +631,9 @@ class ContextEngineService(BaseService):
                 reasons[file_path] = {
                     "file": file_path,
                     "role": "semantic_related",
+                    "certainty": "inferred",
+                    "evidence_type": "semantic_search",
+                    "evidence_strength": "light",
                     "reason": (
                         f"Semantically related to the target "
                         f"(match '{hit.get('short_name')}', score {hit.get('score')})."
@@ -608,6 +647,118 @@ class ContextEngineService(BaseService):
             reverse=True,
         )
         return ranked[:max_related]
+
+    def _framework_related_files(
+        self,
+        target: str,
+        symbol_context: Dict[str, Any],
+        direct_callers: List[Dict[str, Any]],
+        max_related: int,
+    ) -> List[Dict[str, Any]]:
+        structure = self._get_structure()
+        if not structure:
+            return []
+        framework = str(structure.framework or "none").lower()
+        if framework not in {"laravel", "symfony", "nestjs", "express", "node", "spring", "flutter", "reactnative"}:
+            return []
+
+        hints = self._framework_hint_tokens(target, symbol_context, direct_callers)
+        if not hints:
+            return []
+
+        candidate_paths = self._framework_candidate_paths(structure)
+        if not candidate_paths:
+            return []
+
+        matches: List[Dict[str, Any]] = []
+        for rel_path in candidate_paths:
+            if rel_path == target:
+                continue
+            full_path = os.path.join(structure.project_path, rel_path)
+            try:
+                with open(full_path, "r", encoding="utf-8", errors="replace") as handle:
+                    content = handle.read(8000)
+            except Exception:
+                continue
+            lowered = content.lower()
+            matched = [token for token in hints if token in lowered]
+            if not matched:
+                continue
+            role = "framework_entrypoint"
+            reason = (
+                f"Framework wiring references target-related tokens ({', '.join(matched[:3])})."
+            )
+            matches.append(
+                {
+                    "file": rel_path,
+                    "role": role,
+                    "certainty": "probable",
+                    "evidence_type": "framework_wiring",
+                    "evidence_strength": "medium",
+                    "reason": reason,
+                    "priority": 55,
+                }
+            )
+            if len(matches) >= max_related:
+                break
+        return matches
+
+    def _framework_candidate_paths(self, structure) -> List[str]:
+        candidate_dirs = []
+        for category in ("routes", "navigation", "router", "middleware", "controllers"):
+            rel_dir = structure.get_rel_dir(category)
+            if rel_dir:
+                candidate_dirs.append(rel_dir)
+
+        seen: set[str] = set()
+        candidates: List[str] = []
+        for rel_path, _abs in structure.walk_source_files():
+            normalized = rel_path.replace("\\", "/")
+            if normalized in seen:
+                continue
+            if any(normalized.startswith(dir_path.replace("\\", "/") + "/") or normalized == dir_path.replace("\\", "/")
+                   for dir_path in candidate_dirs):
+                seen.add(normalized)
+                candidates.append(normalized)
+        candidates.sort()
+        return candidates[:30]
+
+    def _framework_hint_tokens(
+        self,
+        target: str,
+        symbol_context: Dict[str, Any],
+        direct_callers: List[Dict[str, Any]],
+    ) -> List[str]:
+        hints: List[str] = []
+        base = os.path.basename(target)
+        stem = base.split(".", 1)[0]
+        canonical = str(symbol_context.get("canonical_name") or symbol_context.get("symbol") or "")
+        for token in (
+            stem,
+            stem.replace("Controller", ""),
+            stem.replace("Service", ""),
+            canonical.split(".", 1)[0] if canonical else "",
+            canonical.split(".")[-1] if canonical else "",
+        ):
+            lowered = str(token).strip().lower()
+            if len(lowered) >= 4 and lowered not in hints:
+                hints.append(lowered)
+        for caller in direct_callers[:2]:
+            caller_base = os.path.basename(str(caller.get("file") or "")).split(".", 1)[0].lower()
+            if len(caller_base) >= 4 and caller_base not in hints:
+                hints.append(caller_base)
+        return hints[:6]
+
+    def _build_relationship_buckets(self, related_file_reasons: List[Dict[str, Any]]) -> Dict[str, List[str]]:
+        buckets: Dict[str, List[str]] = {"certain": [], "probable": [], "inferred": []}
+        for item in related_file_reasons:
+            certainty = str(item.get("certainty") or "inferred").lower()
+            if certainty not in buckets:
+                certainty = "inferred"
+            file_path = item.get("file")
+            if file_path and file_path not in buckets[certainty]:
+                buckets[certainty].append(file_path)
+        return buckets
 
     def _semantic_peers(
         self,
@@ -777,6 +928,8 @@ class ContextEngineService(BaseService):
             "score_gap": score_gap,
             "score_ratio": score_ratio,
             "path_role": top_role,
+            "selection_reason": self._describe_query_selection(top, second),
+            "selection_confidence": "strong" if score_gap >= 1.0 else "moderate",
             "match_symbol_id": top.get("symbol_id"),
             "alternatives": [
                 {
@@ -786,6 +939,7 @@ class ContextEngineService(BaseService):
                     "score": r.get("score"),
                     "adjusted_score": r.get("adjusted_score"),
                     "path_role": r.get("path_role"),
+                    "rejected_reason": self._describe_candidate_rejection(top, r),
                 }
                 for r in ranked[1:6]
             ],
@@ -812,6 +966,38 @@ class ContextEngineService(BaseService):
             }
             for r in ranked
         ]
+
+    def _describe_query_selection(
+        self,
+        top: Dict[str, Any],
+        second: Optional[Dict[str, Any]],
+    ) -> str:
+        parts = [
+            f"Selected {top.get('short_name')} in {top.get('file')}",
+            f"as a {top.get('path_role', 'source')} candidate",
+        ]
+        if second:
+            gap = round(
+                float(top.get("adjusted_score") or 0.0) - float(second.get("adjusted_score") or 0.0),
+                4,
+            )
+            parts.append(f"with a score margin of {gap} over {second.get('short_name')}")
+        return "; ".join(parts) + "."
+
+    def _describe_candidate_rejection(
+        self,
+        top: Dict[str, Any],
+        candidate: Dict[str, Any],
+    ) -> str:
+        top_role = str(top.get("path_role") or "source")
+        candidate_role = str(candidate.get("path_role") or "source")
+        if top_role == "source" and candidate_role != "source":
+            return "Lower-ranked because it is a non-source support path."
+        top_score = float(top.get("adjusted_score") or 0.0)
+        candidate_score = float(candidate.get("adjusted_score") or 0.0)
+        if candidate_score < top_score:
+            return f"Lower-ranked due to weaker adjusted score ({round(candidate_score, 4)} < {round(top_score, 4)})."
+        return "Lower-ranked after tie-break rules."
 
     def _rerank_query_hits(self, query: str, hits: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         if not hits:
@@ -934,6 +1120,7 @@ class ContextEngineService(BaseService):
         indirect_dependents = response.get("indirect_dependents", []) or []
         related_files = response.get("related_files", []) or []
         query_resolution = response.get("query_resolution") or {}
+        relationship_buckets = response.get("relationship_buckets") or {}
         evidence = {
             "has_symbol_match": bool(symbol_context.get("found")),
             "direct_callers": len(direct_callers),
@@ -943,6 +1130,9 @@ class ContextEngineService(BaseService):
             "has_blast_radius": bool(response.get("blast_radius")),
             "query_resolved": bool(query_resolution),
             "query_path_role": query_resolution.get("path_role"),
+            "certain_relationships": len(relationship_buckets.get("certain", []) or []),
+            "probable_relationships": len(relationship_buckets.get("probable", []) or []),
+            "inferred_relationships": len(relationship_buckets.get("inferred", []) or []),
         }
 
         score = 0.45
@@ -981,6 +1171,10 @@ class ContextEngineService(BaseService):
         inferred = []
         if evidence["indirect_dependents"]:
             inferred.append("Indirect dependents are inferred from direct-caller expansion.")
+        if evidence["inferred_relationships"]:
+            inferred.append(
+                f"{evidence['inferred_relationships']} related file(s) come from softer signals such as semantic search or history."
+            )
         if "deep_index" in missing_context:
             inferred.append("Symbol-level evidence is limited because the deep index is missing.")
         if response.get("target", {}).get("symbol") and not evidence["has_symbol_match"]:
