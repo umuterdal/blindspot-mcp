@@ -521,13 +521,29 @@ class ContextEngineService(BaseService):
             if not file_path:
                 continue
             strongest = item.get("strongest_usage", "reference")
+            evidence_source = str(item.get("evidence_source") or "scan").lower()
+            category = str(item.get("category") or "other").lower()
+            framework_role = self._framework_role_for_file(file_path, category)
             # Split file-scope (synthetic PHP ``__file_scope__``) callers
             # into a distinct role. They carry a real cross-file edge
             # but represent procedural entry-point wiring rather than an
             # in-method invocation, so the agent should weigh them lower
             # than a normal method_call direct_caller when sequencing an
             # edit.
-            if strongest == "module_script":
+            if framework_role and strongest in {"module_script", "method_call", "reference"}:
+                reasons[file_path] = {
+                    "file": file_path,
+                    "role": framework_role,
+                    "certainty": "probable",
+                    "evidence_type": "framework_wiring",
+                    "evidence_strength": "medium",
+                    "reason": (
+                        "Framework bootstrap/router wiring references the target "
+                        f"via {strongest} evidence."
+                    ),
+                    "priority": 82,
+                }
+            elif strongest == "module_script":
                 reasons[file_path] = {
                     "file": file_path,
                     "role": "file_scope_caller",
@@ -541,14 +557,35 @@ class ContextEngineService(BaseService):
                     "priority": 80,
                 }
             else:
+                is_strong_direct = (
+                    evidence_source == "index"
+                    or strongest in {
+                        "extends_or_implements", "import", "instantiation",
+                        "static_call", "type_hint",
+                    }
+                )
+                certainty = "certain" if is_strong_direct else "probable"
+                evidence_strength = "strong" if is_strong_direct else "medium"
+                priority = 90 if is_strong_direct else 78
+                reason = f"Calls or references the target symbol directly via {strongest}."
+                if not is_strong_direct:
+                    reason = (
+                        f"Likely reaches the target via {strongest}, but the evidence is "
+                        f"{'scan-only' if evidence_source != 'index' else 'weakly-typed'}."
+                    )
+                if category == "migrations" and strongest in {"method_call", "reference"}:
+                    reason = (
+                        f"Mentions the target via a generic {strongest} in migration/schema code; "
+                        "treat as supporting evidence, not a guaranteed caller."
+                    )
                 reasons[file_path] = {
                     "file": file_path,
                     "role": "direct_caller",
-                    "certainty": "certain",
+                    "certainty": certainty,
                     "evidence_type": "cross_file_reference",
-                    "evidence_strength": "strong",
-                    "reason": f"Calls or references the target symbol directly via {strongest}.",
-                    "priority": 90,
+                    "evidence_strength": evidence_strength,
+                    "reason": reason,
+                    "priority": priority,
                 }
 
         for item in indirect_dependents or []:
@@ -593,14 +630,20 @@ class ContextEngineService(BaseService):
                 continue
             for file_path in item.get("files", []) or []:
                 if file_path and file_path not in reasons:
+                    category = self._get_structure().categorize_file(file_path) or "other"
+                    framework_role = self._framework_role_for_file(file_path, category)
                     reasons[file_path] = {
                         "file": file_path,
-                        "role": "file_impact",
+                        "role": framework_role or "file_impact",
                         "certainty": "probable",
-                        "evidence_type": "file_impact",
+                        "evidence_type": "framework_wiring" if framework_role else "file_impact",
                         "evidence_strength": "medium",
-                        "reason": f"References file-level symbol '{symbol_name}'.",
-                        "priority": 50,
+                        "reason": (
+                            f"Framework wiring references file-level symbol '{symbol_name}'."
+                            if framework_role else
+                            f"References file-level symbol '{symbol_name}'."
+                        ),
+                        "priority": 55 if framework_role else 50,
                     }
 
         for item in self._framework_related_files(
@@ -726,9 +769,11 @@ class ContextEngineService(BaseService):
     def _framework_role_for_file(self, file_path: str, category: str) -> Optional[str]:
         normalized = file_path.replace("\\", "/").lower()
         category = (category or "").lower()
-        if category in {"routes", "router", "navigation", "middleware"}:
+        if category in {"routes", "router", "navigation", "middleware", "bootstrap", "config"}:
             return "framework_entrypoint"
-        if any(token in normalized for token in ("/routes/", "/router/", "/navigation/", "/middleware/")):
+        if normalized.startswith(("bootstrap/", "config/")):
+            return "framework_entrypoint"
+        if any(token in normalized for token in ("/routes/", "/router/", "/navigation/", "/middleware/", "/bootstrap/", "/config/")):
             return "framework_entrypoint"
         return None
 
@@ -738,6 +783,10 @@ class ContextEngineService(BaseService):
             rel_dir = structure.get_rel_dir(category)
             if rel_dir:
                 candidate_dirs.append(rel_dir)
+        for extra_dir in ("bootstrap", "config"):
+            abs_dir = os.path.join(structure.project_path, extra_dir)
+            if os.path.isdir(abs_dir):
+                candidate_dirs.append(extra_dir)
 
         seen: set[str] = set()
         candidates: List[str] = []

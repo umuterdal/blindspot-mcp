@@ -131,6 +131,7 @@ FIXTURES = [
             },
             "related_file_roles": {
                 "routes/web.php": "framework_entrypoint",
+                "bootstrap/app.php": "framework_entrypoint",
             },
         },
     },

@@ -28,6 +28,16 @@ _INDEXED_CALLER_EXTENSIONS: Set[str] = {
     ".go",
 }
 
+# Generic lifecycle / action names that routinely collide with unrelated
+# framework helpers, schema builders, and migration DSL methods. Scan-only
+# fallback evidence for these names is weak unless it is backed by a typed
+# index edge or owner-aware structural context.
+_AMBIGUOUS_SCAN_SYMBOLS: Set[str] = {
+    "__construct", "__invoke", "boot", "create", "delete", "destroy",
+    "down", "edit", "get", "handle", "index", "list", "mount", "process",
+    "render", "resolve", "run", "set", "show", "store", "update", "up",
+}
+
 
 def _has_indexed_caller_edges(rel_path: str) -> bool:
     """Return True when the file's language populates the refs table."""
@@ -224,6 +234,13 @@ class SymbolResolver:
                     continue
                 if scope != "all" and not self._file_in_scope(caller_file, scope):
                     continue
+                if self._should_skip_index_usage(
+                    symbol=symbol,
+                    caller_file=caller_file,
+                    caller_short_name=str(row.get("caller_short_name") or ""),
+                    owner=owner or context_filter,
+                ):
+                    continue
                 self._append_index_usage(aggregated, row, symbol)
 
         # ── 2. Supplement with targeted text scan ─────────────────────
@@ -249,6 +266,7 @@ class SymbolResolver:
             syntax = get_syntax_for_file(fname)
             lines = content.split("\n")
             usages: List[Dict[str, Any]] = []
+            category = self.structure.categorize_file(rel_path) or "other"
 
             for i, line in enumerate(lines, 1):
                 if symbol not in line:
@@ -256,6 +274,15 @@ class SymbolResolver:
 
                 usage_type = syntax.classify_usage(line, symbol)
                 if not usage_type:
+                    continue
+
+                if self._should_skip_scan_usage(
+                    symbol=symbol,
+                    usage_type=usage_type,
+                    file_path=rel_path,
+                    category=category,
+                    context_filter=context_filter,
+                ):
                     continue
 
                 if context_filter and usage_type in ("method_call", "reference"):
@@ -269,10 +296,10 @@ class SymbolResolver:
                 })
 
             if usages:
-                category = self.structure.categorize_file(rel_path)
                 aggregated[rel_path] = {
                     "file": rel_path,
                     "category": category or "other",
+                    "evidence_source": "scan",
                     "usages": usages,
                     "count": len(usages),
                 }
@@ -314,6 +341,7 @@ class SymbolResolver:
             entry = {
                 "file": caller_file,
                 "category": category or "other",
+                "evidence_source": "index",
                 "usages": [],
                 "count": 0,
             }
@@ -959,6 +987,78 @@ class SymbolResolver:
 
         return context
 
+    @staticmethod
+    def _is_ambiguous_scan_symbol(symbol: str) -> bool:
+        return (symbol or "").strip().lower() in _AMBIGUOUS_SCAN_SYMBOLS
+
+    def _should_skip_scan_usage(
+        self,
+        symbol: str,
+        usage_type: str,
+        file_path: str,
+        category: str,
+        context_filter: Optional[str],
+    ) -> bool:
+        """Decide whether a scan-only usage is too weak to trust.
+
+        False-positive notes:
+            - Generic action names such as ``index`` or ``up`` often match
+              migration/schema DSL methods or framework boilerplate. Those
+              matches are not safe enough to surface as direct callers.
+            - Weak text matches inside migration/bootstrap/config files can
+              outnumber real callers in large Laravel/Symfony repos.
+
+        False-negative notes:
+            - This intentionally drops some scan-only recall for generic
+              symbols when we cannot prove receiver identity. Index-backed
+              edges remain unaffected and should carry the real callers.
+        """
+        usage_type = (usage_type or "reference").lower()
+        category = (category or "other").lower()
+        normalized = (file_path or "").replace("\\", "/").lower()
+
+        if not self._is_ambiguous_scan_symbol(symbol):
+            return False
+
+        if category == "migrations" and usage_type in {"method_call", "reference"}:
+            return True
+
+        if usage_type == "reference" and category in {"tests", "docs", "views"} and not context_filter:
+            return True
+
+        if usage_type in {"method_call", "reference"} and not context_filter:
+            if normalized.startswith("database/migrations/") or normalized.startswith("migrations/"):
+                return True
+            if normalized.startswith("bootstrap/") or normalized.startswith("config/"):
+                return True
+
+        return False
+
+    def _should_skip_index_usage(
+        self,
+        symbol: str,
+        caller_file: str,
+        caller_short_name: str,
+        owner: Optional[str],
+    ) -> bool:
+        """Filter weak index-backed collisions for generic symbol names.
+
+        False positives:
+            - Normalized refs can still collide on bare method names when a
+              language strategy cannot recover the receiver type. Laravel
+              migrations are the most common example: ``$table->index(...)``
+              inside ``up()`` should not count as a caller of
+              ``HomeController.index``.
+        """
+        if owner or not self._is_ambiguous_scan_symbol(symbol):
+            return False
+
+        category = (self.structure.categorize_file(caller_file) or "other").lower()
+        caller_short = (caller_short_name or "").lower()
+        if category == "migrations" and caller_short in {"up", "down", "change"}:
+            return True
+        return False
+
     def get_symbol_change_context(
         self,
         rel_path: str,
@@ -1100,6 +1200,7 @@ class SymbolResolver:
                     "file": ref.get("file", ""),
                     "category": ref.get("category", "other"),
                     "count": int(ref.get("count", 0)),
+                    "evidence_source": ref.get("evidence_source", "scan"),
                     "strongest_usage": strongest_usage,
                     "usage_types": usage_types or ["reference"],
                     "snippets": snippets,

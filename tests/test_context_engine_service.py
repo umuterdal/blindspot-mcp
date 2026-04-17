@@ -963,6 +963,68 @@ class SignalEnrichmentTests(unittest.TestCase):
         self.assertEqual(route_reason["evidence_type"], "framework_wiring")
         self.assertIn("routes/web.php", result["relationship_buckets"]["probable"])
 
+    def test_framework_wiring_surfaces_bootstrap_file_as_probable_relation(self):
+        with open(os.path.join(self.tmp.name, ".blindspot.yaml"), "w", encoding="utf-8") as f:
+            f.write(
+                "language: php\n"
+                "framework: laravel\n"
+                "scan_dirs:\n"
+                "  services: app/Services\n"
+                "  bootstrap: bootstrap\n"
+            )
+        os.makedirs(os.path.join(self.tmp.name, "app", "Services"), exist_ok=True)
+        os.makedirs(os.path.join(self.tmp.name, "bootstrap"), exist_ok=True)
+        with open(os.path.join(self.tmp.name, "app", "Services", "PricingService.php"), "w", encoding="utf-8") as f:
+            f.write("<?php class PricingService { public function rateFor($tier) {} }\n")
+        with open(os.path.join(self.tmp.name, "bootstrap", "app.php"), "w", encoding="utf-8") as f:
+            f.write("<?php app()->singleton(PricingService::class);\n")
+
+        ctx = _build_ctx_with_fake_index(self.tmp.name)
+        patches = self._patch_structural(direct_callers=[], indirect_dependents=[])
+        with patches[0], patches[1], patches[2], patches[3], patches[4]:
+            result = ContextEngineService(ctx).get_context(
+                target="app/Services/PricingService.php",
+                intent="before_edit",
+                symbol="rateFor",
+                include_source=False,
+            )
+
+        bootstrap_reason = next(
+            (item for item in result["related_file_reasons"] if item.get("file") == "bootstrap/app.php"),
+            None,
+        )
+        self.assertIsNotNone(bootstrap_reason, result["related_file_reasons"])
+        self.assertEqual(bootstrap_reason["role"], "framework_entrypoint")
+        self.assertEqual(bootstrap_reason["certainty"], "probable")
+        self.assertEqual(bootstrap_reason["evidence_type"], "framework_wiring")
+        self.assertIn("bootstrap/app.php", result["relationship_buckets"]["probable"])
+
+    def test_scan_only_direct_caller_is_not_marked_certain(self):
+        ctx = _build_ctx_with_fake_index(self.tmp.name)
+        direct_callers = [
+            {
+                "file": "database/migrations/2024_01_01_create_users.php",
+                "category": "migrations",
+                "count": 1,
+                "evidence_source": "scan",
+                "strongest_usage": "method_call",
+                "usage_types": ["method_call"],
+                "snippets": [{"line": 4, "type": "method_call", "snippet": "$table->index(['email']);"}],
+            }
+        ]
+        patches = self._patch_structural(direct_callers=direct_callers, indirect_dependents=[])
+        with patches[0], patches[1], patches[2], patches[3], patches[4]:
+            result = self._run_get_context(ctx)
+
+        migration_reason = next(
+            item for item in result["related_file_reasons"]
+            if item.get("file") == "database/migrations/2024_01_01_create_users.php"
+        )
+        self.assertEqual(migration_reason["role"], "direct_caller")
+        self.assertEqual(migration_reason["certainty"], "probable")
+        self.assertEqual(migration_reason["evidence_strength"], "medium")
+        self.assertIn("supporting evidence", migration_reason["reason"])
+
 
 class CrossFileRefsFixtureRegressionTests(unittest.TestCase):
     """Ensure PHP and Java cross-file ``pending_calls`` still populate the
@@ -1270,6 +1332,77 @@ class CrossFileRefsFixtureRegressionTests(unittest.TestCase):
             edge_present("TypedPropController.log", "AuditService.record"),
             f"Typed class property alone did not resolve AuditService.record. "
             f"Edges: {edges}",
+        )
+
+    def test_php_generic_migration_method_name_does_not_surface_as_direct_caller(self):
+        """Generic schema DSL calls like ``$table->index(...)`` must not
+        surface as controller action callers just because the action is
+        also named ``index``.
+        """
+        import tempfile
+
+        from blindspot.adapters.project_structure import get_project_structure
+        from blindspot.adapters.symbol_resolver import SymbolResolver
+        from blindspot.indexing.sqlite_index_manager import SQLiteIndexManager
+
+        tmp = Path(tempfile.mkdtemp(prefix="blindspot_php_generic_"))
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        (tmp / "app" / "Http" / "Controllers").mkdir(parents=True, exist_ok=True)
+        (tmp / "routes").mkdir(parents=True, exist_ok=True)
+        (tmp / "database" / "migrations").mkdir(parents=True, exist_ok=True)
+        (tmp / ".blindspot.yaml").write_text(
+            "language: php\n"
+            "framework: laravel\n"
+            "scan_dirs:\n"
+            "  controllers: app/Http/Controllers\n"
+            "  routes: routes\n"
+            "  migrations: database/migrations\n",
+            encoding="utf-8",
+        )
+        (tmp / "composer.json").write_text("{\"name\": \"demo/demo\"}\n", encoding="utf-8")
+        (tmp / "artisan").write_text("#!/usr/bin/env php\n", encoding="utf-8")
+        (tmp / "app" / "Http" / "Controllers" / "HomeController.php").write_text(
+            "<?php\n"
+            "class HomeController {\n"
+            "    public function index() {\n"
+            "        return 'ok';\n"
+            "    }\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        (tmp / "routes" / "web.php").write_text(
+            "<?php\n"
+            "Route::get('/', [HomeController::class, 'index']);\n",
+            encoding="utf-8",
+        )
+        (tmp / "database" / "migrations" / "2024_01_01_000000_create_users.php").write_text(
+            "<?php\n"
+            "return new class {\n"
+            "    public function up(): void {\n"
+            "        Schema::table('users', function ($table) {\n"
+            "            $table->index(['email']); // schema index, not HomeController@index\n"
+            "        });\n"
+            "    }\n"
+            "};\n",
+            encoding="utf-8",
+        )
+
+        mgr = SQLiteIndexManager()
+        mgr.set_project_path(str(tmp))
+        mgr.build_index(force_rebuild=True)
+        structure = get_project_structure(str(tmp))
+        resolver = SymbolResolver(str(tmp), structure, index_manager=mgr)
+
+        refs = resolver.find_references(
+            "index",
+            scope="all",
+            definition_file="app/Http/Controllers/HomeController.php",
+        )
+        ref_files = {item.get("file") for item in refs.get("references", [])}
+        self.assertNotIn(
+            "database/migrations/2024_01_01_000000_create_users.php",
+            ref_files,
+            f"Migration DSL method must not appear as controller direct caller. Got {refs}",
         )
 
     def test_ts_variable_bound_calls_resolve_to_owning_class(self):
